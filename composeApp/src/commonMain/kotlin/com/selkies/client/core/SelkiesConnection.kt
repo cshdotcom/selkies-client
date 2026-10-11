@@ -255,15 +255,19 @@ class SelkiesConnection(
 
     /**
      * 建立 WebSocket 连接（挂起直到连接结束）。返回 false 时已通过 onError 报告原因。
+     * 只读模式追加 ?role=viewer：官方共享模式下的旁观通道，服务器不授予键鼠权限（非控制通道）。
      */
     suspend fun connectOnce(): Boolean {
         closing = false
         val wsUrl = resolveWsUrl() ?: return false
-        val url = Url(toWsUrl(wsUrl))
+        val viewerSuffix = if (server.viewOnly) {
+            if (wsUrl.contains('?')) "&role=viewer" else "?role=viewer"
+        } else ""
+        val url = Url(toWsUrl(wsUrl) + viewerSuffix)
         try {
             val session = http.webSocketSession {
                 // ⚠️ webSocketSession 必须用 ws(s):// URL；http(s):// 会导致引擎按普通 GET 处理（无 101 升级）
-                url(toWsUrl(wsUrl))
+                url(toWsUrl(wsUrl) + viewerSuffix)
                 headers {
                     authHeader?.let { append(HttpHeaders.Authorization, it) }
                     append(HttpHeaders.UserAgent, USER_AGENT)

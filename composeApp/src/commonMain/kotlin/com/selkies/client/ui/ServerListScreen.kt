@@ -16,12 +16,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.Keyboard
@@ -57,7 +57,8 @@ import com.selkies.client.model.ServerEntry
 import java.util.UUID
 
 /**
- * 服务器列表：多选批量操作（删除/复制/连接）、导入导出
+ * 服务器列表：卡片点击连接、铅笔编辑、长按多选批量（删除/复制/导出）、文件/剪贴板导入导出、
+ * 返回键双击退出
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -68,10 +69,55 @@ fun ServerListScreen(state: AppState) {
     var showImport by remember { mutableStateOf(false) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var importText by remember { mutableStateOf("") }
+    var snackbarMsg by remember { mutableStateOf<String?>(null) }
+    var lastBackAt by remember { mutableStateOf(0L) }
+
+    // 返回键双击退出（首次提示，2 秒内再按才退出）
+    PlatformBackHandler {
+        val now = System.currentTimeMillis()
+        if (now - lastBackAt < 2000) {
+            state.platform.exitApp()
+        } else {
+            lastBackAt = now
+            snackbarMsg = "再按一次返回键退出应用"
+        }
+    }
 
     fun exitSelection() {
         selectionMode = false
         selected = emptySet()
+    }
+
+    /** 导出：保存为 JSON 文件（SAF/文件对话框） */
+    fun exportToFile(ids: Set<String>) {
+        val json = state.store.exportServers(ids)
+        val name = "selkies-servers-${System.currentTimeMillis() / 1000}.json"
+        state.platform.saveFile(name, json.toByteArray(Charsets.UTF_8)) { ok ->
+            snackbarMsg = if (ok) "已导出到文件：$name（${if (ids.isEmpty()) servers.size else ids.size} 项）"
+            else "导出失败：未选择保存位置"
+        }
+    }
+
+    /** 导出：复制到剪贴板 */
+    fun exportToClipboard(ids: Set<String>) {
+        val json = state.store.exportServers(ids)
+        state.platform.clipboard().setText(json)
+        snackbarMsg = "已复制 ${if (ids.isEmpty()) servers.size else ids.size} 项配置 JSON 到剪贴板"
+    }
+
+    /** 从文件导入 */
+    fun importFromFile() {
+        state.platform.pickFiles(listOf("application/json", "text/*", "*/*")) { files ->
+            val f = files.firstOrNull() ?: return@pickFiles
+            runCatching {
+                val bytes = state.platform.readFileBytes(f.path)
+                val text = bytes?.toString(Charsets.UTF_8) ?: ""
+                val n = state.store.importServers(text)
+                snackbarMsg = if (n > 0) "从 ${f.name} 导入 $n 项成功" else "导入失败：文件格式不正确"
+            }.onFailure {
+                snackbarMsg = "导入失败：${it.message}"
+            }
+        }
     }
 
     Scaffold(
@@ -84,14 +130,19 @@ fun ServerListScreen(state: AppState) {
                     },
                     actions = {
                         IconButton(onClick = {
+                            val id = selected.firstOrNull()
+                            if (id != null) {
+                                exitSelection()
+                                state.navigate(Screen.AddEdit(id))
+                            }
+                        }) { Icon(Icons.Filled.Edit, "编辑") }
+                        IconButton(onClick = {
                             state.store.duplicateServer(selected.firstOrNull() ?: return@IconButton)
                             exitSelection()
                         }) { Icon(Icons.Filled.ContentCopy, "复制") }
                         IconButton(onClick = { showDeleteConfirm = true }) { Icon(Icons.Filled.Delete, "删除") }
                         TextButton(onClick = {
-                            val json = state.store.exportServers(selected)
-                            // 写入剪贴板
-                            state.platform.clipboard().setText(json)
+                            exportToFile(selected)
                             exitSelection()
                         }) { Text("导出") }
                     }
@@ -116,6 +167,10 @@ fun ServerListScreen(state: AppState) {
                             Icon(Icons.Filled.Settings, "设置")
                         }
                         TextButton(onClick = { showImport = true }) { Text("导入") }
+                        // 全部导出（无选中时）
+                        if (servers.isNotEmpty()) {
+                            TextButton(onClick = { exportToFile(emptySet()) }) { Text("导出") }
+                        }
                     }
                 )
             }
@@ -180,7 +235,7 @@ fun ServerListScreen(state: AppState) {
                         } else androidx.compose.material3.CardDefaults.cardColors()
                     ) {
                         Row(
-                            modifier = Modifier.padding(16.dp),
+                            modifier = Modifier.padding(start = 16.dp, top = 16.dp, bottom = 16.dp, end = 4.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             if (selectionMode) {
@@ -206,6 +261,13 @@ fun ServerListScreen(state: AppState) {
                                     Tag("${server.framerate}fps", MaterialTheme.colorScheme.surfaceVariant, MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                             }
+                            // 编辑入口（v2.1.0：列表可直接编辑）
+                            IconButton(onClick = { state.navigate(Screen.AddEdit(server.id)) }) {
+                                Icon(
+                                    Icons.Filled.Edit, "编辑",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                             if (server.viewOnly) {
                                 Icon(Icons.Filled.Visibility, "查看", tint = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
@@ -214,6 +276,15 @@ fun ServerListScreen(state: AppState) {
                 }
             }
         }
+    }
+
+    // 轻量提示（含双击退出提示）
+    snackbarMsg?.let { msg ->
+        AlertDialog(
+            onDismissRequest = { snackbarMsg = null },
+            confirmButton = { TextButton(onClick = { snackbarMsg = null }) { Text("知道了") } },
+            title = { Text(msg) }
+        )
     }
 
     if (showDeleteConfirm) {
@@ -226,7 +297,6 @@ fun ServerListScreen(state: AppState) {
                     state.store.deleteServers(selected)
                     exitSelection()
                     showDeleteConfirm = false
-                    state.dataVersion++
                 }) { Text("删除", color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = { TextButton(onClick = { showDeleteConfirm = false }) { Text("取消") } }
@@ -239,7 +309,12 @@ fun ServerListScreen(state: AppState) {
             title = { Text("导入服务器") },
             text = {
                 Column {
-                    Text("粘贴此前导出的 JSON 配置：", style = MaterialTheme.typography.bodySmall)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { showImport = false; importFromFile() }) { Text("从文件导入") }
+                        OutlinedButton(onClick = { /* 留在对话框手动粘贴 */ }) { Text("手动粘贴") }
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Text("或粘贴此前导出的 JSON 配置：", style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(
                         value = importText,
@@ -254,7 +329,7 @@ fun ServerListScreen(state: AppState) {
                     val n = state.store.importServers(importText)
                     showImport = false
                     importText = ""
-                    state.dataVersion++
+                    snackbarMsg = if (n > 0) "导入 $n 项成功" else "导入失败：JSON 格式不正确"
                 }) { Text("导入") }
             },
             dismissButton = { TextButton(onClick = { showImport = false }) { Text("取消") } }

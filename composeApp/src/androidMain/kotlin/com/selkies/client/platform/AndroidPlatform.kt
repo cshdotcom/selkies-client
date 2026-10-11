@@ -81,7 +81,15 @@ object AndroidPlatform : PlatformServices {
                         if (c.moveToFirst()) {
                             val name = if (nameIdx >= 0) c.getString(nameIdx) else uri.lastPathSegment ?: "file"
                             val size = if (sizeIdx >= 0) c.getLong(sizeIdx) else 0L
-                            files.add(PickedFile(name, uri.toString(), size))
+                            // ⚠️ content:// URI 不能直接 new File() 读（v2.0.1 Android 上传损坏的根因）：
+                            //    先拷贝到应用缓存目录，返回真实文件路径，分片上传才可用
+                            val cache = File(activity.cacheDir, "pick_${System.currentTimeMillis()}_$name")
+                            activity.contentResolver.openInputStream(uri)?.use { input ->
+                                cache.outputStream().use { input.copyTo(it) }
+                            }
+                            if (cache.exists() && cache.length() > 0) {
+                                files.add(PickedFile(name, cache.absolutePath, if (size > 0) size else cache.length()))
+                            }
                         }
                     }
                 }
@@ -163,6 +171,19 @@ object AndroidPlatform : PlatformServices {
         val launcher = pickLauncher ?: run { onResult(emptyList()); return }
         pendingPick = onResult
         launcher.launch(mimeTypes.firstOrNull() ?: "*/*")
+    }
+
+    override fun readFileBytes(path: String): ByteArray? = runCatching {
+        when {
+            path.startsWith("content://") ->
+                appContext?.contentResolver?.openInputStream(android.net.Uri.parse(path))?.use { it.readBytes() }
+            path.startsWith("file://") -> File(android.net.Uri.parse(path).path ?: return@runCatching null).readBytes()
+            else -> File(path).takeIf { it.exists() }?.readBytes()
+        }
+    }.getOrNull()
+
+    override fun exitApp() {
+        activityRef?.finish()
     }
 
     override fun saveFile(suggestedName: String, bytes: ByteArray, onDone: (Boolean) -> Unit) {
@@ -276,6 +297,11 @@ object AndroidPlatform : PlatformServices {
 
 /** 平台 HttpClient（OkHttp 引擎，可选信任所有证书）
  *  ⚠️ 必须安装 WebSockets 插件，否则 webSocketSession 直接抛异常（v2.0.0 连不上的根因）
+ *  ⚠️【断连根因修复】绝不能设置 pingInterval：OkHttp 发 WS ping 后服务器经 Cloudflare 不回 pong，
+ *     OkHttp 会在一个 ping 周期内主动杀掉连接——浏览器不发 ping 所以网页版稳定（实测验证 87s+ 稳定）。
+ *     保活由应用层保证：CLIENT_FRAME_ACK 每 50ms（与官方前端一致）持续有上行流量，CF 不会闲置掐线。
+ *  ⚠️ readTimeout 必须为 0（无限）：WS 建立后静态画面期间服务器可能长时间无下行数据，
+ *     有限读超时会误杀空闲连接；探测请求用协程 withTimeout 控制超时。
  */
 actual fun createHttpClient(allowUntrustedCert: Boolean): HttpClient {
     return HttpClient(OkHttp) {
@@ -296,8 +322,7 @@ actual fun createHttpClient(allowUntrustedCert: Boolean): HttpClient {
                     hostnameVerifier { _, _ -> true }
                 }
                 connectTimeout(java.time.Duration.ofSeconds(12))
-                readTimeout(java.time.Duration.ofSeconds(30))
-                pingInterval(java.time.Duration.ofMillis(20000))
+                readTimeout(java.time.Duration.ZERO)
             }
         }
     }

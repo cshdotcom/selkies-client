@@ -128,6 +128,11 @@ fun HotkeyManagerScreen(state: AppState) {
     val recorder = remember { HotkeyRecorder() }
     var recordedKeys by remember { mutableStateOf<List<Long>>(emptyList()) }
 
+    com.selkies.client.ui.PlatformBackHandler {
+        if (recording) recording = false
+        else state.navigate(com.selkies.client.Screen.ServerList)
+    }
+
     Column(modifier = Modifier.fillMaxSize()) {
         androidx.compose.material3.TopAppBar(
             title = { Text("快捷键管理") },

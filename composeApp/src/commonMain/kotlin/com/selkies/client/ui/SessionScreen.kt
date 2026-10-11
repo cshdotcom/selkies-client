@@ -26,7 +26,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -42,8 +41,10 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Mouse
 import androidx.compose.material.icons.filled.QueryStats
+import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VideocamOff
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -65,8 +66,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
@@ -84,6 +83,7 @@ import com.selkies.client.AppState
 import com.selkies.client.core.Keysyms
 import com.selkies.client.core.Protocol
 import com.selkies.client.core.SelkiesSession
+import com.selkies.client.core.attachGamepadSession
 import com.selkies.client.model.ServerEntry
 import com.selkies.client.platform.keysymOrNull
 import com.selkies.client.platform.primaryPressed
@@ -91,18 +91,23 @@ import com.selkies.client.platform.secondaryPressed
 import com.selkies.client.platform.tertiaryPressed
 import com.selkies.client.ui.panels.ClipboardPanel
 import com.selkies.client.ui.panels.FilesPanel
+import com.selkies.client.ui.panels.FloatingKeyboard
 import com.selkies.client.ui.panels.HotkeysPanel
 import com.selkies.client.ui.panels.ImeHostPanel
-import com.selkies.client.ui.panels.SpecialKeysPanel
 import com.selkies.client.ui.panels.StatsPanel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.log10
 import kotlin.math.min
 import kotlin.math.pow
+import kotlin.math.roundToInt
 
 /** 底部面板类型 */
-enum class SessionPanel { NONE, KEYBOARD, SPECIAL_KEYS, HOTKEYS, CLIPBOARD, FILES, STATS }
+enum class SessionPanel { NONE, KEYBOARD, HOTKEYS, CLIPBOARD, FILES, STATS }
+
+/** 触控输入模式 */
+enum class InputMode { TOUCH, TRACKPAD }
 
 private const val TOUCH_SCROLL_NOTCH_PX = 50f
 private const val PINCH_NOTCH_RATIO = 1.189207115002721 // 2^(1/4)
@@ -122,16 +127,20 @@ expect fun ImeHost(
 )
 
 /**
- * 远程桌面会话界面：视频 + 全套输入 + 工具栏 + 面板
+ * 远程桌面会话界面：视频 + 触屏/触摸板双模式输入 + 悬浮键盘 + IME + 工具栏 + 面板
  */
 @Composable
 fun SessionScreen(state: AppState, server: ServerEntry) {
     val platform = state.platform
+    var toast by remember { mutableStateOf<String?>(null) }
     val session = remember(server.id) {
         SelkiesSession(
             server = server,
             platform = platform,
-            settingsProvider = { state.store.settings.value }
+            settingsProvider = { state.store.settings.value },
+            onPrintDocument = { name, size ->
+                toast = "收到远程打印文档：$name（${if (size > 1024) "${size / 1024}KB" else "$size B"}），已调起系统打印"
+            }
         )
     }
 
@@ -145,18 +154,18 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     var panel by remember { mutableStateOf(SessionPanel.NONE) }
     var fullscreen by remember { mutableStateOf(false) }
     var toolbarVisible by remember { mutableStateOf(true) }
-    var touchMouse by remember { mutableStateOf(state.store.settings.value.touchMouseMode) }
+    var floatingKb by remember { mutableStateOf(false) }
+    var inputMode by remember { mutableStateOf(if (state.store.settings.value.touchMouseMode) InputMode.TRACKPAD else InputMode.TOUCH) }
+    var showModeSelector by remember { mutableStateOf(false) }
+    var exitConfirm by remember { mutableStateOf(false) }
     var micOn by remember { mutableStateOf(false) }
     var camOn by remember { mutableStateOf(false) }
+    var pendingDrag by remember { mutableStateOf(false) } // 触摸板双击后按住拖动
 
     // 视口几何
     var viewSize by remember { mutableStateOf(IntSize.Zero) }
     var streamSize by remember { mutableStateOf(realizedRes ?: Pair(1280, 720)) }
     LaunchedEffect(realizedRes) { realizedRes?.let { streamSize = it } }
-
-    // 虚拟光标（触屏鼠标模式）
-    var cursorPos by remember { mutableStateOf(Offset.Zero) }
-    var cursorVisible by remember { mutableStateOf(false) }
 
     // 手势累积器
     val acc = remember { ScrollAccumulator() }
@@ -164,11 +173,39 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
 
     val viewOnly = server.viewOnly || role == "viewer"
 
-    // 连接生命周期 + 剪贴板监听 + 桌面物理键直通
+    // 提示自动消失
+    LaunchedEffect(toast) {
+        if (toast != null) {
+            delay(3500)
+            toast = null
+        }
+    }
+
+    // 返回键：逐层退出（面板→悬浮键盘→全屏→确认断开）
+    PlatformBackHandler {
+        when {
+            panel != SessionPanel.NONE -> panel = SessionPanel.NONE
+            floatingKb -> floatingKb = false
+            showModeSelector -> showModeSelector = false
+            fullscreen -> fullscreen = false
+            else -> exitConfirm = true
+        }
+    }
+
+    // 连接生命周期 + 剪贴板监听 + 桌面物理键直通 + 手柄挂载
     DisposableEffect(session) {
         session.screenWidthPx = streamSize.first
         session.screenHeightPx = streamSize.second
         session.connect()
+
+        // 服务器端光标渲染进视频流（官方 SET_NATIVE_CURSOR_RENDERING）：
+        // 触屏/触摸板模式下都能看到远程光标，无需本地渲染
+        session.post { session.connection.sendText("SET_NATIVE_CURSOR_RENDERING,1") }
+
+        // Android 手柄 → js 指令
+        if (state.store.settings.value.gamepadEnabled) {
+            attachGamepadSession(session)
+        }
 
         val clip = platform.clipboard()
         var lastText: String? = clip.getText()
@@ -182,7 +219,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
 
         // 桌面（AWT 分发器）物理键直通；无本地面板打开时才转发，避免在文本框输入时打到远程
         platform.setPhysicalKeyHandler { code, down ->
-            if (!viewOnly && panel == SessionPanel.NONE &&
+            if (!viewOnly && panel == SessionPanel.NONE && !floatingKb &&
                 state.store.settings.value.physicalKeyboardPassthrough
             ) {
                 val ks = platform.nativeKeyCodeToKeysym(code, 0)
@@ -194,6 +231,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
 
         onDispose {
             platform.setPhysicalKeyHandler(null)
+            attachGamepadSession(null)
             clip.setListener(null)
             session.disconnect()
             platform.setFullscreen(false)
@@ -201,13 +239,6 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     }
 
     LaunchedEffect(fullscreen) { platform.setFullscreen(fullscreen) }
-
-    LaunchedEffect(Unit) {
-        if (state.store.settings.value.autoShowIme && !platform.hasHardwareKeyboard()) {
-            kotlinx.coroutines.delay(600)
-            platform.showSoftInput(true)
-        }
-    }
 
     // ---------- 坐标映射 ----------
     fun mapToStream(pos: Offset): Pair<Int, Int> {
@@ -224,27 +255,34 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         return x to y
     }
 
-    fun cursorStreamPos(): Pair<Int, Int> =
-        if (cursorVisible) mapToStream(cursorPos)
-        else streamSize.first / 2 to streamSize.second / 2
+    /** 视图像素位移 → 流坐标位移（触摸板相对移动用） */
+    fun deltaToStream(d: Offset): Offset {
+        val vw = viewSize.width.toFloat()
+        val vh = viewSize.height.toFloat()
+        if (vw <= 0 || vh <= 0) return d
+        val scale = min(vw / streamSize.first.toFloat(), vh / streamSize.second.toFloat())
+        if (scale <= 0f) return d
+        return Offset(d.x / scale, d.y / scale)
+    }
 
+    // ---------- 触屏（直接）模式点击 ----------
     fun leftClickAt(pos: Offset) {
         if (viewOnly) return
-        val (x, y) = if (touchMouse) cursorStreamPos() else mapToStream(pos)
+        val (x, y) = mapToStream(pos)
         session.sendMouseMove(x, y, Protocol.BUTTON_LEFT)
         session.sendMouseMove(x, y, 0)
     }
 
     fun rightClickAt(pos: Offset) {
         if (viewOnly) return
-        val (x, y) = if (touchMouse) cursorStreamPos() else mapToStream(pos)
+        val (x, y) = mapToStream(pos)
         session.sendMouseMove(x, y, Protocol.BUTTON_RIGHT)
         session.sendMouseMove(x, y, 0)
     }
 
     fun middleClickAt(pos: Offset) {
         if (viewOnly) return
-        val (x, y) = if (touchMouse) cursorStreamPos() else mapToStream(pos)
+        val (x, y) = mapToStream(pos)
         session.sendMouseMove(x, y, Protocol.BUTTON_MIDDLE)
         session.sendMouseMove(x, y, 0)
     }
@@ -261,6 +299,22 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         if (viewOnly) return
         val (x, y) = mapToStream(pos)
         session.sendMouseMove(x, y, 0)
+    }
+
+    // ---------- 触摸板模式点击（相对，作用于当前位置） ----------
+    fun trackpadClick(mask: Int) {
+        if (viewOnly) return
+        session.sendMouseMoveRelative(0, 0, mask)
+        session.sendMouseMoveRelative(0, 0, 0)
+    }
+
+    fun trackpadDoubleClick() {
+        if (viewOnly) return
+        trackpadClick(Protocol.BUTTON_LEFT)
+        scope.launch {
+            kotlinx.coroutines.delay(80)
+            trackpadClick(Protocol.BUTTON_LEFT)
+        }
     }
 
     fun scrollNotches(vertical: Boolean, notches: Int) {
@@ -302,33 +356,46 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             modifier = Modifier
                 .fillMaxSize()
                 // 单指点击/长按/双击
-                .pointerInput(touchMouse, viewOnly, streamSize, viewSize) {
+                .pointerInput(inputMode, viewOnly, streamSize, viewSize) {
                     detectTapGestures(
-                        onDoubleTap = { pos -> doubleClickAt(pos) },
-                        onLongPress = { pos -> rightClickAt(pos) },
-                        onTap = { pos -> leftClickAt(pos) },
-                        onPress = { pos ->
-                            if (touchMouse && !viewOnly) {
-                                // 触屏鼠标模式：轻触仅移动光标
-                                if (!cursorVisible) {
-                                    cursorPos = pos
-                                    cursorVisible = true
-                                }
+                        onDoubleTap = { pos ->
+                            if (inputMode == InputMode.TRACKPAD) {
+                                trackpadDoubleClick()
+                                pendingDrag = true // 双击后按住不放 → 拖动
                             } else {
+                                doubleClickAt(pos)
+                            }
+                        },
+                        onLongPress = { pos ->
+                            if (inputMode == InputMode.TRACKPAD) {
+                                trackpadClick(Protocol.BUTTON_RIGHT)
+                            } else {
+                                rightClickAt(pos)
+                            }
+                        },
+                        onTap = { pos ->
+                            if (inputMode == InputMode.TRACKPAD) {
+                                trackpadClick(Protocol.BUTTON_LEFT)
+                            } else {
+                                leftClickAt(pos)
+                            }
+                        },
+                        onPress = { pos ->
+                            if (inputMode == InputMode.TOUCH && !viewOnly) {
                                 movePointerTo(pos)
                             }
                         }
                     )
                 }
                 // 拖动
-                .pointerInput(touchMouse, viewOnly, streamSize, viewSize) {
+                .pointerInput(inputMode, viewOnly, streamSize, viewSize) {
                     detectDragGestures(
                         onDragStart = { pos ->
                             if (!viewOnly) {
-                                if (touchMouse) {
-                                    if (!cursorVisible) {
-                                        cursorPos = pos
-                                        cursorVisible = true
+                                if (inputMode == InputMode.TRACKPAD) {
+                                    // 双击后按住 = 拖动（按住左键）
+                                    if (pendingDrag) {
+                                        session.sendMouseMoveRelative(0, 0, Protocol.BUTTON_LEFT)
                                     }
                                 } else {
                                     val (x, y) = mapToStream(pos)
@@ -338,14 +405,14 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                         },
                         onDrag = { change, _ ->
                             if (!viewOnly) {
-                                if (touchMouse) {
-                                    val vw = viewSize.width.toFloat()
-                                    val vh = viewSize.height.toFloat()
-                                    cursorPos = Offset(
-                                        (cursorPos.x + change.positionChange().x).coerceIn(0f, vw),
-                                        (cursorPos.y + change.positionChange().y).coerceIn(0f, vh)
+                                if (inputMode == InputMode.TRACKPAD) {
+                                    val d = deltaToStream(change.positionChange())
+                                    val mask = if (pendingDrag) Protocol.BUTTON_LEFT else 0
+                                    session.sendMouseMoveRelative(
+                                        d.x.roundToInt(),
+                                        d.y.roundToInt(),
+                                        mask
                                     )
-                                    cursorVisible = true
                                 } else {
                                     val (x, y) = mapToStream(change.position)
                                     session.sendMouseMove(x, y, Protocol.BUTTON_LEFT)
@@ -353,17 +420,29 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                             }
                         },
                         onDragEnd = {
-                            if (!viewOnly && !touchMouse) {
-                                val (x, y) = cursorStreamPos()
-                                session.sendMouseMove(x, y, 0)
+                            if (!viewOnly) {
+                                if (inputMode == InputMode.TRACKPAD) {
+                                    if (pendingDrag) {
+                                        session.sendMouseMoveRelative(0, 0, 0)
+                                    }
+                                    pendingDrag = false
+                                } else {
+                                    session.sendMouseMove(0, 0, 0)
+                                }
                             }
                         },
                         onDragCancel = {
-                            if (!viewOnly && !touchMouse) session.sendMouseMove(0, 0, 0)
+                            if (!viewOnly) {
+                                if (inputMode == InputMode.TRACKPAD) {
+                                    pendingDrag = false
+                                } else {
+                                    session.sendMouseMove(0, 0, 0)
+                                }
+                            }
                         }
                     )
                 }
-                // 双指：滚动 + 捏合缩放（触屏）
+                // 双指：滚动 + 捏合缩放（两种模式通用）
                 .pointerInput(viewOnly) {
                     detectTransformGestures { _, pan, zoom, _ ->
                         if (!viewOnly) {
@@ -387,7 +466,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     }
                 }
                 // 桌面鼠标：滚轮 / 右中键 / 悬停（Initial 通道拦截）
-                .pointerInput(viewOnly, touchMouse) {
+                .pointerInput(viewOnly) {
                     awaitPointerEventScope {
                         while (true) {
                             val event = awaitPointerEvent(PointerEventPass.Initial)
@@ -420,16 +499,11 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                     when {
                                         event.tertiaryPressed() -> middleClickAt(pos)
                                         event.secondaryPressed() -> rightClickAt(pos)
-                                        event.primaryPressed() -> {
-                                            if (!touchMouse) {
-                                                val (x, y) = mapToStream(pos)
-                                                session.sendMouseMove(x, y, Protocol.BUTTON_LEFT)
-                                            }
-                                        }
+                                        event.primaryPressed() -> leftClickAt(pos)
                                     }
                                     event.changes.forEach { it.consume() }
                                 }
-                            } else if (event.type == PointerEventType.Move && !touchMouse) {
+                            } else if (event.type == PointerEventType.Move) {
                                 val isMouse = event.changes.any { it.type == PointerType.Mouse }
                                 if (isMouse) {
                                     val pos = event.changes.first().position
@@ -444,7 +518,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                 }
                             } else if (event.type == PointerEventType.Release) {
                                 val isMouse = event.changes.any { it.type == PointerType.Mouse }
-                                if (isMouse && !touchMouse) {
+                                if (isMouse) {
                                     val pos = event.changes.first().position
                                     val (x, y) = mapToStream(pos)
                                     session.sendMouseMove(x, y, 0)
@@ -456,22 +530,6 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                 }
         ) {
             VideoSurface(session, Modifier.fillMaxSize())
-
-            // 触屏鼠标模式的虚拟光标
-            if (touchMouse && cursorVisible && !viewOnly) {
-                Canvas(Modifier.fillMaxSize()) {
-                    val c = cursorPos
-                    val path = Path().apply {
-                        moveTo(c.x, c.y)
-                        lineTo(c.x + 16f, c.y + 5.5f)
-                        lineTo(c.x + 7f, c.y + 7f)
-                        lineTo(c.x + 5.5f, c.y + 16f)
-                        close()
-                    }
-                    drawPath(path, Color.Black, style = Stroke(width = 2f))
-                    drawPath(path, Color.White)
-                }
-            }
         }
 
         // ============ 状态覆盖层 ============
@@ -542,7 +600,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     modifier = Modifier.statusBarsPadding().padding(horizontal = 4.dp, vertical = 2.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(onClick = { state.navigate(com.selkies.client.Screen.ServerList) }) {
+                    IconButton(onClick = { exitConfirm = true }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回", tint = Color.White)
                     }
                     Column(Modifier.weight(1f)) {
@@ -555,7 +613,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                 append(streamSize.first).append('×').append(streamSize.second)
                                 if (stats.fps > 0) append(" · ").append(stats.fps).append("fps")
                                 if (stats.latencyMs > 0) append(" · ").append(stats.latencyMs).append("ms")
-                                if (viewOnly) append(" · 查看模式")
+                                if (viewOnly) append(" · 只读（viewer 通道）")
+                                if (inputMode == InputMode.TRACKPAD) append(" · 触摸板")
                             },
                             color = Color.White.copy(alpha = 0.7f), fontSize = 11.sp
                         )
@@ -605,8 +664,11 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    ToolButton(Icons.Filled.Keyboard, "键盘") { panel = if (panel == SessionPanel.KEYBOARD) SessionPanel.NONE else SessionPanel.KEYBOARD }
-                    ToolButton(Icons.Filled.Abc, "特殊键") { panel = if (panel == SessionPanel.SPECIAL_KEYS) SessionPanel.NONE else SessionPanel.SPECIAL_KEYS }
+                    ToolButton(
+                        Icons.Filled.Keyboard, "键盘",
+                        tint = if (floatingKb) Color(0xFF60A5FA) else Color.White
+                    ) { floatingKb = !floatingKb }
+                    ToolButton(Icons.Filled.Abc, "输入法") { panel = if (panel == SessionPanel.KEYBOARD) SessionPanel.NONE else SessionPanel.KEYBOARD }
                     ToolButton(Icons.Filled.Bolt, "快捷键") { panel = if (panel == SessionPanel.HOTKEYS) SessionPanel.NONE else SessionPanel.HOTKEYS }
                     ToolButton(Icons.Filled.ContentPaste, "剪贴板") { panel = if (panel == SessionPanel.CLIPBOARD) SessionPanel.NONE else SessionPanel.CLIPBOARD }
                     ToolButton(Icons.Filled.Folder, "文件") { panel = if (panel == SessionPanel.FILES) SessionPanel.NONE else SessionPanel.FILES }
@@ -626,12 +688,10 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     }
                     if (platform.isTouchDevice()) {
                         ToolButton(
-                            Icons.Filled.Mouse, "触屏鼠标",
-                            tint = if (touchMouse) Color(0xFF60A5FA) else Color.White
-                        ) {
-                            touchMouse = !touchMouse
-                            cursorVisible = false
-                        }
+                            if (inputMode == InputMode.TRACKPAD) Icons.Filled.Mouse else Icons.Filled.TouchApp,
+                            if (inputMode == InputMode.TRACKPAD) "触摸板" else "触屏",
+                            tint = if (inputMode == InputMode.TRACKPAD) Color(0xFF60A5FA) else Color.White
+                        ) { showModeSelector = true }
                     }
                     ToolButton(Icons.Filled.QueryStats, "统计") { panel = if (panel == SessionPanel.STATS) SessionPanel.NONE else SessionPanel.STATS }
                     ToolButton(
@@ -662,7 +722,6 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                         Text(
                             when (panel) {
                                 SessionPanel.KEYBOARD -> "输入法（可直接打字）"
-                                SessionPanel.SPECIAL_KEYS -> "特殊按键与修饰键"
                                 SessionPanel.HOTKEYS -> "快捷键"
                                 SessionPanel.CLIPBOARD -> "剪贴板"
                                 SessionPanel.FILES -> "文件传输"
@@ -676,7 +735,6 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     }
                     when (panel) {
                         SessionPanel.KEYBOARD -> ImeHostPanel(session)
-                        SessionPanel.SPECIAL_KEYS -> SpecialKeysPanel(session)
                         SessionPanel.HOTKEYS -> HotkeysPanel(state, session)
                         SessionPanel.CLIPBOARD -> ClipboardPanel(state, session)
                         SessionPanel.FILES -> FilesPanel(state, session)
@@ -685,6 +743,84 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     }
                 }
             }
+        }
+
+        // ============ 悬浮窗可拖动软键盘（非 IME） ============
+        if (!viewOnly && status == SelkiesSession.Status.CONNECTED) {
+            FloatingKeyboard(
+                session = session,
+                visible = floatingKb,
+                onDismiss = { floatingKb = false }
+            )
+        }
+
+        // ============ 轻提示（打印到达等） ============
+        AnimatedVisibility(
+            visible = toast != null,
+            enter = fadeIn() + slideInVertically { -it / 2 },
+            exit = fadeOut() + slideOutVertically { -it / 2 },
+            modifier = Modifier.align(Alignment.TopCenter)
+        ) {
+            Surface(
+                color = Color.Black.copy(alpha = 0.75f),
+                shape = RoundedCornerShape(20.dp),
+                modifier = Modifier.statusBarsPadding().padding(top = 8.dp)
+            ) {
+                Text(
+                    toast ?: "",
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                )
+            }
+        }
+
+        // ============ 输入模式选择器 ============
+        if (showModeSelector) {
+            AlertDialog(
+                onDismissRequest = { showModeSelector = false },
+                title = { Text("远程控制模式") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        ModeOption(
+                            title = "触屏模式（直接）",
+                            desc = "手指点哪里就在哪里点击，拖动即拖拽，双指滚动/缩放",
+                            selected = inputMode == InputMode.TOUCH
+                        ) {
+                            inputMode = InputMode.TOUCH
+                            pendingDrag = false
+                            showModeSelector = false
+                        }
+                        ModeOption(
+                            title = "鼠标模式（触摸板）",
+                            desc = "手指滑动移动远程光标（相对），轻点=左键，长按=右键，双击后按住拖动，双指滚动",
+                            selected = inputMode == InputMode.TRACKPAD
+                        ) {
+                            inputMode = InputMode.TRACKPAD
+                            pendingDrag = false
+                            showModeSelector = false
+                        }
+                    }
+                },
+                confirmButton = {},
+                dismissButton = { TextButton(onClick = { showModeSelector = false }) { Text("取消") } }
+            )
+        }
+
+        // ============ 返回确认 ============
+        if (exitConfirm) {
+            AlertDialog(
+                onDismissRequest = { exitConfirm = false },
+                title = { Text("断开连接") },
+                text = { Text("确定断开远程会话并返回服务器列表？") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        exitConfirm = false
+                        state.navigate(com.selkies.client.Screen.ServerList)
+                    }) { Text("断开返回", color = MaterialTheme.colorScheme.error) }
+                },
+                dismissButton = { TextButton(onClick = { exitConfirm = false }) { Text("取消") } }
+            )
         }
 
         // IME 宿主（Android 隐藏输入框，常驻）
@@ -698,6 +834,26 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             },
             modifier = Modifier.size(1.dp).align(Alignment.Center)
         )
+    }
+}
+
+@Composable
+private fun ModeOption(title: String, desc: String, selected: Boolean, onClick: () -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick() }
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Text(title, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.titleSmall)
+            Text(
+                desc,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
     }
 }
 

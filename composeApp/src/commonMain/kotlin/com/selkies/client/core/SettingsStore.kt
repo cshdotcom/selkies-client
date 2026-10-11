@@ -3,6 +3,7 @@ package com.selkies.client.core
 import com.selkies.client.model.AppSettings
 import com.selkies.client.model.HotkeyDef
 import com.selkies.client.model.ServerEntry
+import androidx.compose.runtime.mutableStateOf
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -128,6 +129,18 @@ class SettingsStore(private val configDir: String) {
         return added
     }
 
+    /**
+     * 响应式更新设置：复制一份新实例再修改并重新赋值，
+     * 触发 Compose 重组与 onChange 监听器。
+     * （直接改 var 字段不会触发任何通知——这是 v2.0.1 设置开关"点不动"的根因）
+     */
+    fun updateSettings(mutate: (AppSettings) -> Unit) {
+        val s = settings.value.copy()
+        mutate(s)
+        settings.value = s
+        saveSettings()
+    }
+
     // ---- 快捷键 ----
     fun upsertHotkey(def: HotkeyDef) {
         val list = hotkeys.value.toMutableList()
@@ -143,11 +156,17 @@ class SettingsStore(private val configDir: String) {
     }
 }
 
-/** 简单的可变状态包装（避免在 common 层直接依赖 androidx mutableStateOf 的生命周期语义） */
+/**
+ * 可变状态包装：以 Compose mutableStateOf 为背书，
+ * 在 Composable 中读取 .value 即可自动跟踪变化（Android/Desktop 通用）。
+ * 赋值时同时通知 onChange 监听器（AppState 等）。
+ */
 class MutableStateFlowCompat<T>(initial: T) {
-    var value: T = initial
+    private val state = mutableStateOf(initial)
+    var value: T
+        get() = state.value
         set(newValue) {
-            field = newValue
+            state.value = newValue
             listeners.forEach { it(newValue) }
         }
     private val listeners = ArrayList<(T) -> Unit>()

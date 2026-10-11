@@ -85,6 +85,14 @@ object DesktopPlatform : PlatformServices {
         }.apply { isDaemon = true }.start()
     }
 
+    override fun readFileBytes(path: String): ByteArray? = runCatching {
+        File(path).takeIf { it.exists() }?.readBytes()
+    }.getOrNull()
+
+    override fun exitApp() {
+        kotlin.system.exitProcess(0)
+    }
+
     override fun saveFile(suggestedName: String, bytes: ByteArray, onDone: (Boolean) -> Unit) {
         Thread {
             runCatching {
@@ -368,8 +376,9 @@ actual fun createHttpClient(allowUntrustedCert: Boolean): HttpClient {
                     hostnameVerifier { _, _ -> true }
                 }
                 connectTimeout(java.time.Duration.ofSeconds(12))
-                readTimeout(java.time.Duration.ofSeconds(30))
-                pingInterval(java.time.Duration.ofMillis(20000))
+                // ⚠️ 不设 pingInterval：OkHttp ping 无 pong 会被主动杀连接（与 Android 同根因）
+                // ⚠️ readTimeout=0：WS 空闲期不误杀；探测超时由协程 withTimeout 控制
+                readTimeout(java.time.Duration.ZERO)
             }
         }
     }

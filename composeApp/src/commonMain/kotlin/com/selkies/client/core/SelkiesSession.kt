@@ -91,6 +91,11 @@ class SelkiesSession(
     private var startVideoAttempts = 0
     private var clipboardTid = 0
     private var statsSubscriptionActive = false
+    /** 指针消息递增序列号（官方 _pointerSeq，多线程安全） */
+    private val pointerSeq = java.util.concurrent.atomic.AtomicInteger(0)
+    /** 当前按住的 keysym（用于 kh 心跳，官方 100ms 周期） */
+    private val heldKeys = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+    private var keyHeartbeatJob: Job? = null
 
     private val startedAt = System.currentTimeMillis()
 
@@ -123,6 +128,8 @@ class SelkiesSession(
         reconnectJob?.cancel()
         ackTimer?.cancel()
         watchdogTimer?.cancel()
+        keyHeartbeatJob?.cancel()
+        heldKeys.clear()
         runCatching { micCapture.stop() }
         runCatching { webcamCapture.stop() }
         runCatching { audioPlayer.stop() }
@@ -132,6 +139,8 @@ class SelkiesSession(
         status.value = Status.CLOSED
         statusDetail.value = "已断开"
     }
+
+    private fun nextPointerSeq(): Int = pointerSeq.incrementAndGet()
 
     // =====================================================================
     // 连接回调
@@ -234,6 +243,11 @@ class SelkiesSession(
                 if (!videoRequested) {
                     videoRequested = true
                     ioScope.launch {
+                        if (server.viewOnly) {
+                            // 官方 viewer/共享模式流程：先 STOP 再延迟 250ms START，服务器才会为旁观者启动视频
+                            connection.sendText("STOP_VIDEO")
+                            delay(250)
+                        }
                         // 请求分辨率 + 启动视频
                         val w = realizedResolution.value?.first ?: stats.value.let {
                             parseResW(it.resolution) ?: 1280
@@ -445,7 +459,11 @@ class SelkiesSession(
                         onPrintDocument(name, sizeBytes)
                     }
                     platform.print().printPdf(bytes, name)
+                } else {
+                    lastError.value = "远程打印失败：获取打印文档 $name 失败（HTTP $code）"
                 }
+            }.onFailure {
+                lastError.value = "远程打印失败：${it.message ?: it.javaClass.simpleName}"
             }
         }
     }
@@ -620,7 +638,28 @@ class SelkiesSession(
     }
 
     fun sendKey(keysym: Long, down: Boolean) = post {
+        if (down) heldKeys.add(keysym) else heldKeys.remove(keysym)
         connection.sendText(Protocol.keyEvent(down, keysym))
+        if (down) startKeyHeartbeat() else if (heldKeys.isEmpty()) stopKeyHeartbeat()
+    }
+
+    /**
+     * kh 按键心跳（官方行为）：有按键按住期间每 100ms 上报一次按住的 keysym 列表，
+     * 全部松开后停止。用于服务器校准长按状态、防按键卡死。
+     */
+    private fun startKeyHeartbeat() {
+        if (keyHeartbeatJob?.isActive == true) return
+        keyHeartbeatJob = scope.launch {
+            while (isActive && heldKeys.isNotEmpty() && !userClosed) {
+                runCatching { connection.sendText(Protocol.keyHeartbeat(heldKeys.toList())) }
+                delay(100)
+            }
+        }
+    }
+
+    private fun stopKeyHeartbeat() {
+        keyHeartbeatJob?.cancel()
+        keyHeartbeatJob = null
     }
 
     fun sendKeyChord(keysyms: List<Long>) = post {
@@ -637,11 +676,15 @@ class SelkiesSession(
     }
 
     fun sendMouseMove(x: Int, y: Int, mask: Int) = post {
-        connection.sendText(Protocol.mouseMove(x, y, mask))
+        connection.sendText(Protocol.mouseMove(x, y, mask, nextPointerSeq()))
+    }
+
+    fun sendMouseMoveRelative(dx: Int, dy: Int, mask: Int) = post {
+        connection.sendText(Protocol.mouseMoveRelative(dx, dy, mask, nextPointerSeq()))
     }
 
     fun sendMouseButton(x: Int, y: Int, mask: Int) = post {
-        connection.sendText(Protocol.mouseMove(x, y, mask))
+        connection.sendText(Protocol.mouseMove(x, y, mask, nextPointerSeq()))
     }
 
     fun sendScroll(currentMask: Int, vertical: Boolean, notches: Int) = post {

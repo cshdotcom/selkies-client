@@ -125,6 +125,10 @@ interface PlatformServices {
     fun nativeKeyCodeToKeysym(nativeKeyCode: Int, unicodeChar: Int): Int?
     /** 物理/平台键盘直通钩子（Desktop=AWT 分发器；Android=no-op，走 Compose 键事件） */
     fun setPhysicalKeyHandler(handler: ((keyCode: Int, down: Boolean) -> Unit)?)
+    /** 读取本地文件/内容 URI 字节（导入、上传预读等） */
+    fun readFileBytes(path: String): ByteArray?
+    /** 退出应用（Android=finish；Desktop=System.exit） */
+    fun exitApp()
 }
 
 expect fun getPlatformServices(): PlatformServices

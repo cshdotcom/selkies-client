@@ -75,6 +75,8 @@ fun AddServerScreen(state: AppState, serverId: String?) {
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
+    com.selkies.client.ui.PlatformBackHandler { state.navigate(Screen.ServerList) }
+
     val encoders = listOf(
         "h264enc" to "H.264 硬编（默认）",
         "h264enc-striped" to "H.264 条带",

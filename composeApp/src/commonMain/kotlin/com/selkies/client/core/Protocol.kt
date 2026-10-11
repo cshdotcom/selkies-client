@@ -141,6 +141,8 @@ object Protocol {
         ((data[off].toInt() and 0xff) shl 8) or (data[off + 1].toInt() and 0xff)
 
     // ---- 输入消息构造 ----
+    // ⚠️ 官方格式（selkies-web-core _sendPointer）：每条指针消息末尾附递增序列号，
+    //    服务器据此丢弃乱序/重复事件；固定 0 可能导致事件被丢弃（v2.0.1 隐患）
 
     fun keyEvent(down: Boolean, keysym: Long): String =
         (if (down) "kd," else "ku,") + keysym
@@ -152,29 +154,38 @@ object Protocol {
     /** IME 提交文本 */
     fun commitText(text: String): String = "co,end,$text"
 
-    /** 鼠标绝对移动 */
-    fun mouseMove(x: Int, y: Int, mask: Int): String = "m,$x,$y,$mask,0"
+    /** 鼠标绝对移动（官方：m,x,y,mask,0,seq） */
+    fun mouseMove(x: Int, y: Int, mask: Int, seq: Int): String = "m,$x,$y,$mask,0,$seq"
 
-    /** 鼠标相对移动（游戏/指针锁定） */
-    fun mouseMoveRelative(dx: Int, dy: Int, mask: Int): String = "m2,$dx,$dy,$mask,0"
+    /** 鼠标相对移动（官方：m2,dx,dy,mask,0,seq；游戏/触摸板模式） */
+    fun mouseMoveRelative(dx: Int, dy: Int, mask: Int, seq: Int): String = "m2,$dx,$dy,$mask,0,$seq"
 
     /**
-     * 滚动脉冲：服务器在滚动位上升沿触发滚动，需三连发
-     * vertical: true=上下 false=左右; amount>0 = 右/下
+     * 滚动脉冲（官方 _triggerMouseWheel）：
+     * 纵向三连发 m2,0,0,cleared→cleared|bit→buttonMask，幅度 1..8；
+     * 横向两连发 set→restore。
+     * bit: 上=0x10 下=0x08 左=0x40 右=0x80
      */
-    fun scrollPulse(currentMask: Int, vertical: Boolean, amount: Int): List<String> {
-        val magnitude = min(64, abs(amount).coerceAtLeast(1))
+    fun scrollPulse(buttonMask: Int, vertical: Boolean, amount: Int): List<String> {
+        val magnitude = min(8, abs(amount).coerceAtLeast(1))
         val bit = if (vertical) {
             if (amount > 0) SCROLL_DOWN_BIT else SCROLL_UP_BIT
         } else {
             if (amount > 0) SCROLL_RIGHT_BIT else SCROLL_LEFT_BIT
         }
-        val cleared = currentMask and bit.inv()
-        return listOf(
-            "m2,0,0,$cleared,$magnitude",
-            "m2,0,0,${cleared or bit},$magnitude",
-            "m2,0,0,$currentMask,$magnitude"
-        )
+        val cleared = buttonMask and bit.inv()
+        return if (vertical) {
+            listOf(
+                "m2,0,0,$cleared,$magnitude",
+                "m2,0,0,${cleared or bit},$magnitude",
+                "m2,0,0,$buttonMask,$magnitude"
+            )
+        } else {
+            listOf(
+                "m2,0,0,${buttonMask or bit},$magnitude",
+                "m2,0,0,$buttonMask,$magnitude"
+            )
+        }
     }
 
     /** 手柄连接 */
