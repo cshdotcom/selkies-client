@@ -1,4 +1,4 @@
-# Selkies 原生远程桌面客户端 v2.0.1
+# Selkies 原生远程桌面客户端 v2.2.0
 
 原生 Android + 桌面（x86_64 / ARM64）双端客户端，100% 原生实现（**非 WebView 套壳**），直连 Selkies v2 WebSocket 流协议。深色/浅色主题可切换，两端页面与功能完全一致。
 
@@ -9,17 +9,26 @@
 >
 > 另补齐官方网页客户端必带的 `tabId` 标识（缺失会导致服务器不为本客户端启动视频捕获）。
 
+
+> **v2.2.0 更新（世界最完整键盘）**：
+> 1. **151 键完整悬浮键盘**——主键盘页 103 键（功能行/完整主区/导航区/方向键/数字小键盘，NumLk 真实切换、+/Enter 真实 2u 高键）+ 媒体页 24 键（音量/播放/主页/邮件/搜索/计算器/电源/唤醒/弹出/F13-F24）+ 扩展页 24 键（SysRq/Break/Compose/日韩键/小键盘扩展）；23 单位统一网格列严格对齐；可拖动、双指捏合缩放、折叠悬浮球、长按重复；修饰键单次粘滞+双击锁定。
+> 2. **输入方式可选**——远程控制时可选：悬浮完整键盘 / 系统输入法（支持中文）/ 快捷按钮栏（CTL/ALT/WIN 粘滞 + TAB/ESC/ENTER 单发 + 固定快捷键一键直发）；选择被记住，长按"键盘"重新选择。
+> 3. **快捷键创建用完整键盘选择**（修饰键粘滞+主键点选成组）；任意快捷键可固定到快捷按钮栏。
+> 4. **官方前端 API 全量校对补齐**——LOST_FRAME 丢帧上报、远程应用启动面板（server_apps + cmd,）、视频高级设置（jpeg_quality/video_fullcolor/use_cpu/force_aligned_resolution/video_streaming_mode/paint-over 系列）。
+> 5. 文本合成条：与输入法等效（可调系统 IME 输中文，co,end 提交）；对官方 softButtons 的完整扩展。
+> 6. 全部回归通过：协议 E2E / 连接回归（RST/正常关/守卫）/ 视频解码 0 错 / Linux GUI 实测（151 键布局像素级校验、修饰键粘滞高亮、输入方式选择器、被顶替友好提示与重试）。
+
 ---
 
 ## 交付清单
 
 | 文件 | 说明 |
 |------|------|
-| `Selkies-Android-v2.0.1.apk` | Android 签名正式包（minSdk 26 / Android 8.0+，13MB） |
-| `Selkies-Android-v2.0.1-debug.apk` | Android 调试包（可用 logcat 排查） |
-| `Selkies-Desktop-windows-x64.zip` | Windows x64 便携完整包（自带 Java 21，双击 `launch.bat` 即用；Win-ARM64 可经 x64 模拟运行） |
-| `Selkies-Desktop-linux-x86_64.zip` | Linux x86_64 便携完整包（自带 Java 21，运行 `launch.sh`） |
-| `Selkies-Desktop-linux-arm64.zip` | Linux ARM64 便携完整包（树莓派/ARM 主机可用） |
+| `Selkies-Android-v2.2.0.apk` | Android 签名正式包（minSdk 26 / Android 8.0+，13MB） |
+| `Selkies-Android-v2.2.0-debug.apk` | Android 调试包（可用 logcat 排查） |
+| `Selkies-Desktop-windows-x64-v2.2.0.zip` | Windows x64 便携完整包（自带 Java 21，双击 `launch.bat` 即用；Win-ARM64 可经 x64 模拟运行） |
+| `Selkies-Desktop-linux-x86_64-v2.2.0.zip` | Linux x86_64 便携完整包（自带 Java 21，运行 `launch.sh`） |
+| `Selkies-Desktop-linux-arm64-v2.2.0.zip` | Linux ARM64 便携完整包（树莓派/ARM 主机可用） |
 | `Selkies-Desktop-all.jar` | 通用 JAR（任意装有 Java 17+ 的系统，含全部平台原生库，235MB） |
 | `Selkies-Client-source.zip` | 完整源码（含 Gradle 工程与签名密钥） |
 
@@ -43,7 +52,7 @@
 4. 保存并点击服务器卡片即进入远程桌面。
 
 ### 桌面（以 Windows 为例）
-1. 解压 `Selkies-Desktop-windows-x64.zip`；
+1. 解压 `Selkies-Desktop-windows-x64-v2.2.0.zip`；
 2. 双击 `Selkies-Desktop/launch.bat`（Linux 为 `launch.sh`）；
 3. 其余与 Android 完全一致（页面相同、功能不减）。
 

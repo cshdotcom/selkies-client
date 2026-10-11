@@ -12,9 +12,9 @@ object BuiltinHotkeys {
         val system = listOf(
             HotkeyDef(id("lock"), "锁定屏幕", listOf(Keysyms.XK_Super_L, 'l'.code.toLong()), true, "system"),
             HotkeyDef(id("run"), "运行对话框", listOf(Keysyms.XK_Alt_L, Keysyms.XK_F2), true, "system"),
-            HotkeyDef(id("terminal"), "打开终端", listOf(Keysyms.XK_Control_L, Keysyms.XK_Alt_L, 't'.code.toLong()), true, "system"),
+            HotkeyDef(id("terminal"), "打开终端", listOf(Keysyms.XK_Control_L, Keysyms.XK_Alt_L, 't'.code.toLong()), true, "system", true),
             HotkeyDef(id("close-window"), "关闭窗口", listOf(Keysyms.XK_Alt_L, Keysyms.XK_F4), true, "system"),
-            HotkeyDef(id("switch-app"), "切换应用", listOf(Keysyms.XK_Alt_L, Keysyms.XK_Tab), true, "system"),
+            HotkeyDef(id("switch-app"), "切换应用", listOf(Keysyms.XK_Alt_L, Keysyms.XK_Tab), true, "system", true),
             HotkeyDef(id("show-desktop"), "显示桌面", listOf(Keysyms.XK_Super_L, 'd'.code.toLong()), true, "system"),
             HotkeyDef(id("activities"), "活动概览", listOf(Keysyms.XK_Super_L), true, "system"),
             HotkeyDef(id("screenshot"), "截图", listOf(Keysyms.XK_Print), true, "system"),
@@ -47,14 +47,14 @@ object BuiltinHotkeys {
             HotkeyDef(id("downloads"), "下载列表", listOf(Keysyms.XK_Control_L, 'j'.code.toLong()), true, "browser")
         )
         val text = listOf(
-            HotkeyDef(id("select-all"), "全选", listOf(Keysyms.XK_Control_L, 'a'.code.toLong()), true, "text"),
-            HotkeyDef(id("copy"), "复制", listOf(Keysyms.XK_Control_L, 'c'.code.toLong()), true, "text"),
-            HotkeyDef(id("paste"), "粘贴", listOf(Keysyms.XK_Control_L, 'v'.code.toLong()), true, "text"),
-            HotkeyDef(id("cut"), "剪切", listOf(Keysyms.XK_Control_L, 'x'.code.toLong()), true, "text"),
-            HotkeyDef(id("undo"), "撤销", listOf(Keysyms.XK_Control_L, 'z'.code.toLong()), true, "text"),
+            HotkeyDef(id("select-all"), "全选", listOf(Keysyms.XK_Control_L, 'a'.code.toLong()), true, "text", true),
+            HotkeyDef(id("copy"), "复制", listOf(Keysyms.XK_Control_L, 'c'.code.toLong()), true, "text", true),
+            HotkeyDef(id("paste"), "粘贴", listOf(Keysyms.XK_Control_L, 'v'.code.toLong()), true, "text", true),
+            HotkeyDef(id("cut"), "剪切", listOf(Keysyms.XK_Control_L, 'x'.code.toLong()), true, "text", true),
+            HotkeyDef(id("undo"), "撤销", listOf(Keysyms.XK_Control_L, 'z'.code.toLong()), true, "text", true),
             HotkeyDef(id("redo"), "重做", listOf(Keysyms.XK_Control_L, Keysyms.XK_Shift_L, 'z'.code.toLong()), true, "text"),
             HotkeyDef(id("find-text"), "查找", listOf(Keysyms.XK_Control_L, 'f'.code.toLong()), true, "text"),
-            HotkeyDef(id("save"), "保存", listOf(Keysyms.XK_Control_L, 's'.code.toLong()), true, "text"),
+            HotkeyDef(id("save"), "保存", listOf(Keysyms.XK_Control_L, 's'.code.toLong()), true, "text", true),
             HotkeyDef(id("print-doc"), "打印", listOf(Keysyms.XK_Control_L, 'p'.code.toLong()), true, "text"),
             HotkeyDef(id("home-line"), "行首", listOf(Keysyms.XK_Home), true, "text"),
             HotkeyDef(id("end-line"), "行尾", listOf(Keysyms.XK_End), true, "text"),

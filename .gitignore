@@ -2,3 +2,4 @@
 build/
 local.properties
 hs_err_pid*.log
+.kotlin/

@@ -1,5 +1,6 @@
 package com.selkies.client.ui
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -69,6 +70,18 @@ fun AddServerScreen(state: AppState, serverId: String?) {
     var encoder by remember { mutableStateOf(existing?.encoder ?: "h264enc") }
     var audioEnabled by remember { mutableStateOf(existing?.audioEnabled ?: true) }
     var displayId by remember { mutableStateOf(existing?.displayId ?: "primary") }
+
+    // ---- 官方前端对齐的视频高级设置 ----
+    var showAdvanced by remember { mutableStateOf(false) }
+    var jpegQuality by remember { mutableFloatStateOf((existing?.jpegQuality ?: 0).toFloat()) }
+    var videoFullcolor by remember { mutableStateOf(existing?.videoFullcolor ?: false) }
+    var useCpu by remember { mutableStateOf(existing?.useCpu ?: false) }
+    var forceAligned by remember { mutableStateOf(existing?.forceAlignedResolution ?: false) }
+    var streamingMode by remember { mutableStateOf(existing?.videoStreamingMode ?: "") }
+    var paintOverCrf by remember { mutableFloatStateOf((existing?.paintOverCrf ?: 0).toFloat()) }
+    var paintOverBurst by remember { mutableFloatStateOf((existing?.paintOverBurstFrames ?: 0).toFloat()) }
+    var paintOverJpeg by remember { mutableFloatStateOf((existing?.paintOverJpegQuality ?: 0).toFloat()) }
+    var usePaintOverQuality by remember { mutableStateOf(existing?.usePaintOverQuality ?: false) }
 
     var testing by remember { mutableStateOf(false) }
     var testResult by remember { mutableStateOf<String?>(null) }
@@ -180,6 +193,58 @@ fun AddServerScreen(state: AppState, serverId: String?) {
                 FilterChip(selected = encoder == "jpeg", onClick = { encoder = "jpeg" }, label = { Text("JPEG") })
             }
 
+            // ---- 视频高级设置（对齐官方设置面板）----
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().clickable { showAdvanced = !showAdvanced }
+            ) {
+                Text(
+                    if (showAdvanced) "▾ 视频高级设置（对齐官方）" else "▸ 视频高级设置（对齐官方）",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+            if (showAdvanced) {
+                Text("JPEG 质量：${if (jpegQuality < 1) "默认" else jpegQuality.toInt().toString()}（仅 JPEG 编码器生效）",
+                    style = MaterialTheme.typography.bodySmall)
+                Slider(value = jpegQuality, onValueChange = { jpegQuality = it }, valueRange = 0f..100f)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = videoFullcolor, onCheckedChange = { videoFullcolor = it })
+                    Text("全色彩（video_fullcolor，带宽↑）")
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = useCpu, onCheckedChange = { useCpu = it })
+                    Text("软编码（use_cpu，无 GPU 时）")
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = forceAligned, onCheckedChange = { forceAligned = it })
+                    Text("强制对齐分辨率")
+                }
+                Text("流式模式：", style = MaterialTheme.typography.bodySmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(selected = streamingMode.isEmpty(), onClick = { streamingMode = "" }, label = { Text("默认") })
+                    FilterChip(selected = streamingMode == "standard", onClick = { streamingMode = "standard" }, label = { Text("标准") })
+                    FilterChip(selected = streamingMode == "paint-over", onClick = { streamingMode = "paint-over" }, label = { Text("Paint-over") })
+                }
+                if (streamingMode == "paint-over") {
+                    Text("Paint-over CRF：${if (paintOverCrf < 1) "默认" else paintOverCrf.toInt().toString()}",
+                        style = MaterialTheme.typography.bodySmall)
+                    Slider(value = paintOverCrf, onValueChange = { paintOverCrf = it }, valueRange = 0f..51f)
+                    Text("突发帧数：${if (paintOverBurst < 1) "默认" else paintOverBurst.toInt().toString()}",
+                        style = MaterialTheme.typography.bodySmall)
+                    Slider(value = paintOverBurst, onValueChange = { paintOverBurst = it }, valueRange = 0f..30f)
+                    Text("覆盖层 JPEG 质量：${if (paintOverJpeg < 1) "默认" else paintOverJpeg.toInt().toString()}",
+                        style = MaterialTheme.typography.bodySmall)
+                    Slider(value = paintOverJpeg, onValueChange = { paintOverJpeg = it }, valueRange = 0f..100f)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(checked = usePaintOverQuality, onCheckedChange = { usePaintOverQuality = it })
+                        Text("使用 Paint-over 质量参数（CRF 模式）")
+                    }
+                }
+                Text("以上选项留默认 = 不发送，由服务器端配置决定。",
+                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+
             Spacer(Modifier.height(8.dp))
 
             Button(
@@ -202,6 +267,15 @@ fun AddServerScreen(state: AppState, serverId: String?) {
                             videoCrf = if (useCrf) videoCrf.toInt() else 0,
                             encoder = encoder,
                             audioEnabled = audioEnabled,
+                            jpegQuality = jpegQuality.toInt(),
+                            videoFullcolor = videoFullcolor,
+                            useCpu = useCpu,
+                            forceAlignedResolution = forceAligned,
+                            videoStreamingMode = streamingMode,
+                            paintOverCrf = paintOverCrf.toInt(),
+                            paintOverBurstFrames = paintOverBurst.toInt(),
+                            paintOverJpegQuality = paintOverJpeg.toInt(),
+                            usePaintOverQuality = usePaintOverQuality,
                             useTokenAuth = useToken, token = token,
                             allowUntrustedCert = allowUntrusted
                         )
@@ -237,6 +311,15 @@ fun AddServerScreen(state: AppState, serverId: String?) {
                         videoCrf = if (useCrf) videoCrf.toInt() else 0,
                         encoder = encoder,
                         audioEnabled = audioEnabled,
+                        jpegQuality = jpegQuality.toInt(),
+                        videoFullcolor = videoFullcolor,
+                        useCpu = useCpu,
+                        forceAlignedResolution = forceAligned,
+                        videoStreamingMode = streamingMode,
+                        paintOverCrf = paintOverCrf.toInt(),
+                        paintOverBurstFrames = paintOverBurst.toInt(),
+                        paintOverJpegQuality = paintOverJpeg.toInt(),
+                        usePaintOverQuality = usePaintOverQuality,
                         useTokenAuth = useToken, token = token,
                         allowUntrustedCert = allowUntrusted
                     )

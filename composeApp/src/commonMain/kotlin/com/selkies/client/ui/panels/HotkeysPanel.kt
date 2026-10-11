@@ -11,12 +11,16 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -47,7 +51,7 @@ import com.selkies.client.platform.keysymOrNull
 import java.util.UUID
 
 /**
- * 快捷键面板：内置分类 + 自定义 + 录制
+ * 快捷键面板：内置分类 + 自定义 + 录制 + 固定到快捷按钮栏
  */
 @Composable
 fun HotkeysPanel(state: AppState, session: SelkiesSession) {
@@ -76,7 +80,10 @@ fun HotkeysPanel(state: AppState, session: SelkiesSession) {
                     onRun = { session.sendKeyChord(hk.keysyms) },
                     onDelete = if (!hk.builtin) {
                         { state.store.deleteHotkey(hk.id) }
-                    } else null
+                    } else null,
+                    onPin = {
+                        state.store.upsertHotkey(hk.copy(pinned = !hk.pinned))
+                    }
                 )
             }
         }
@@ -84,7 +91,7 @@ fun HotkeysPanel(state: AppState, session: SelkiesSession) {
 }
 
 @Composable
-fun HotkeyRow(hotkey: HotkeyDef, onRun: () -> Unit, onDelete: (() -> Unit)?) {
+fun HotkeyRow(hotkey: HotkeyDef, onRun: () -> Unit, onDelete: (() -> Unit)?, onPin: (() -> Unit)? = null) {
     Surface(
         shape = RoundedCornerShape(10.dp),
         color = if (hotkey.builtin) MaterialTheme.colorScheme.surfaceVariant
@@ -101,6 +108,15 @@ fun HotkeyRow(hotkey: HotkeyDef, onRun: () -> Unit, onDelete: (() -> Unit)?) {
                         hotkey.keysyms.joinToString(" + ") { Keysyms.name(it) },
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            if (onPin != null) {
+                IconButton(onClick = onPin) {
+                    Icon(
+                        if (hotkey.pinned) Icons.Filled.PushPin else Icons.Outlined.PushPin,
+                        if (hotkey.pinned) "取消固定" else "固定到快捷按钮栏",
+                        tint = if (hotkey.pinned) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
@@ -124,13 +140,17 @@ fun HotkeyRow(hotkey: HotkeyDef, onRun: () -> Unit, onDelete: (() -> Unit)?) {
 fun HotkeyManagerScreen(state: AppState) {
     val hotkeys = state.store.hotkeys.value
     var recording by remember { mutableStateOf(false) }
+    var picking by remember { mutableStateOf(false) }
     var newHotkeyName by remember { mutableStateOf("") }
     val recorder = remember { HotkeyRecorder() }
     var recordedKeys by remember { mutableStateOf<List<Long>>(emptyList()) }
 
     com.selkies.client.ui.PlatformBackHandler {
-        if (recording) recording = false
-        else state.navigate(com.selkies.client.Screen.ServerList)
+        when {
+            picking -> picking = false
+            recording -> recording = false
+            else -> state.navigate(com.selkies.client.Screen.ServerList)
+        }
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -161,13 +181,61 @@ fun HotkeyManagerScreen(state: AppState) {
                         singleLine = true
                     )
                     Spacer(Modifier.height(8.dp))
-                    if (!recording) {
-                        androidx.compose.material3.Button(onClick = {
-                            recording = true
-                            recorder.reset()
-                            recordedKeys = emptyList()
-                        }) { Text("开始录制（按住修饰键后按主键）") }
-                    } else {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (!recording && !picking) {
+                            androidx.compose.material3.Button(onClick = {
+                                recording = true
+                                recorder.reset()
+                                recordedKeys = emptyList()
+                            }) { Text("录制（物理键盘）") }
+                            androidx.compose.material3.OutlinedButton(onClick = {
+                                picking = true
+                                recorder.reset()
+                                recordedKeys = emptyList()
+                            }) {
+                                Icon(Icons.Filled.Keyboard, null, modifier = Modifier.padding(end = 4.dp).size(16.dp))
+                                Text("用完整键盘选择")
+                            }
+                        }
+                    }
+                    if (picking) {
+                        Text(
+                            if (recordedKeys.isEmpty()) "先点修饰键（Ctrl/Alt/Shift/AltGr…），再点主键完成"
+                            else "已选：${recordedKeys.joinToString(" + ") { Keysyms.name(it) }} — 再点主键完成",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        // 世界最完整键盘选择器：修饰键粘滞 + 主键点选 → 直接成组
+                        Box(modifier = Modifier.fillMaxWidth().height(300.dp)) {
+                            CompleteKeyboard(
+                                session = null,
+                                visible = true,
+                                autoScaleHint = 0.42f,
+                                onDismiss = { picking = false },
+                                onChord = { chord ->
+                                    if (chord.size >= 2) {
+                                        if (newHotkeyName.isBlank()) {
+                                            newHotkeyName = chord.joinToString("+") { Keysyms.name(it) }
+                                        }
+                                        state.store.upsertHotkey(
+                                            HotkeyDef(
+                                                id = UUID.randomUUID().toString(),
+                                                name = newHotkeyName,
+                                                keysyms = chord,
+                                                builtin = false,
+                                                category = "custom"
+                                            )
+                                        )
+                                        newHotkeyName = ""
+                                        recordedKeys = emptyList()
+                                        picking = false
+                                    } else {
+                                        recordedKeys = chord
+                                    }
+                                }
+                            )
+                        }
+                    } else if (recording) {
                         Text(
                             if (recordedKeys.isEmpty()) "请先按下修饰键（Ctrl/Alt/Shift/Super）…"
                             else "已按：${recordedKeys.joinToString(" + ") { Keysyms.name(it) }} — 现在按主键完成录制",
@@ -213,7 +281,8 @@ fun HotkeyManagerScreen(state: AppState) {
                         onRun = { },
                         onDelete = if (!hk.builtin) {
                             { state.store.deleteHotkey(hk.id) }
-                        } else null
+                        } else null,
+                        onPin = { state.store.upsertHotkey(hk.copy(pinned = !hk.pinned)) }
                     )
                 }
             }

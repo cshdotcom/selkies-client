@@ -195,6 +195,18 @@ class SelkiesSession(
         }
         payload["audio_bitrate"] = 128000
         payload["enable_binary_clipboard"] = s.clipboardBinaryEnabled
+        // ---- 官方前端视频高级设置（仅非默认时发送，与官方 postSetting 键名一致）----
+        if (server.jpegQuality in 1..100) payload["jpeg_quality"] = server.jpegQuality
+        if (server.videoFullcolor) payload["video_fullcolor"] = true
+        if (server.useCpu) payload["use_cpu"] = true
+        if (server.forceAlignedResolution) payload["force_aligned_resolution"] = true
+        if (server.videoStreamingMode in listOf("standard", "paint-over")) {
+            payload["video_streaming_mode"] = server.videoStreamingMode
+        }
+        if (server.paintOverCrf in 1..51) payload["video_paintover_crf"] = server.paintOverCrf
+        if (server.paintOverBurstFrames > 0) payload["video_paintover_burst_frames"] = server.paintOverBurstFrames
+        if (server.paintOverJpegQuality in 1..100) payload["paint_over_jpeg_quality"] = server.paintOverJpegQuality
+        if (server.usePaintOverQuality) payload["use_paint_over_quality"] = true
         connection.sendText("SETTINGS," + jsonEncode(payload))
     }
 
@@ -526,11 +538,21 @@ class SelkiesSession(
 
     private fun noteVideoChunk(frameId: Int) {
         if (role.value != "viewer") {
+            // 官方 VideoWorker lostFrame 语义：检测到帧号跳跃（丢帧）即上报，
+            // 服务器据此统计/补偿。限定每秒最多报一次避免风暴。
+            if (lastReceivedFrameId >= 0 && frameId > lastReceivedFrameId + 1 &&
+                System.currentTimeMillis() - lastLostFrameReportAt > 1000
+            ) {
+                lastLostFrameReportAt = System.currentTimeMillis()
+                post { connection.sendText("LOST_FRAME $frameId") }
+            }
             lastReceivedFrameId = frameId
         }
         lastReceivedFrameAt = System.currentTimeMillis()
         disarmStartVideoWatchdog()
     }
+
+    private var lastLostFrameReportAt = 0L
 
     private fun gunzip(data: ByteArray, offset: Int, length: Int): String {
         GZIPInputStream(ByteArrayInputStream(data, offset, length - offset)).use { gz ->

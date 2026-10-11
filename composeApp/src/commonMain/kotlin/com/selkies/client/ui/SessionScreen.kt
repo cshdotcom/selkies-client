@@ -8,6 +8,8 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
@@ -31,6 +33,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Abc
+import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Folder
@@ -89,11 +92,13 @@ import com.selkies.client.platform.keysymOrNull
 import com.selkies.client.platform.primaryPressed
 import com.selkies.client.platform.secondaryPressed
 import com.selkies.client.platform.tertiaryPressed
+import com.selkies.client.ui.panels.AppsPanel
 import com.selkies.client.ui.panels.ClipboardPanel
+import com.selkies.client.ui.panels.CompleteKeyboard
 import com.selkies.client.ui.panels.FilesPanel
-import com.selkies.client.ui.panels.FloatingKeyboard
 import com.selkies.client.ui.panels.HotkeysPanel
 import com.selkies.client.ui.panels.ImeHostPanel
+import com.selkies.client.ui.panels.QuickShortcutBar
 import com.selkies.client.ui.panels.StatsPanel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -104,7 +109,7 @@ import kotlin.math.pow
 import kotlin.math.roundToInt
 
 /** 底部面板类型 */
-enum class SessionPanel { NONE, KEYBOARD, HOTKEYS, CLIPBOARD, FILES, STATS }
+enum class SessionPanel { NONE, KEYBOARD, HOTKEYS, CLIPBOARD, FILES, STATS, APPS }
 
 /** 触控输入模式 */
 enum class InputMode { TOUCH, TRACKPAD }
@@ -155,6 +160,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     var fullscreen by remember { mutableStateOf(false) }
     var toolbarVisible by remember { mutableStateOf(true) }
     var floatingKb by remember { mutableStateOf(false) }
+    var quickBar by remember { mutableStateOf(false) }
+    var showInputPicker by remember { mutableStateOf(false) }
     var inputMode by remember { mutableStateOf(if (state.store.settings.value.touchMouseMode) InputMode.TRACKPAD else InputMode.TOUCH) }
     var showModeSelector by remember { mutableStateOf(false) }
     var exitConfirm by remember { mutableStateOf(false) }
@@ -181,12 +188,14 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         }
     }
 
-    // 返回键：逐层退出（面板→悬浮键盘→全屏→确认断开）
+    // 返回键：逐层退出（面板→悬浮键盘/快捷栏→选择器→全屏→确认断开）
     PlatformBackHandler {
         when {
             panel != SessionPanel.NONE -> panel = SessionPanel.NONE
             floatingKb -> floatingKb = false
+            quickBar -> quickBar = false
             showModeSelector -> showModeSelector = false
+            showInputPicker -> showInputPicker = false
             fullscreen -> fullscreen = false
             else -> exitConfirm = true
         }
@@ -239,6 +248,24 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     }
 
     LaunchedEffect(fullscreen) { platform.setFullscreen(fullscreen) }
+
+    // ---------- 输入方式选择（软键盘 / 系统输入法 / 快捷按钮）----------
+    fun openInputMethod(kind: String) {
+        when (kind) {
+            "float" -> { floatingKb = true; quickBar = false; panel = SessionPanel.NONE }
+            "ime" -> { panel = SessionPanel.KEYBOARD; floatingKb = false; quickBar = false }
+            "quick" -> { quickBar = true; floatingKb = false; panel = SessionPanel.NONE }
+        }
+        state.store.updateSettings { it.lastInputMethod = kind }
+        showInputPicker = false
+    }
+
+    val onKeyboardButton: () -> Unit = {
+        val last = state.store.settings.value.lastInputMethod
+        if (last in listOf("float", "ime", "quick")) openInputMethod(last)
+        else showInputPicker = true
+    }
+    val onKeyboardButtonLong: () -> Unit = { showInputPicker = true }
 
     // ---------- 坐标映射 ----------
     fun mapToStream(pos: Offset): Pair<Int, Int> {
@@ -667,9 +694,10 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                 ) {
                     ToolButton(
                         Icons.Filled.Keyboard, "键盘",
-                        tint = if (floatingKb) Color(0xFF60A5FA) else Color.White
-                    ) { floatingKb = !floatingKb }
-                    ToolButton(Icons.Filled.Abc, "输入法") { panel = if (panel == SessionPanel.KEYBOARD) SessionPanel.NONE else SessionPanel.KEYBOARD }
+                        tint = if (floatingKb || panel == SessionPanel.KEYBOARD || quickBar) Color(0xFF60A5FA) else Color.White,
+                        onLongClick = onKeyboardButtonLong,
+                        onClick = onKeyboardButton
+                    )
                     ToolButton(Icons.Filled.Bolt, "快捷键") { panel = if (panel == SessionPanel.HOTKEYS) SessionPanel.NONE else SessionPanel.HOTKEYS }
                     ToolButton(Icons.Filled.ContentPaste, "剪贴板") { panel = if (panel == SessionPanel.CLIPBOARD) SessionPanel.NONE else SessionPanel.CLIPBOARD }
                     ToolButton(Icons.Filled.Folder, "文件") { panel = if (panel == SessionPanel.FILES) SessionPanel.NONE else SessionPanel.FILES }
@@ -694,6 +722,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                             tint = if (inputMode == InputMode.TRACKPAD) Color(0xFF60A5FA) else Color.White
                         ) { showModeSelector = true }
                     }
+                    ToolButton(Icons.Filled.Apps, "应用") { panel = if (panel == SessionPanel.APPS) SessionPanel.NONE else SessionPanel.APPS }
                     ToolButton(Icons.Filled.QueryStats, "统计") { panel = if (panel == SessionPanel.STATS) SessionPanel.NONE else SessionPanel.STATS }
                     ToolButton(
                         if (fullscreen) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen, "全屏",
@@ -722,11 +751,12 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     ) {
                         Text(
                             when (panel) {
-                                SessionPanel.KEYBOARD -> "输入法（可直接打字）"
-                                SessionPanel.HOTKEYS -> "快捷键"
+                                SessionPanel.KEYBOARD -> "系统输入法（可直接打字）"
+                                SessionPanel.HOTKEYS -> "快捷键（可固定到快捷按钮栏）"
                                 SessionPanel.CLIPBOARD -> "剪贴板"
                                 SessionPanel.FILES -> "文件传输"
                                 SessionPanel.STATS -> "会话统计"
+                                SessionPanel.APPS -> "远程应用"
                                 SessionPanel.NONE -> ""
                             },
                             style = MaterialTheme.typography.titleMedium,
@@ -740,18 +770,37 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                         SessionPanel.CLIPBOARD -> ClipboardPanel(state, session)
                         SessionPanel.FILES -> FilesPanel(state, session)
                         SessionPanel.STATS -> StatsPanel(session)
+                        SessionPanel.APPS -> AppsPanel(session)
                         SessionPanel.NONE -> {}
                     }
                 }
             }
         }
 
-        // ============ 悬浮窗可拖动软键盘（非 IME） ============
+        // ============ 悬浮窗可拖动完整键盘（世界最完整 ~151 键）============
         if (!viewOnly && status == SelkiesSession.Status.CONNECTED) {
-            FloatingKeyboard(
+            val density = androidx.compose.ui.platform.LocalDensity.current
+            val autoScale = with(density) {
+                (viewSize.width.toDp().value / 980f).coerceIn(0.35f, 1f)
+            }
+            CompleteKeyboard(
                 session = session,
                 visible = floatingKb,
+                autoScaleHint = autoScale,
+                savedScale = state.store.settings.value.keyboardScale,
+                onScaleChange = { s -> state.store.updateSettings { it.keyboardScale = s } },
                 onDismiss = { floatingKb = false }
+            )
+        }
+
+        // ============ 快捷按钮栏（CTL/ALT/WIN 粘滞 + 常用单发 + 固定快捷键）============
+        if (!viewOnly && status == SelkiesSession.Status.CONNECTED) {
+            QuickShortcutBar(
+                session = session,
+                hotkeys = state.store.hotkeys.value,
+                visible = quickBar,
+                onDismiss = { quickBar = false },
+                onOpenManager = { quickBar = false; panel = SessionPanel.HOTKEYS }
             )
         }
 
@@ -774,6 +823,40 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                 )
             }
+        }
+
+        // ============ 输入方式选择器（软键盘 / 系统输入法 / 快捷按钮）============
+        if (showInputPicker) {
+            AlertDialog(
+                onDismissRequest = { showInputPicker = false },
+                title = { Text("选择输入方式") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        ModeOption(
+                            title = "悬浮完整键盘（151 键）",
+                            desc = "可拖动、双指缩放的全尺寸 PC 键盘：功能键/导航/小键盘/媒体键/扩展键，修饰键粘滞组合",
+                            selected = floatingKb
+                        ) { openInputMethod("float") }
+                        ModeOption(
+                            title = "系统输入法（直接打字）",
+                            desc = "调用本机输入法（支持中文），逐字实时发送到远程；配合软键盘文本条亦可",
+                            selected = panel == SessionPanel.KEYBOARD
+                        ) { openInputMethod("ime") }
+                        ModeOption(
+                            title = "快捷按钮栏",
+                            desc = "CTL/ALT/WIN 粘滞 + TAB/ESC/ENTER 单发 + 固定的常用快捷键，一键直发",
+                            selected = quickBar
+                        ) { openInputMethod("quick") }
+                        Text(
+                            "选择后下次点“键盘”直接打开该方式；长按“键盘”可重新选择。",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                },
+                confirmButton = {},
+                dismissButton = { TextButton(onClick = { showInputPicker = false }) { Text("取消") } }
+            )
         }
 
         // ============ 输入模式选择器 ============
@@ -867,21 +950,30 @@ private class ScrollAccumulator {
     var zoom = 1f
 }
 
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
-private fun ToolButton(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, tint: Color = Color.White, onClick: () -> Unit) {
+private fun ToolButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    tint: Color = Color.White,
+    onLongClick: (() -> Unit)? = null,
+    onClick: () -> Unit
+) {
     val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
             .padding(horizontal = 2.dp)
             .background(Color.White.copy(alpha = 0.06f), RoundedCornerShape(10.dp))
-            .clickable(
+            .combinedClickable(
                 interactionSource = interaction,
-                indication = null
-            ) { onClick() }
+                indication = null,
+                onClick = onClick,
+                onLongClick = onLongClick
+            )
             .padding(horizontal = 10.dp, vertical = 6.dp)
     ) {
         Icon(icon, label, tint = tint, modifier = Modifier.size(22.dp))
-        Text(label, color = Color.White, fontSize = 9.sp, maxLines = 1)
+        Text(label, color = tint, fontSize = 9.sp, maxLines = 1)
     }
 }

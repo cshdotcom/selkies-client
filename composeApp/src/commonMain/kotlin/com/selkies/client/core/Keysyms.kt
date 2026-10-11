@@ -111,12 +111,43 @@ object Keysyms {
     const val XK_F18 = 0xffcfL
     const val XK_F19 = 0xffd0L
     const val XK_F20 = 0xffd1L
+    const val XK_F21 = 0xffd2L
+    const val XK_F22 = 0xffd3L
+    const val XK_F23 = 0xffd4L
+    const val XK_F24 = 0xffd5L
+
+    // ---- AltGr / Compose / 国际键 ----
+    const val XK_ISO_Level3_Shift = 0xfe03L   // AltGr
+    const val XK_Multi_key = 0xff20L          // Compose
+    const val XK_Zenkaku = 0xff28L
+    const val XK_Hankaku = 0xff29L
+    const val XK_Henkan_Mode = 0xff23L
+    const val XK_Muhenkan = 0xff22L
+    const val XK_Hangul = 0xff31L
+    const val XK_Hangul_Hanja = 0xff34L
+
+    // ---- XF86 多媒体键（X11 XF86keysym.h 标准值）----
+    const val XK_XF86AudioLowerVolume = 0x1008ff11L
+    const val XK_XF86AudioMute = 0x1008ff12L
+    const val XK_XF86AudioRaiseVolume = 0x1008ff13L
+    const val XK_XF86AudioPlay = 0x1008ff14L
+    const val XK_XF86AudioStop = 0x1008ff15L
+    const val XK_XF86AudioPrev = 0x1008ff16L
+    const val XK_XF86AudioNext = 0x1008ff17L
+    const val XK_XF86HomePage = 0x1008ff18L
+    const val XK_XF86Mail = 0x1008ff19L
+    const val XK_XF86Search = 0x1008ff1bL
+    const val XK_XF86Calculator = 0x1008ff1dL
+    const val XK_XF86PowerOff = 0x1008ff2aL
+    const val XK_XF86WakeUp = 0x1008ff2bL
+    const val XK_XF86Eject = 0x1008ff2cL
 
     // ---- 修饰键集合判断 ----
     val MODIFIER_KEYSYMS = setOf(
         XK_Shift_L, XK_Shift_R, XK_Control_L, XK_Control_R,
         XK_Meta_L, XK_Meta_R, XK_Alt_L, XK_Alt_R,
-        XK_Super_L, XK_Super_R, XK_Hyper_L, XK_Hyper_R, XK_Caps_Lock
+        XK_Super_L, XK_Super_R, XK_Hyper_L, XK_Hyper_R, XK_Caps_Lock,
+        XK_ISO_Level3_Shift
     )
 
     fun isModifier(keysym: Long): Boolean = MODIFIER_KEYSYMS.contains(keysym)

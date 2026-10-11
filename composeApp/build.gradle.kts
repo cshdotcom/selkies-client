@@ -84,8 +84,8 @@ android {
         applicationId = "com.selkies.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 20101
-        versionName = "2.1.1"
+        versionCode = 20200
+        versionName = "2.2.0"
         ndkVersion = ""
     }
     signingConfigs {
@@ -123,7 +123,7 @@ compose.desktop {
         mainClass = "com.selkies.client.MainKt"
         nativeDistributions {
             packageName = "Selkies-Desktop"
-            packageVersion = "2.1.1"
+            packageVersion = "2.2.0"
             description = "Selkies 远程桌面原生客户端"
             vendor = "Selkies Client"
         }
@@ -140,7 +140,7 @@ val desktopFatJar = tasks.register<Jar>("desktopFatJar") {
     manifest {
         attributes["Main-Class"] = "com.selkies.client.MainKt"
         attributes["Implementation-Title"] = "Selkies Desktop Client"
-        attributes["Implementation-Version"] = "2.1.1"
+        attributes["Implementation-Version"] = "2.2.0"
     }
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
     exclude("META-INF/versions/**/module-info.class")
@@ -187,4 +187,15 @@ tasks.register<JavaExec>("probeVideoDecode") {
     for (k in listOf("holdSecs", "url", "user", "pass")) {
         if (project.hasProperty(k)) systemProperty(k, project.property(k).toString())
     }
+}
+
+// GUI E2E 驱动（Xvfb 下 AWT Robot 自动化）
+tasks.register<JavaExec>("guiProbe") {
+    group = "verification"
+    description = "GUI 自动化步骤执行器：-Pscript=\"sleep:4000;shot:01;click:640,300\""
+    mainClass.set("com.selkies.client.tools.GuiProbe")
+    val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
+    classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
+    systemProperty("java.awt.headless", "false")
+    if (project.hasProperty("script")) systemProperty("script", project.property("script").toString())
 }

@@ -19,6 +19,16 @@ data class ServerEntry(
     var videoCrf: Int = 24,             // 0 = 使用码率模式
     var encoder: String = "h264enc",    // h264enc / h264enc-striped / h264enc-fullcolor? / jpeg / ...
     var audioEnabled: Boolean = true,
+    // ---- 官方前端视频高级设置（默认 0/false/空 = 不发送，走服务器默认）----
+    var jpegQuality: Int = 0,               // jpeg_quality 1-100
+    var videoFullcolor: Boolean = false,    // video_fullcolor
+    var useCpu: Boolean = false,            // use_cpu（软编）
+    var forceAlignedResolution: Boolean = false,
+    var videoStreamingMode: String = "",    // standard / paint-over
+    var paintOverCrf: Int = 0,              // video_paintover_crf
+    var paintOverBurstFrames: Int = 0,      // video_paintover_burst_frames
+    var paintOverJpegQuality: Int = 0,      // paint_over_jpeg_quality
+    var usePaintOverQuality: Boolean = false,
     var useTokenAuth: Boolean = false,
     var token: String = "",
     var allowUntrustedCert: Boolean = false
@@ -53,6 +63,9 @@ data class AppSettings(
     var trackpadMode: Boolean = false,       // 触控板模式
     var physicalKeyboardPassthrough: Boolean = true,
     var gamepadEnabled: Boolean = true,
+    // 键盘
+    var keyboardScale: Float = 0f,           // 完整键盘缩放（0 = 未设置，自动适配）
+    var lastInputMethod: String = "",        // 上次选择的输入方式：float / ime / quick
     // 视频
     var requestKeyframeOnStall: Boolean = true,
     var showFpsOverlay: Boolean = false,
@@ -71,7 +84,8 @@ data class HotkeyDef(
     var name: String,
     var keysyms: List<Long>,       // 修饰键在前，主键在最后
     var builtin: Boolean = false,
-    var category: String = "custom"
+    var category: String = "custom",
+    var pinned: Boolean = false    // 固定到快捷按钮栏
 )
 
 /**
