@@ -143,7 +143,15 @@ object DesktopPlatform : PlatformServices {
 
     override fun screenDpi(): Float = Toolkit.getDefaultToolkit().screenResolution.toFloat()
 
-    override fun appVersion(): String = "2.0.0"
+    override fun appVersion(): String {
+        // 优先取 fat JAR 清单里的 Implementation-Version（desktopFatJar 注入 2.1.1），
+        // 开发运行（gradle run）无清单时回退内置常量
+        return runCatching {
+            val cls = DesktopPlatform::class.java
+            val v = cls.`package`?.implementationVersion
+            if (v.isNullOrBlank()) "2.1.1" else v
+        }.getOrDefault("2.1.1")
+    }
 
     override fun showSoftInput(show: Boolean) { /* 桌面无软键盘 */ }
 

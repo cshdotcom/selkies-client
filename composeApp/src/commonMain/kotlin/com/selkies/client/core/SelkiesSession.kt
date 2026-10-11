@@ -119,6 +119,13 @@ class SelkiesSession(
     }
 
     private fun openConnection() {
+        // ⚠️【泄漏修复】重连前必须释放上一条连接（OkHttp 连接池/半开 socket/线程）。
+        //    旧代码直接覆盖引用，重连风暴下 socket 逐次泄漏，最终引发
+        //    ConnectException（拒绝连接）/文件描述符耗尽——即用户报的
+        //    "报错重连→401→拒绝连接"链条的客户端侧根源。
+        if (::connection.isInitialized) {
+            runCatching { connection.close() }
+        }
         connection = SelkiesConnection(server, this)
         connection.start()
     }
@@ -295,7 +302,12 @@ class SelkiesSession(
                 val reason = text.substring(5)
                 userClosed = true
                 status.value = Status.CLOSED
-                statusDetail.value = "服务器断开：$reason"
+                // 被新客户端顶替是服务器的单主人策略：给出友好解释而非原始英文
+                val friendly = if (reason.contains("new primary client") || reason.contains("primary")) {
+                    "另一个客户端接管了此会话（服务器单主人策略）。若要夺回控制权，请点击重试重连。"
+                } else "服务器断开：$reason"
+                statusDetail.value = friendly
+                lastError.value = friendly
             }
             text == "_gz,1" -> { gzRxEnabled = true }
             // ---- 剪贴板 ----
@@ -475,34 +487,40 @@ class SelkiesSession(
     override fun onBinary(data: ByteArray, length: Int) {
         if (length < 1) return
         stats.value.bytesReceived += length.toLong()
-        when (data[0]) {
-            Protocol.FRAME_AUDIO -> {
-                if (role.value == "viewer") return
-                val frames = Protocol.parseAudioFrames(data, length, audioParseState)
-                for ((opus, quiet) in frames) {
-                    if (quiet) audioPlayer.onQuiet()
-                    if (opus.isNotEmpty()) audioPlayer.playOpus(opus)
+        // ⚠️【连接稳定性】单帧解析异常绝不允许打断 WS 接收循环：
+        //    修复前一个 copyOfRange 越界就能让整条连接被判死亡并无限重连。
+        //    帧级错误降级为丢帧 + 关键帧请求。
+        runCatching {
+            when (data[0]) {
+                Protocol.FRAME_AUDIO -> {
+                    if (role.value == "viewer") return
+                    val frames = Protocol.parseAudioFrames(data, length, audioParseState)
+                    for ((opus, quiet) in frames) {
+                        if (quiet) audioPlayer.onQuiet()
+                        if (opus.isNotEmpty()) audioPlayer.playOpus(opus)
+                    }
                 }
-            }
-            Protocol.FRAME_JPEG -> {
-                Protocol.parseJpegStripeHeader(data, length)?.let { (frameId, stripeY, off) ->
-                    noteVideoChunk(frameId)
-                    videoSink?.onJpegStripe(frameId, stripeY, data, off, length)
+                Protocol.FRAME_JPEG -> {
+                    Protocol.parseJpegStripeHeader(data, length)?.let { (frameId, stripeY, off) ->
+                        noteVideoChunk(frameId)
+                        videoSink?.onJpegStripe(frameId, stripeY, data, off, length)
+                    }
                 }
-            }
-            Protocol.FRAME_VIDEO -> {
-                Protocol.parseVideoFrameHeader(data, length)?.let { (header, off) ->
-                    noteVideoChunk(header.frameId)
-                    stats.value.videoFrames++
-                    videoSink?.onVideoFrame(header, data, off, length)
+                Protocol.FRAME_VIDEO -> {
+                    Protocol.parseVideoFrameHeader(data, length)?.let { (header, off) ->
+                        noteVideoChunk(header.frameId)
+                        stats.value.videoFrames++
+                        videoSink?.onVideoFrame(header, data, off, length)
+                    }
                 }
-            }
-            Protocol.FRAME_GZ -> {
-                runCatching {
+                Protocol.FRAME_GZ -> {
                     val text = gunzip(data, 1, length)
                     onText(text)
                 }
             }
+        }.onFailure {
+            // 丢帧恢复：请求服务器补发关键帧
+            post { connection.sendText("REQUEST_KEYFRAME") }
         }
     }
 
@@ -539,7 +557,9 @@ class SelkiesSession(
             statusDetail.value = "认证或权限问题"
             return
         }
-        scheduleReconnect("连接被关闭（$code）${reason.ifBlank { "" }}")
+        val desc = if (code == -1) "网络中断或服务器关闭了连接"
+                    else "连接被关闭（$code）${reason.ifBlank { "" }}"
+        scheduleReconnect(desc)
     }
 
     override fun onError(userMessage: String, technical: String) {
@@ -552,7 +572,7 @@ class SelkiesSession(
                 technical.contains("redirect loop")
         if (fatal) {
             status.value = Status.FAILED
-            statusDetail.value = "连接失败"
+            statusDetail.value = if (technical.contains("401")) "认证失败——请编辑服务器条目校验账号密码" else "连接失败"
             return
         }
         scheduleReconnect(userMessage)
@@ -560,11 +580,22 @@ class SelkiesSession(
 
     private fun scheduleReconnect(reason: String) {
         if (userClosed || status.value == Status.RECONNECTING) return
+        // ⚠️【风暴防护】连续失败达上限后停止自动重连，转为 FAILED + 手动重试。
+        //    无限重连风暴会持续冲击反代/CDN（可能触发 401/403 拉黑），且叠加旧版
+        //    socket 泄漏会耗尽本地资源——必须封顶。
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            status.value = Status.FAILED
+            statusDetail.value = "自动重连已达上限（$MAX_RECONNECT_ATTEMPTS 次）"
+            lastError.value = "$reason\u3002已停止自动重连，请检查网络/服务器状态后手动重试"
+            return
+        }
         reconnectJob?.cancel()
-        val delayMs = (500L shl reconnectAttempts.coerceAtMost(6)).coerceAtMost(30_000L)
+        val base = (500L shl reconnectAttempts.coerceAtMost(6)).coerceAtMost(30_000L)
+        // 抖动：避免与其他客户端/重连周期同步形成请求波峰
+        val delayMs = base + (0..(base / 4)).random()
         reconnectAttempts++
         status.value = Status.RECONNECTING
-        statusDetail.value = "$reason · ${delayMs / 1000.0}s 后重连（第 $reconnectAttempts 次）"
+        statusDetail.value = "$reason · ${"%.1f".format(delayMs / 1000.0)}s 后重连（第 $reconnectAttempts/$MAX_RECONNECT_ATTEMPTS 次）"
         reconnectJob = scope.launch {
             delay(delayMs)
             if (!userClosed) {
@@ -897,5 +928,8 @@ class SelkiesSession(
             val even = if (v % 2 == 0) v else v - 1
             return even.coerceIn(16, 4080)
         }
+
+        /** 自动重连次数上限：约 8 分钟退避总量，之后交还用户手动控制 */
+        private const val MAX_RECONNECT_ATTEMPTS = 12
     }
 }

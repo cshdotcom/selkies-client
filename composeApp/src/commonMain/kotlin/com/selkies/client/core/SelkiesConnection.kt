@@ -276,8 +276,13 @@ class SelkiesConnection(
             }
             wsSession = session
             listener.onOpened()
+            var sawCloseFrame = false
             try {
                 for (frame in session.incoming) {
+                    // ⚠️【重连竞态修复】close() 置位 closing 后（重连释放旧连接/用户断开），
+                    //    旧连接仍可能投递残留帧（尤其 KILL/close）——必须立即停止向监听者投递，
+                    //    否则服务器发给旧连接的 KILL 会污染共享会话状态（表现为“已断开”假死）。
+                    if (closing) break
                     when (frame) {
                         is io.ktor.websocket.Frame.Text -> listener.onText(frame.readText())
                         is io.ktor.websocket.Frame.Binary -> {
@@ -285,8 +290,12 @@ class SelkiesConnection(
                             listener.onBinary(buf, buf.size)
                         }
                         is io.ktor.websocket.Frame.Close -> {
-                            val reason = frame.readReason()
-                            listener.onClosed(reason?.code?.toInt() ?: 1000, reason?.message ?: "")
+                            sawCloseFrame = true
+                            // 主动关闭路径（重连释放旧连接/用户断开）不再回调，避免与新连接竞争
+                            if (!closing) {
+                                val reason = frame.readReason()
+                                listener.onClosed(reason?.code?.toInt() ?: 1000, reason?.message ?: "")
+                            }
                             break
                         }
                         else -> {}
@@ -295,6 +304,12 @@ class SelkiesConnection(
             } finally {
                 wsSession = null
                 runCatching { session.close() }
+            }
+            // ⚠️【静默死亡修复】TCP 被链路中途掐断（RST/FIN，无 Close 帧）时 incoming 通道
+            //    直接关闭、for 循环正常退出——若不在此上报，会话将永远停留在 CONNECTED
+            //    状态且视频冻结，永远不会触发重连（用户"一直断开/卡死"的隐藏根因之一）。
+            if (!sawCloseFrame && !closing) {
+                listener.onClosed(-1, "连接异常中断（未收到关闭帧）")
             }
             return true
         } catch (e: Exception) {

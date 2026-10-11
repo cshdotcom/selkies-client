@@ -84,8 +84,8 @@ android {
         applicationId = "com.selkies.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 20100
-        versionName = "2.1.0"
+        versionCode = 20101
+        versionName = "2.1.1"
         ndkVersion = ""
     }
     signingConfigs {
@@ -123,7 +123,7 @@ compose.desktop {
         mainClass = "com.selkies.client.MainKt"
         nativeDistributions {
             packageName = "Selkies-Desktop"
-            packageVersion = "2.1.0"
+            packageVersion = "2.1.1"
             description = "Selkies 远程桌面原生客户端"
             vendor = "Selkies Client"
         }
@@ -140,7 +140,7 @@ val desktopFatJar = tasks.register<Jar>("desktopFatJar") {
     manifest {
         attributes["Main-Class"] = "com.selkies.client.MainKt"
         attributes["Implementation-Title"] = "Selkies Desktop Client"
-        attributes["Implementation-Version"] = "2.1.0"
+        attributes["Implementation-Version"] = "2.1.1"
     }
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
     exclude("META-INF/versions/**/module-info.class")
@@ -163,4 +163,28 @@ val probeProtocol = tasks.register<JavaExec>("probeProtocol") {
     if (project.hasProperty("probeUser")) systemProperty("probeUser", project.property("probeUser").toString())
     if (project.hasProperty("probePass")) systemProperty("probePass", project.property("probePass").toString())
     if (project.hasProperty("probeTimeout")) systemProperty("probeTimeout", project.property("probeTimeout").toString())
+}
+
+// 连接层回归测试（静默死亡修复 / 主动关闭守卫 / 长稳保持）
+tasks.register<JavaExec>("probeConnection") {
+    group = "verification"
+    description = "连接层回归：local-abrupt / local-clean / local-guard / real-hold"
+    mainClass.set("com.selkies.client.tools.ConnectionProbe")
+    val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
+    classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
+    for (k in listOf("mode", "url", "holdSecs", "user", "pass")) {
+        if (project.hasProperty(k)) systemProperty(k, project.property(k).toString())
+    }
+}
+
+// 无头视频解码验证（真实 DesktopVideoSink 全链路）
+tasks.register<JavaExec>("probeVideoDecode") {
+    group = "verification"
+    description = "真实 FFmpeg 解码链路验证：帧进入 → 解码 → bitmapFlow 发布"
+    mainClass.set("com.selkies.client.tools.VideoDecodeProbe")
+    val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
+    classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
+    for (k in listOf("holdSecs", "url", "user", "pass")) {
+        if (project.hasProperty(k)) systemProperty(k, project.property(k).toString())
+    }
 }

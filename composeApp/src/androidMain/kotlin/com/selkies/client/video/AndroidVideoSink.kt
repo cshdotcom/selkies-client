@@ -55,7 +55,10 @@ class AndroidVideoSink : VideoSink {
     override fun onVideoFrame(header: VideoFrameHeader, data: ByteArray, offset: Int, length: Int) {
         // 全帧模式（stripeY=0）；条带模式暂按整帧缓冲策略丢弃非 0 条带的增量
         if (header.stripeY != 0) return
-        val copy = data.copyOfRange(offset, offset + length)
+        // ⚠️【视频黑屏修复】length 为整条二进制消息总长（含 12B 帧头），payload 区间是 [offset, length)，
+        //    copyOfRange(offset, offset + length) 会恒定越界 12 字节（见 DesktopVideoSink 同步修复）。
+        if (length <= offset) return
+        val copy = data.copyOfRange(offset, length)
         if (!queue.offer(FrameBuf(header, copy))) {
             // 队列满：丢帧并请求关键帧由上层处理
             queue.clear()

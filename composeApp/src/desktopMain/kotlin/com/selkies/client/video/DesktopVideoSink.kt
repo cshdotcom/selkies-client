@@ -32,6 +32,13 @@ class DesktopVideoSink : VideoSink {
 
     override val firstFrameRendered = MutableStateFlow(false)
 
+    /** 诊断计数（无头验证用） */
+    @Volatile var diagFramesIn: Long = 0
+    @Volatile var diagDecodeErrors: Long = 0
+    @Volatile var diagFramesDecoded: Long = 0
+    @Volatile var diagFramesPublished: Long = 0
+    @Volatile var diagLastError: String? = null
+
     /** 最新解码帧（UI 观察绘制） */
     val bitmapFlow = MutableStateFlow<ImageBitmap?>(null)
 
@@ -71,7 +78,15 @@ class DesktopVideoSink : VideoSink {
 
     override fun onVideoFrame(header: VideoFrameHeader, data: ByteArray, offset: Int, length: Int) {
         if (header.stripeY != 0) return
-        val copy = data.copyOfRange(offset, offset + length)
+        // ⚠️【视频黑屏修复】length 为整条二进制消息总长（含 12B 帧头，见 SelkiesSession.onBinary/
+        //    Protocol.parseVideoFrameHeader），payload 区间是 [offset, length)。
+        //    此前写成 copyOfRange(offset, offset + length) 恒定越界 12 字节，抛出
+        //    IndexOutOfBoundsException("toIndex (N+12) is greater than size (N)")，
+        //    异常沿 WS 接收循环上抛导致连接被判定中断并无限重连（每次重连拿到首个视频帧再次崩溃），
+        //    视频区永远黑屏。
+        if (length <= offset) return
+        diagFramesIn++
+        val copy = data.copyOfRange(offset, length)
         if (!queue.offer(FrameBuf(header, copy))) {
             queue.clear()
             queue.offer(FrameBuf(header, copy))
@@ -109,12 +124,13 @@ class DesktopVideoSink : VideoSink {
 
     private fun releaseCodec() {
         runCatching {
-            codecCtx?.let {
-                avcodec.avcodec_free_context(it)
-            }
-            packet?.let { avcodec.av_packet_free(it) }
-            frame?.let { avutil.av_frame_free(it) }
-            bgraFrame?.let { avutil.av_frame_free(it) }
+            // ⚠️【double-free 修复】JavaCPP 分配对象（avcodec_alloc_context3/AVPacket()/AVFrame()）
+            //    自带释放器，手动调 C 释放函数会与 GC 释放器双重释放 → "free(): invalid pointer"。
+            //    统一改用 Pointer.deallocate()（幂等）。
+            codecCtx?.deallocate()
+            packet?.deallocate()
+            frame?.deallocate()
+            bgraFrame?.deallocate()
             bgraPtr?.let { avutil.av_free(it) }
             sws?.let { swscale.sws_freeContext(it) }
         }
@@ -134,7 +150,10 @@ class DesktopVideoSink : VideoSink {
         releaseCodec()
         val codec = avcodec.avcodec_find_decoder(AV_CODEC_ID_H264)
             ?: throw IllegalStateException("未找到 H.264 解码器")
-        val ctx = AVCodecContext(codec)
+        // ⚠️【SIGSEGV 修复】AVCodecContext(codec) 匹配的是 Pointer 包装构造器（不分配内存），
+        //    把 AVCodec 结构当 AVCodecContext 用会越界写直接段错误——必须用 avcodec_alloc_context3 分配。
+        //    此前从未触发：无头探针用 no-op 桩，真机走 Android MediaCodec。
+        val ctx = AVCodecContext(avcodec.avcodec_alloc_context3(codec))
         ctx.width(w)
         ctx.height(h)
         ctx.flags2(ctx.flags2() or avcodec.AV_CODEC_FLAG2_FAST)
@@ -169,7 +188,10 @@ class DesktopVideoSink : VideoSink {
                 val pkt = packet!!
                 avcodec.av_packet_unref(pkt)
                 avcodec.av_new_packet(pkt, fb.data.size)
-                pkt.data().position(0).asByteBuffer().put(fb.data)
+                // ⚠️【BufferOverflow 修复】JavaCPP 从 getter 拿到的 BytePointer 无容量信息，
+                //    asByteBuffer() 视图容量为 0，任何 put 都溢出——必须用 BytePointer.put(byte[])
+                //    （原生 memcpy，不做 NIO 容量检查，bytedeco 官方示例同款模式）
+                pkt.data().position(0).put(fb.data, 0, fb.data.size)
                 var ret = avcodec.avcodec_send_packet(ctx, pkt)
                 if (ret < 0) {
                     reset()
@@ -193,12 +215,15 @@ class DesktopVideoSink : VideoSink {
                     swscale.sws_scale(sws, f.data() as org.bytedeco.javacpp.PointerPointer, f.linesize() as org.bytedeco.javacpp.IntPointer, 0, h, bf.data() as org.bytedeco.javacpp.PointerPointer, bf.linesize() as org.bytedeco.javacpp.IntPointer)
                     val bytes = bgraBytes!!
                     if (bytes.size >= w * h * 4) {
-                        bgraPtr!!.position(0).asBuffer().get(bytes, 0, w * h * 4)
+                        bgraPtr!!.position(0).get(bytes, 0, w * h * 4)
                         publishBgra(bytes, w, h)
+                        diagFramesDecoded++
                     }
                     avutil.av_frame_unref(f)
                 }
             }.onFailure {
+                diagDecodeErrors++
+                diagLastError = "${it.javaClass.simpleName}: ${it.message}"
                 reset()
             }
         }
@@ -223,6 +248,7 @@ class DesktopVideoSink : VideoSink {
         pool.addLast(bmp)
         poolBytes.addLast(dst)
         bitmapFlow.value = bmp.asComposeImageBitmap()
+        diagFramesPublished++
         if (!firstFrameRendered.value) firstFrameRendered.value = true
     }
 

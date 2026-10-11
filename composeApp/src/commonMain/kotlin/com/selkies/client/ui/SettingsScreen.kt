@@ -168,7 +168,7 @@ fun SettingsScreen(state: AppState) {
 }
 
 private fun updateTheme(state: AppState, mode: String) {
-    state.store.settings.value.themeMode = mode
-    state.store.saveSettings()
-    state.themeMode = mode
+    // 走 updateSettings（复制+重赋值）触发 onChange → AppState.themeMode/dataVersion 同步，
+    // 设置页 FilterChip 的选中态才能可靠刷新（原地改 var 字段不会触发任何通知）
+    state.store.updateSettings { it.themeMode = mode }
 }

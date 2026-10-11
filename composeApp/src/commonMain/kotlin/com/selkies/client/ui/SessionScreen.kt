@@ -561,7 +561,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     Text(lastError ?: statusDetail, color = Color.White, fontSize = 14.sp)
                     Spacer(Modifier.height(20.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        if (status == SelkiesSession.Status.FAILED) {
+                        // FAILED 可重试；CLOSED 携带错误（如被新客户端顶替/服务器断开）也可手动重连
+                        if (status == SelkiesSession.Status.FAILED || lastError != null) {
                             Button(onClick = { session.connect() }) { Text("重试") }
                         }
                         Button(onClick = { state.navigate(com.selkies.client.Screen.ServerList) }) { Text("返回") }

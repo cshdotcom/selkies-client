@@ -72,9 +72,12 @@ class DesktopAudioPlayer : AudioPlayer {
 
     private fun releaseAll() {
         runCatching { line?.stop(); line?.close() }
-        runCatching { codecCtx?.let { avcodec.avcodec_free_context(it) } }
-        runCatching { packet?.let { avcodec.av_packet_free(it) } }
-        runCatching { frame?.let { avutil.av_frame_free(it) } }
+        // ⚠️【double-free 修复】JavaCPP 分配的对象（avcodec_alloc_context3 / AVPacket() / AVFrame()）
+        //    都已自动挂接释放器：手动调 C 释放函数 + GC 释放器 = 双重释放 → "free(): invalid pointer" 崩溃。
+        //    必须用 Pointer.deallocate()（幂等，只释放一次）。
+        runCatching { codecCtx?.deallocate() }
+        runCatching { packet?.deallocate() }
+        runCatching { frame?.deallocate() }
         line = null
         codecCtx = null
         packet = null
@@ -85,7 +88,9 @@ class DesktopAudioPlayer : AudioPlayer {
         runCatching {
             val codec = avcodec.avcodec_find_decoder(AV_CODEC_ID_OPUS)
                 ?: throw IllegalStateException("未找到 Opus 解码器")
-            val ctx = AVCodecContext(codec)
+            // ⚠️【SIGSEGV 修复】必须用 avcodec_alloc_context3 分配上下文；
+            //    AVCodecContext(codec) 是 Pointer 包装构造器，会越界写直接段错误
+            val ctx = AVCodecContext(avcodec.avcodec_alloc_context3(codec))
             ctx.sample_rate(sampleRate)
             if (avcodec.avcodec_open2(ctx, codec, null as org.bytedeco.ffmpeg.avutil.AVDictionary?) < 0) {
                 throw IllegalStateException("Opus 解码器初始化失败")
@@ -102,7 +107,8 @@ class DesktopAudioPlayer : AudioPlayer {
                 if (opus != null) {
                     avcodec.av_packet_unref(pkt)
                     avcodec.av_new_packet(pkt, opus.size)
-                    pkt.data().position(0).asByteBuffer().put(opus)
+                    // ⚠️ BytePointer 无容量信息：asByteBuffer() 容量为 0，必须用 put(byte[])
+                    pkt.data().position(0).put(opus, 0, opus.size)
                     if (avcodec.avcodec_send_packet(ctx, pkt) < 0) continue
                 }
                 while (true) {
@@ -143,29 +149,28 @@ class DesktopAudioPlayer : AudioPlayer {
         return l
     }
 
-    /** 解码帧（float packed/planar 或 s16）→ s16le 字节 */
+    /** 解码帧（float packed/planar 或 s16）→ s16le 字节
+     *  ⚠️ 所有 BytePointer 读取前必须显式 limit(n)：getter 返回的指针容量未知，
+     *    asByteBuffer() 视图容量为 0，不设 limit 会 BufferUnderflow */
     private fun decodeToS16(fr: AVFrame, n: Int, ch: Int): ByteArray {
         val out = ByteArray(n * ch * 2)
         val bb = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN)
         val sb = bb.asShortBuffer()
         when (fr.format()) {
             avutil.AV_SAMPLE_FMT_FLT -> {
-                val fb = fr.data(0)!!.position(0).asByteBuffer()
-                    .order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+                val fb = fr.data(0)!!.position(0).limit((n * ch * 4).toLong())
+                    .asByteBuffer().order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
                 for (i in 0 until n * ch) sb.put(i, (fb.get(i) * volume * 32767f).toInt().toShort())
             }
             avutil.AV_SAMPLE_FMT_S16 -> {
-                val src = fr.data(0)!!.position(0).asByteBuffer()
-                    .order(ByteOrder.LITTLE_ENDIAN)
-                val dst = ByteBuffer.wrap(out)
-                // 音量处理
-                val srcSb = src.asShortBuffer()
+                val srcSb = fr.data(0)!!.position(0).limit((n * ch * 2).toLong())
+                    .asByteBuffer().order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
                 for (i in 0 until n * ch) sb.put(i, (srcSb.get(i) * volume).toInt().toShort())
             }
             avutil.AV_SAMPLE_FMT_FLTP -> {
                 for (c in 0 until ch) {
-                    val fb = fr.data(c)!!.position(0).asByteBuffer()
-                        .order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+                    val fb = fr.data(c)!!.position(0).limit((n * 4).toLong())
+                        .asByteBuffer().order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
                     for (i in 0 until n) {
                         sb.put(i * ch + c, (fb.get(i) * volume * 32767f).toInt().toShort())
                     }
@@ -173,8 +178,8 @@ class DesktopAudioPlayer : AudioPlayer {
             }
             avutil.AV_SAMPLE_FMT_S16P -> {
                 for (c in 0 until ch) {
-                    val srcSb = fr.data(c)!!.position(0).asByteBuffer()
-                        .order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+                    val srcSb = fr.data(c)!!.position(0).limit((n * 2).toLong())
+                        .asByteBuffer().order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
                     for (i in 0 until n) {
                         sb.put(i * ch + c, (srcSb.get(i) * volume).toInt().toShort())
                     }
@@ -231,7 +236,8 @@ class DesktopMicCapture : MicCapture {
 
             val codec = avcodec.avcodec_find_encoder(AV_CODEC_ID_OPUS)
                 ?: throw IllegalStateException("未找到 Opus 编码器")
-            ctx = AVCodecContext(codec)
+            // ⚠️【SIGSEGV 修复】avcodec_alloc_context3 分配；包装构造器会越界段错误
+            ctx = AVCodecContext(avcodec.avcodec_alloc_context3(codec))
             ctx.sample_rate(sampleRate)
             ctx.ch_layout().nb_channels(channels)
             avutil.av_channel_layout_default(ctx.ch_layout(), channels)
@@ -239,8 +245,9 @@ class DesktopMicCapture : MicCapture {
 
             var opened = false
             for (fmt in intArrayOf(avutil.AV_SAMPLE_FMT_S16, avutil.AV_SAMPLE_FMT_FLT, avutil.AV_SAMPLE_FMT_FLTP)) {
-                runCatching { ctx?.let { avcodec.avcodec_free_context(it) } }
-                val tryCtx = AVCodecContext(codec)
+                runCatching { ctx?.deallocate() }
+                // ⚠️ 同上：avcodec_alloc_context3 分配，包装构造器会 SIGSEGV
+                val tryCtx = AVCodecContext(avcodec.avcodec_alloc_context3(codec))
                 tryCtx.sample_rate(sampleRate)
                 tryCtx.ch_layout().nb_channels(channels)
                 avutil.av_channel_layout_default(tryCtx.ch_layout(), channels)
@@ -294,15 +301,15 @@ class DesktopMicCapture : MicCapture {
                 avutil.av_frame_make_writable(frame)
                 when (useFmt) {
                     avutil.AV_SAMPLE_FMT_S16 -> {
-                        frame.data(0)!!.position(0).asByteBuffer().put(pcm)
+                        frame.data(0)!!.position(0).put(pcm, 0, pcm.size)
                     }
                     avutil.AV_SAMPLE_FMT_FLT -> {
-                        val bb = frame.data(0)!!.position(0).asByteBuffer()
+                        val bb = frame.data(0)!!.position(0).limit((frameSamples * channels * 4).toLong()).asByteBuffer()
                         bb.order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().put(floatBuf)
                     }
                     avutil.AV_SAMPLE_FMT_FLTP -> {
                         for (c in 0 until channels) {
-                            val bb = frame.data(c)!!.position(0).asByteBuffer()
+                            val bb = frame.data(c)!!.position(0).limit((frameSamples * 4).toLong()).asByteBuffer()
                             bb.order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().put(floatBuf, c * frameSamples, frameSamples)
                         }
                     }
@@ -316,7 +323,7 @@ class DesktopMicCapture : MicCapture {
                     val n = pkt.size()
                     if (n > 0) {
                         val bytes = ByteArray(n)
-                        pkt.data().position(0).asBuffer().get(bytes)
+                        pkt.data().position(0).get(bytes, 0, n)
                         onOpus?.invoke(bytes)
                     }
                     avcodec.av_packet_unref(pkt)
@@ -327,9 +334,10 @@ class DesktopMicCapture : MicCapture {
         } finally {
             running = false
             runCatching { line?.stop(); line?.close() }
-            runCatching { ctx?.let { avcodec.avcodec_free_context(it) } }
-            runCatching { frame?.let { avutil.av_frame_free(it) } }
-            runCatching { pkt?.let { avcodec.av_packet_free(it) } }
+            // ⚠️ 同 DesktopAudioPlayer：JavaCPP 对象用 deallocate()，避免双重释放
+            runCatching { ctx?.deallocate() }
+            runCatching { frame?.deallocate() }
+            runCatching { pkt?.deallocate() }
         }
     }
 }
