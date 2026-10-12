@@ -49,14 +49,3 @@ actual fun VideoSurface(session: SelkiesSession, modifier: Modifier) {
     }
 }
 
-/** 桌面无软键盘：空实现 */
-@Composable
-actual fun ImeHost(
-    visible: Boolean,
-    onCommitText: (String) -> Unit,
-    onEnter: () -> Unit,
-    onBackspace: () -> Unit,
-    modifier: Modifier
-) {
-    // 桌面平台由物理键盘直通完成输入
-}

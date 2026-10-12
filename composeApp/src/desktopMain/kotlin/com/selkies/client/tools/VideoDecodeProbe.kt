@@ -135,5 +135,7 @@ object VideoDecodeProbe {
         override fun setPhysicalKeyHandler(handler: ((Int, Boolean) -> Unit)?) {}
         override fun readFileBytes(path: String): ByteArray? = null
         override fun exitApp() {}
+        override fun openFile(path: String) {}
+        override fun shareFile(path: String, displayName: String) {}
     }
 }

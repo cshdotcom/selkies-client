@@ -1,6 +1,7 @@
 package com.selkies.client.core
 
 import com.selkies.client.model.AppSettings
+import com.selkies.client.model.CursorShape
 import com.selkies.client.model.ServerEntry
 import com.selkies.client.model.StatsInfo
 import com.selkies.client.platform.PlatformServices
@@ -42,10 +43,18 @@ class SelkiesSession(
     val lastError = MutableStateFlow<String?>(null)
     val lastErrorTechnical = MutableStateFlow<String?>(null)
     val stats = MutableStateFlow(StatsInfo())
+    /** 用户可见轻提示（打印到达/传输完成/硬件错误等，UI 自动消费） */
+    val notices = MutableStateFlow<String?>(null)
     val realizedResolution = MutableStateFlow<Pair<Int, Int>?>(null)
     val apps = MutableStateFlow<List<Pair<String, String>>>(emptyList())
     val role = MutableStateFlow("controller")
     val realizedResolutionFlow: StateFlow<Pair<Int, Int>?> get() = realizedResolution
+
+    /** 本地回显的远程光标位置（流坐标）——绝对移动置位、相对移动累加 */
+    val cursorX = MutableStateFlow(-1f)
+    val cursorY = MutableStateFlow(-1f)
+    /** 服务器推送的光标形状（cursor,{curdata,...} 消息，按 handle 去重） */
+    val cursorShape = MutableStateFlow<CursorShape?>(null)
 
     /** 服务器设置的镜像（encoder 等） */
     val serverSettings = MutableStateFlow<Map<String, kotlinx.serialization.json.JsonElement>>(emptyMap())
@@ -91,6 +100,9 @@ class SelkiesSession(
     private var startVideoAttempts = 0
     private var clipboardTid = 0
     private var statsSubscriptionActive = false
+    /** 帧停顿看门狗：CONNECTED 且已请求视频但超时无新帧 → 自动 REQUEST_KEYFRAME */
+    private var stallWatchdog: Job? = null
+    private var lastKeyframeRequestAt = 0L
     /** 指针消息递增序列号（官方 _pointerSeq，多线程安全） */
     private val pointerSeq = java.util.concurrent.atomic.AtomicInteger(0)
     /** 当前按住的 keysym（用于 kh 心跳，官方 100ms 周期） */
@@ -128,6 +140,21 @@ class SelkiesSession(
         }
         connection = SelkiesConnection(server, this)
         connection.start()
+        startStallWatchdog()
+    }
+
+    /** 计算本连接应请求的分辨率：每连接配置 > 自适应本机屏幕 > 默认 1280x720 */
+    private fun desiredResolution(): Pair<Int, Int> {
+        if (server.resolutionW > 0 && server.resolutionH > 0) {
+            return alignRes(server.resolutionW) to alignRes(server.resolutionH)
+        }
+        // 自适应：跟随客户端屏幕物理像素（竖屏时以短边为宽保证横向桌面）
+        val sw = screenWidthPx
+        val sh = screenHeightPx
+        if (sw > 0 && sh > 0) {
+            return if (sw >= sh) alignRes(sw) to alignRes(sh) else alignRes(sh) to alignRes(sw)
+        }
+        return 1280 to 720
     }
 
     fun disconnect() {
@@ -135,6 +162,7 @@ class SelkiesSession(
         reconnectJob?.cancel()
         ackTimer?.cancel()
         watchdogTimer?.cancel()
+        stallWatchdog?.cancel()
         keyHeartbeatJob?.cancel()
         heldKeys.clear()
         runCatching { micCapture.stop() }
@@ -162,6 +190,8 @@ class SelkiesSession(
             // gzip 能力宣告
             connection.sendText("_gz,1")
             sendInitialSettings()
+            // 服务器端光标渲染进视频流（官方 SET_NATIVE_CURSOR_RENDERING，与本地覆盖层双保险）
+            connection.sendText("SET_NATIVE_CURSOR_RENDERING,1")
             // 请求服务器剪贴板（cache-only）
             connection.sendText("cr")
         }
@@ -170,12 +200,11 @@ class SelkiesSession(
 
     private suspend fun sendInitialSettings() {
         val s = settings()
-        val defW = 1920
-        val defH = 1080
+        val (defW, defH) = desiredResolution()
         val payload = LinkedHashMap<String, Any>()
         payload["manual_resolution"] = false
-        payload["initialClientWidth"] = alignRes(screenWidthPx.takeIf { it > 0 } ?: defW)
-        payload["initialClientHeight"] = alignRes(screenHeightPx.takeIf { it > 0 } ?: defH)
+        payload["initialClientWidth"] = defW
+        payload["initialClientHeight"] = defH
         payload["scaling_dpi"] = 96
         payload["framerate"] = server.framerate
         payload["keyboardLayout"] = "us"
@@ -267,14 +296,9 @@ class SelkiesSession(
                             connection.sendText("STOP_VIDEO")
                             delay(250)
                         }
-                        // 请求分辨率 + 启动视频
-                        val w = realizedResolution.value?.first ?: stats.value.let {
-                            parseResW(it.resolution) ?: 1280
-                        }
-                        val h = realizedResolution.value?.second ?: stats.value.let {
-                            parseResH(it.resolution) ?: 720
-                        }
-                        connection.sendText(Protocol.resolution(alignRes(w), alignRes(h), server.displayId))
+                        // 请求分辨率 + 启动视频（每连接配置 > 自适应屏幕 > 默认）
+                        val (w, h) = desiredResolution()
+                        connection.sendText(Protocol.resolution(w, h, server.displayId))
                         connection.sendText("START_VIDEO")
                         if (server.audioEnabled) connection.sendText("START_AUDIO")
                         subscribeStats()
@@ -308,7 +332,8 @@ class SelkiesSession(
                 videoSink?.reset()
             }
             text.startsWith("DISPLAY_CONFIG_UPDATE,") -> { /* 多屏配置，v1 仅单屏 */ }
-            text.startsWith("cursor,") -> { /* 服务器光标样式，触屏模式渲染本地指针即可 */ }
+            text.startsWith("cursor,") -> parseCursorShape(text.substring(7))
+            text.startsWith("system,pointer,") -> handlePointerEcho(text.substring("system,pointer,".length))
             text.startsWith("system,") -> handleSystemAction(text.substring(7))
             text.startsWith("KILL ") -> {
                 val reason = text.substring(5)
@@ -419,7 +444,15 @@ class SelkiesSession(
                         stats.value.resolution = "${w}x${h}"
                     }
                 }
-                "stream_info" -> { }
+                "stream_info" -> {
+                    val info = obj["info"] as? kotlinx.serialization.json.JsonObject ?: return
+                    val backend = (info["backend"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: ""
+                    val encoder = (info["encoder"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: ""
+                    if (backend.isNotBlank() || encoder.isNotBlank()) {
+                        stats.value.encoderDetail = "$backend/$encoder"
+                        stats.value = stats.value
+                    }
+                }
                 "stream_stats" -> {
                     val st = stats.value
                     (obj["fps"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull()?.let { st.fps = it.toInt() }
@@ -456,6 +489,37 @@ class SelkiesSession(
         }
     }
 
+    /** 新版服务器的指针位置回显：system,pointer,<did>,<x>,<y>,<scale>,<seq>（本地回显的权威校正） */
+    private fun handlePointerEcho(args: String) {
+        val parts = args.split(",")
+        if (parts.size < 3) return
+        val x = parts[1].toFloatOrNull() ?: return
+        val y = parts[2].toFloatOrNull() ?: return
+        cursorX.value = x
+        cursorY.value = y
+    }
+
+    /** 服务器光标形状：cursor,{"curdata":"<b64 png>","width":32,"height":32,"hotx":4,"hoty":4,"handle":N} */
+    private fun parseCursorShape(json: String) {
+        runCatching {
+            val obj = kotlinx.serialization.json.Json.parseToJsonElement(json) as? kotlinx.serialization.json.JsonObject ?: return
+            val curdata = (obj["curdata"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: return
+            val handle = (obj["handle"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toLongOrNull() ?: return
+            val shape = CursorShape(
+                pngBase64 = curdata,
+                width = (obj["width"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull() ?: 32,
+                height = (obj["height"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull() ?: 32,
+                hotX = (obj["hotx"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull() ?: 0,
+                hotY = (obj["hoty"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull() ?: 0,
+                handle = handle
+            )
+            // 按 handle 去重：同形状重复推送不触发 UI 重组
+            if (cursorShape.value?.handle != handle) {
+                cursorShape.value = shape
+            }
+        }
+    }
+
     private fun handleCaptureDemand(subject: String, wanted: Boolean) {
         val s = settings()
         if (subject == "webcam" || subject.contains("webcam")) {
@@ -477,17 +541,18 @@ class SelkiesSession(
     private fun handlePrintDocument(name: String, sizeBytes: Long) {
         ioScope.launch {
             runCatching {
-                val (code, bytes) = connection.apiGetBytes("/api/print/" + java.net.URLEncoder.encode(name, "UTF-8"))
+                val (code, bytes) = connection.apiGetBytes("/api/print/" + java.net.URLEncoder.encode(name, "UTF-8").replace("+", "%20"))
                 if (code == 200 && bytes.isNotEmpty()) {
                     withContext(Dispatchers.Main) {
                         onPrintDocument(name, sizeBytes)
+                        // ⚠️ PrintManager 必须在主线程调起（旧版在 IO 线程调用导致远程打印无声失败）
+                        platform.print().printPdf(bytes, name)
                     }
-                    platform.print().printPdf(bytes, name)
                 } else {
-                    lastError.value = "远程打印失败：获取打印文档 $name 失败（HTTP $code）"
+                    notices.value = "远程打印：获取文档 $name 失败（HTTP $code）"
                 }
             }.onFailure {
-                lastError.value = "远程打印失败：${it.message ?: it.javaClass.simpleName}"
+                notices.value = "远程打印失败：${it.message ?: it.javaClass.simpleName}"
             }
         }
     }
@@ -521,6 +586,16 @@ class SelkiesSession(
                 Protocol.FRAME_VIDEO -> {
                     Protocol.parseVideoFrameHeader(data, length)?.let { (header, off) ->
                         noteVideoChunk(header.frameId)
+                        // ⚠️【坐标修复】帧头携带真实流尺寸——stream_resolution JSON 缺失/迟到时
+                        //    仍能同步视图几何，否则触摸坐标会按错误分辨率映射（点击错位的根源）
+                        if (header.width > 0 && header.height > 0) {
+                            val cur = realizedResolution.value
+                            if (cur == null || cur.first != header.width || cur.second != header.height) {
+                                realizedResolution.value = header.width to header.height
+                                stats.value.resolution = "${header.width}x${header.height}"
+                                stats.value = stats.value
+                            }
+                        }
                         stats.value.videoFrames++
                         videoSink?.onVideoFrame(header, data, off, length)
                     }
@@ -730,10 +805,24 @@ class SelkiesSession(
 
     fun sendMouseMove(x: Int, y: Int, mask: Int) = post {
         connection.sendText(Protocol.mouseMove(x, y, mask, nextPointerSeq()))
+        // 本地回显光标位置（服务器无位置回显时由本地维护）
+        cursorX.value = x.toFloat()
+        cursorY.value = y.toFloat()
     }
 
     fun sendMouseMoveRelative(dx: Int, dy: Int, mask: Int) = post {
         connection.sendText(Protocol.mouseMoveRelative(dx, dy, mask, nextPointerSeq()))
+        // 虚拟光标累加并限制在流范围内
+        if (dx != 0 || dy != 0) {
+            val w = (realizedResolution.value?.first ?: 1920).toFloat()
+            val h = (realizedResolution.value?.second ?: 1080).toFloat()
+            var cx = cursorX.value
+            var cy = cursorY.value
+            if (cx < 0) cx = w / 2f
+            if (cy < 0) cy = h / 2f
+            cursorX.value = (cx + dx).coerceIn(0f, w - 1f)
+            cursorY.value = (cy + dy).coerceIn(0f, h - 1f)
+        }
     }
 
     fun sendMouseButton(x: Int, y: Int, mask: Int) = post {
@@ -747,7 +836,44 @@ class SelkiesSession(
     }
 
     fun requestKeyframe() = post {
+        // 限流：看门狗/手动触发共享 3s 冷却，避免风暴
+        val now = System.currentTimeMillis()
+        if (now - lastKeyframeRequestAt > 3000) {
+            lastKeyframeRequestAt = now
+            connection.sendText("REQUEST_KEYFRAME")
+        } else if (now - lastKeyframeRequestAt < 0) {
+            lastKeyframeRequestAt = now
+        }
+    }
+
+    /** Surface 重建/解码器重建后的强制关键帧（绕过限流） */
+    fun forceKeyframe() = post {
+        lastKeyframeRequestAt = System.currentTimeMillis()
         connection.sendText("REQUEST_KEYFRAME")
+    }
+
+    /**
+     * 帧停顿看门狗：CONNECTED 且已请求视频但 3s 无新帧 → 自动 REQUEST_KEYFRAME（限流 5s/次）。
+     * 覆盖两类用户报障：①退到后台再回前台 SurfaceView 重建后解码器丢弃增量帧→永久黑屏；
+     * ②链路丢帧导致参考帧断裂→画面冻结。触发后恢复的帧会重置 lastReceivedFrameAt。
+     */
+    private fun startStallWatchdog() {
+        stallWatchdog?.cancel()
+        stallWatchdog = scope.launch {
+            while (isActive && !userClosed) {
+                delay(1000)
+                if (status.value != Status.CONNECTED || !videoRequested) continue
+                if (!settings().requestKeyframeOnStall) continue
+                val last = lastReceivedFrameAt
+                if (last > 0 && System.currentTimeMillis() - last > 3000) {
+                    val now = System.currentTimeMillis()
+                    if (now - lastKeyframeRequestAt > 5000) {
+                        lastKeyframeRequestAt = now
+                        runCatching { connection.sendText("REQUEST_KEYFRAME") }
+                    }
+                }
+            }
+        }
     }
 
     fun sendResolution(w: Int, h: Int) = post {
@@ -905,7 +1031,7 @@ class SelkiesSession(
                 }
             },
             onError = { err ->
-                lastError.value = "麦克风错误：$err"
+                notices.value = "麦克风：$err"
                 runCatching { micCapture.stop() }
             }
         )
@@ -930,7 +1056,7 @@ class SelkiesSession(
                 }
             },
             onError = { err ->
-                lastError.value = "摄像头错误：$err"
+                notices.value = "摄像头：$err"
                 runCatching { webcamCapture.stop() }
             }
         )

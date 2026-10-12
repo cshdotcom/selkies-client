@@ -127,11 +127,18 @@ interface PlatformServices {
     fun setPhysicalKeyHandler(handler: ((keyCode: Int, down: Boolean) -> Unit)?)
     /** 读取本地文件/内容 URI 字节（导入、上传预读等） */
     fun readFileBytes(path: String): ByteArray?
+    /** 用系统查看器打开本地文件（下载完成后「打开」） */
+    fun openFile(path: String)
+    /** 分享本地文件（系统分享面板） */
+    fun shareFile(path: String, displayName: String)
     /** 退出应用（Android=finish；Desktop=System.exit） */
     fun exitApp()
 }
 
 expect fun getPlatformServices(): PlatformServices
+
+/** PNG 字节 → Compose ImageBitmap（Android=BitmapFactory，Desktop=Skia） */
+expect fun decodePngToImageBitmap(bytes: ByteArray): androidx.compose.ui.graphics.ImageBitmap?
 
 /** 平台 HttpClient 工厂（Android/Desktop 均使用 OkHttp 引擎） */
 expect fun createHttpClient(allowUntrustedCert: Boolean): HttpClient

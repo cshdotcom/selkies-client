@@ -28,6 +28,7 @@ import android.view.inputmethod.InputMethodManager
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.compose.ui.graphics.asImageBitmap
 import com.selkies.client.audio.AndroidAudioPlayer
 import com.selkies.client.audio.AndroidMicCapture
 import com.selkies.client.video.AndroidVideoSink
@@ -184,6 +185,40 @@ object AndroidPlatform : PlatformServices {
 
     override fun exitApp() {
         activityRef?.finish()
+    }
+
+    /** 用系统查看器打开本地文件（FileProvider 授权） */
+    override fun openFile(path: String) {
+        runCatching {
+            val ctx = appContext ?: return
+            val file = java.io.File(path)
+            if (!file.exists()) return
+            val uri = androidx.core.content.FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
+            val mime = ctx.contentResolver.getType(uri) ?: "*/*"
+            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, mime)
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            ctx.startActivity(intent)
+        }
+    }
+
+    /** 系统分享面板 */
+    override fun shareFile(path: String, displayName: String) {
+        runCatching {
+            val ctx = appContext ?: return
+            val file = java.io.File(path)
+            if (!file.exists()) return
+            val uri = androidx.core.content.FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
+            val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                type = ctx.contentResolver.getType(uri) ?: "application/octet-stream"
+                putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            ctx.startActivity(android.content.Intent.createChooser(intent, "分享 $displayName").apply {
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            })
+        }
     }
 
     override fun saveFile(suggestedName: String, bytes: ByteArray, onDone: (Boolean) -> Unit) {
@@ -590,3 +625,12 @@ private object AndroidPrintBridge : PrintBridge {
 
 /** Android 平台服务入口 */
 actual fun getPlatformServices(): PlatformServices = AndroidPlatform
+
+/** Android PNG 解码：BitmapFactory → asImageBitmap */
+@Suppress("USELESS_CAST")
+actual fun decodePngToImageBitmap(bytes: ByteArray): androidx.compose.ui.graphics.ImageBitmap? =
+    runCatching {
+        val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            ?: return@runCatching null
+        bmp.asImageBitmap()
+    }.getOrNull()

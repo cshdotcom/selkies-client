@@ -70,6 +70,10 @@ fun AddServerScreen(state: AppState, serverId: String?) {
     var encoder by remember { mutableStateOf(existing?.encoder ?: "h264enc") }
     var audioEnabled by remember { mutableStateOf(existing?.audioEnabled ?: true) }
     var displayId by remember { mutableStateOf(existing?.displayId ?: "primary") }
+    // ---- 每连接分辨率（0=自适应本机屏幕）----
+    var resW by remember { mutableStateOf((existing?.resolutionW ?: 0).coerceAtLeast(0)) }
+    var resH by remember { mutableStateOf((existing?.resolutionH ?: 0).coerceAtLeast(0)) }
+    var customRes by remember { mutableStateOf(false) }
 
     // ---- 官方前端对齐的视频高级设置 ----
     var showAdvanced by remember { mutableStateOf(false) }
@@ -167,6 +171,54 @@ fun AddServerScreen(state: AppState, serverId: String?) {
             }
 
             SectionTitle("视频质量")
+            Text("分辨率（每个服务器可独立设置）：", style = MaterialTheme.typography.bodyMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                FilterChip(
+                    selected = !customRes && resW == 0,
+                    onClick = { customRes = false; resW = 0; resH = 0 },
+                    label = { Text("自适应屏幕") }
+                )
+                FilterChip(
+                    selected = !customRes && resW == 1920,
+                    onClick = { customRes = false; resW = 1920; resH = 1080 },
+                    label = { Text("1920×1080") }
+                )
+                FilterChip(
+                    selected = !customRes && resW == 1280,
+                    onClick = { customRes = false; resW = 1280; resH = 720 },
+                    label = { Text("1280×720") }
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                FilterChip(
+                    selected = !customRes && resW == 2560,
+                    onClick = { customRes = false; resW = 2560; resH = 1440 },
+                    label = { Text("2560×1440") }
+                )
+                FilterChip(
+                    selected = customRes || (resW !in listOf(0, 1280, 1920, 2560)),
+                    onClick = { customRes = true; if (resW == 0) { resW = 1600; resH = 900 } },
+                    label = { Text("自定义") }
+                )
+            }
+            if (customRes) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedTextField(
+                        value = if (resW > 0) resW.toString() else "",
+                        onValueChange = { resW = it.filter { c -> c.isDigit() }.take(4).toIntOrNull() ?: 0 },
+                        label = { Text("宽") }, modifier = Modifier.weight(1f), singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = if (resH > 0) resH.toString() else "",
+                        onValueChange = { resH = it.filter { c -> c.isDigit() }.take(4).toIntOrNull() ?: 0 },
+                        label = { Text("高") }, modifier = Modifier.weight(1f), singleLine = true
+                    )
+                }
+            }
+            Text(
+                if (resW > 0 && resH > 0) "连接时固定请求 ${resW}×${resH}" else "连接时按本机屏幕自动适配（竖屏自动转横向）",
+                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
             Text("帧率：${framerate.toInt()} fps", style = MaterialTheme.typography.bodyMedium)
             Slider(value = framerate, onValueChange = { framerate = it }, valueRange = 15f..144f)
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -263,6 +315,8 @@ fun AddServerScreen(state: AppState, serverId: String?) {
                             username = username, password = password,
                             viewOnly = viewOnly, displayId = displayId,
                             framerate = framerate.toInt(),
+                            resolutionW = if (resW > 0 && resH > 0) resW else 0,
+                            resolutionH = if (resW > 0 && resH > 0) resH else 0,
                             videoBitrate = videoBitrate.toInt(),
                             videoCrf = if (useCrf) videoCrf.toInt() else 0,
                             encoder = encoder,
@@ -307,6 +361,8 @@ fun AddServerScreen(state: AppState, serverId: String?) {
                         username = username, password = password,
                         viewOnly = viewOnly, displayId = displayId,
                         framerate = framerate.toInt(),
+                        resolutionW = if (resW > 0 && resH > 0) resW else 0,
+                        resolutionH = if (resW > 0 && resH > 0) resH else 0,
                         videoBitrate = videoBitrate.toInt(),
                         videoCrf = if (useCrf) videoCrf.toInt() else 0,
                         encoder = encoder,

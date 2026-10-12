@@ -10,14 +10,12 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -27,12 +25,12 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Abc
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.ContentPaste
@@ -69,11 +67,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.pointerInput
@@ -102,7 +104,9 @@ import com.selkies.client.ui.panels.QuickShortcutBar
 import com.selkies.client.ui.panels.StatsPanel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.math.log10
 import kotlin.math.min
 import kotlin.math.pow
@@ -114,25 +118,24 @@ enum class SessionPanel { NONE, KEYBOARD, HOTKEYS, CLIPBOARD, FILES, STATS, APPS
 /** 触控输入模式 */
 enum class InputMode { TOUCH, TRACKPAD }
 
-private const val TOUCH_SCROLL_NOTCH_PX = 50f
+private const val TOUCH_SCROLL_NOTCH_PX = 48f
 private const val PINCH_NOTCH_RATIO = 1.189207115002721 // 2^(1/4)
+private const val TAP_SLOP_PX = 18f          // 单指位移容差（超过视为拖动而非点击）
+private const val LONG_PRESS_MS = 480L       // 长按右键阈值
+private const val TAP_MAX_MS = 280L         // 轻触最大时长
+private const val TWO_FINGER_TAP_MS = 260L  // 双指轻点右键窗口
 
 /** 视频渲染表面（平台实现：Android=SurfaceView+MediaCodec，Desktop=Skia 位图） */
 @Composable
 expect fun VideoSurface(session: SelkiesSession, modifier: Modifier)
 
-/** IME 宿主（Android=隐藏 EditText；Desktop=空实现） */
-@Composable
-expect fun ImeHost(
-    visible: Boolean,
-    onCommitText: (String) -> Unit,
-    onEnter: () -> Unit,
-    onBackspace: () -> Unit,
-    modifier: Modifier
-)
-
 /**
- * 远程桌面会话界面：视频 + 触屏/触摸板双模式输入 + 悬浮键盘 + IME + 工具栏 + 面板
+ * 远程桌面会话界面：
+ * - 视频等比自适应（aspectRatio 容器，点击坐标与画面严格一致）
+ * - 零延迟触屏（Initial 通道直发：按下即 m 事件，无系统双击等待）
+ * - 本地光标覆盖层（服务器 cursor 形状 + 本地位置回显）
+ * - 悬浮键盘（分类/完整双模式）+ 系统输入法（缓冲+发送）+ 快捷按钮栏
+ * - 可横向滑动工具栏
  */
 @Composable
 fun SessionScreen(state: AppState, server: ServerEntry) {
@@ -155,6 +158,10 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     val realizedRes by session.realizedResolution.collectAsState()
     val lastError by session.lastError.collectAsState()
     val role by session.role.collectAsState()
+    val notices by session.notices.collectAsState()
+    val cursorX by session.cursorX.collectAsState()
+    val cursorY by session.cursorY.collectAsState()
+    val cursorShape by session.cursorShape.collectAsState()
 
     var panel by remember { mutableStateOf(SessionPanel.NONE) }
     var fullscreen by remember { mutableStateOf(false) }
@@ -172,7 +179,12 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     // 视口几何
     var viewSize by remember { mutableStateOf(IntSize.Zero) }
     var streamSize by remember { mutableStateOf(realizedRes ?: Pair(1280, 720)) }
-    LaunchedEffect(realizedRes) { realizedRes?.let { streamSize = it } }
+    LaunchedEffect(realizedRes) {
+        realizedRes?.let {
+            streamSize = it
+            println("[Selkies] 流分辨率: ${it.first}x${it.second}")
+        }
+    }
 
     // 手势累积器
     val acc = remember { ScrollAccumulator() }
@@ -182,10 +194,11 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
 
     // 提示自动消失
     LaunchedEffect(toast) {
-        if (toast != null) {
-            delay(3500)
-            toast = null
-        }
+        if (toast != null) { delay(3500); toast = null }
+    }
+    // 会话级通知（打印/硬件/传输）→ toast
+    LaunchedEffect(notices) {
+        if (notices != null) { toast = notices; session.notices.value = null }
     }
 
     // 返回键：逐层退出（面板→悬浮键盘/快捷栏→选择器→全屏→确认断开）
@@ -203,12 +216,17 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
 
     // 连接生命周期 + 剪贴板监听 + 桌面物理键直通 + 手柄挂载
     DisposableEffect(session) {
-        session.screenWidthPx = streamSize.first
-        session.screenHeightPx = streamSize.second
-        session.connect()
+        // ⚠️ 等待首次布局拿到真实视口尺寸再连接：SETTINGS 的 initialClientWidth/Height
+        //    与自适应分辨率依赖它（旧版在布局前连接，恒发 1280x720）。
+        val job = scope.launch {
+            var waited = 0
+            while (viewSize == IntSize.Zero && waited < 1500) { delay(50); waited += 50 }
+            session.screenWidthPx = viewSize.width.takeIf { it > 0 } ?: 1280
+            session.screenHeightPx = viewSize.height.takeIf { it > 0 } ?: 720
+            session.connect()
+        }
 
-        // 服务器端光标渲染进视频流（官方 SET_NATIVE_CURSOR_RENDERING）：
-        // 触屏/触摸板模式下都能看到远程光标，无需本地渲染
+        // 服务器端光标渲染进视频流（官方 SET_NATIVE_CURSOR_RENDERING）+ 本地覆盖层双保险
         session.post { session.connection.sendText("SET_NATIVE_CURSOR_RENDERING,1") }
 
         // Android 手柄 → js 指令
@@ -239,6 +257,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         }
 
         onDispose {
+            job.cancel()
             platform.setPhysicalKeyHandler(null)
             attachGamepadSession(null)
             clip.setListener(null)
@@ -267,7 +286,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     }
     val onKeyboardButtonLong: () -> Unit = { showInputPicker = true }
 
-    // ---------- 坐标映射 ----------
+    // ---------- 坐标映射（视频等比容器内，画面与坐标严格一致）----------
     fun mapToStream(pos: Offset): Pair<Int, Int> {
         val vw = viewSize.width.toFloat()
         val vh = viewSize.height.toFloat()
@@ -282,6 +301,19 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         return x to y
     }
 
+    /** 流坐标 → 视图坐标（光标覆盖层用） */
+    fun mapFromStream(sx: Float, sy: Float): Offset {
+        val vw = viewSize.width.toFloat()
+        val vh = viewSize.height.toFloat()
+        if (vw <= 0 || vh <= 0) return Offset.Zero
+        val sw = streamSize.first.toFloat()
+        val sh = streamSize.second.toFloat()
+        val scale = min(vw / sw, vh / sh)
+        val dx = (vw - sw * scale) / 2f
+        val dy = (vh - sh * scale) / 2f
+        return Offset(sx * scale + dx, sy * scale + dy)
+    }
+
     /** 视图像素位移 → 流坐标位移（触摸板相对移动用） */
     fun deltaToStream(d: Offset): Offset {
         val vw = viewSize.width.toFloat()
@@ -292,7 +324,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         return Offset(d.x / scale, d.y / scale)
     }
 
-    // ---------- 触屏（直接）模式点击 ----------
+    // ---------- 点击原语 ----------
     fun leftClickAt(pos: Offset) {
         if (viewOnly) return
         val (x, y) = mapToStream(pos)
@@ -314,34 +346,10 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         session.sendMouseMove(x, y, 0)
     }
 
-    fun doubleClickAt(pos: Offset) {
-        leftClickAt(pos)
-        scope.launch {
-            kotlinx.coroutines.delay(80)
-            leftClickAt(pos)
-        }
-    }
-
-    fun movePointerTo(pos: Offset) {
-        if (viewOnly) return
-        val (x, y) = mapToStream(pos)
-        session.sendMouseMove(x, y, 0)
-    }
-
-    // ---------- 触摸板模式点击（相对，作用于当前位置） ----------
     fun trackpadClick(mask: Int) {
         if (viewOnly) return
         session.sendMouseMoveRelative(0, 0, mask)
         session.sendMouseMoveRelative(0, 0, 0)
-    }
-
-    fun trackpadDoubleClick() {
-        if (viewOnly) return
-        trackpadClick(Protocol.BUTTON_LEFT)
-        scope.launch {
-            kotlinx.coroutines.delay(80)
-            trackpadClick(Protocol.BUTTON_LEFT)
-        }
     }
 
     fun scrollNotches(vertical: Boolean, notches: Int) {
@@ -382,181 +390,261 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                // 单指点击/长按/双击
+                // ⚠️【无法点击根因修复】统一的零延迟指针处理器：
+                //   Initial 通道直发——手指按下立即发送 m 事件，无 detectTapGestures
+                //   的双击等待（旧版每次点击延迟 ~300ms，且 SurfaceView 拉伸变形导致
+                //   坐标错位；本处理器配合外层 aspectRatio 等比容器后坐标严格一致）。
                 .pointerInput(inputMode, viewOnly, streamSize, viewSize) {
-                    detectTapGestures(
-                        onDoubleTap = { pos ->
-                            if (inputMode == InputMode.TRACKPAD) {
-                                trackpadDoubleClick()
-                                pendingDrag = true // 双击后按住不放 → 拖动
-                            } else {
-                                doubleClickAt(pos)
-                            }
-                        },
-                        onLongPress = { pos ->
-                            if (inputMode == InputMode.TRACKPAD) {
-                                trackpadClick(Protocol.BUTTON_RIGHT)
-                            } else {
-                                rightClickAt(pos)
-                            }
-                        },
-                        onTap = { pos ->
-                            if (inputMode == InputMode.TRACKPAD) {
-                                trackpadClick(Protocol.BUTTON_LEFT)
-                            } else {
-                                leftClickAt(pos)
-                            }
-                        },
-                        onPress = { pos ->
-                            if (inputMode == InputMode.TOUCH && !viewOnly) {
-                                movePointerTo(pos)
-                            }
-                        }
-                    )
-                }
-                // 拖动
-                .pointerInput(inputMode, viewOnly, streamSize, viewSize) {
-                    detectDragGestures(
-                        onDragStart = { pos ->
-                            if (!viewOnly) {
-                                if (inputMode == InputMode.TRACKPAD) {
-                                    // 双击后按住 = 拖动（按住左键）
-                                    if (pendingDrag) {
-                                        session.sendMouseMoveRelative(0, 0, Protocol.BUTTON_LEFT)
-                                    }
-                                } else {
-                                    val (x, y) = mapToStream(pos)
-                                    session.sendMouseMove(x, y, Protocol.BUTTON_LEFT)
-                                }
-                            }
-                        },
-                        onDrag = { change, _ ->
-                            if (!viewOnly) {
-                                if (inputMode == InputMode.TRACKPAD) {
-                                    val d = deltaToStream(change.positionChange())
-                                    val mask = if (pendingDrag) Protocol.BUTTON_LEFT else 0
-                                    session.sendMouseMoveRelative(
-                                        d.x.roundToInt(),
-                                        d.y.roundToInt(),
-                                        mask
-                                    )
-                                } else {
-                                    val (x, y) = mapToStream(change.position)
-                                    session.sendMouseMove(x, y, Protocol.BUTTON_LEFT)
-                                }
-                            }
-                        },
-                        onDragEnd = {
-                            if (!viewOnly) {
-                                if (inputMode == InputMode.TRACKPAD) {
-                                    if (pendingDrag) {
-                                        session.sendMouseMoveRelative(0, 0, 0)
-                                    }
-                                    pendingDrag = false
-                                } else {
-                                    session.sendMouseMove(0, 0, 0)
-                                }
-                            }
-                        },
-                        onDragCancel = {
-                            if (!viewOnly) {
-                                if (inputMode == InputMode.TRACKPAD) {
-                                    pendingDrag = false
-                                } else {
-                                    session.sendMouseMove(0, 0, 0)
-                                }
-                            }
-                        }
-                    )
-                }
-                // 双指：滚动 + 捏合缩放（两种模式通用）
-                .pointerInput(viewOnly) {
-                    detectTransformGestures { _, pan, zoom, _ ->
-                        if (!viewOnly) {
-                            if (abs(pan.y) > 0.5f) {
-                                acc.scrollY += -pan.y
-                                val notches = (acc.scrollY / TOUCH_SCROLL_NOTCH_PX).toInt()
-                                if (notches != 0) {
-                                    acc.scrollY -= notches * TOUCH_SCROLL_NOTCH_PX
-                                    scrollNotches(true, notches)
-                                }
-                            }
-                            if (zoom != 1f) {
-                                acc.zoom *= zoom
-                                val n = (log10(acc.zoom.toDouble()) / log10(PINCH_NOTCH_RATIO)).toInt()
-                                if (n != 0) {
-                                    acc.zoom /= PINCH_NOTCH_RATIO.pow(n.toDouble()).toFloat()
-                                    pinchNotches(n)
-                                }
-                            }
-                        }
-                    }
-                }
-                // 桌面鼠标：滚轮 / 右中键 / 悬停（Initial 通道拦截）
-                .pointerInput(viewOnly) {
                     awaitPointerEventScope {
-                        while (true) {
-                            val event = awaitPointerEvent(PointerEventPass.Initial)
-                            if (viewOnly) continue
-                            if (event.type == PointerEventType.Scroll) {
-                                val sd = event.changes.fold(Offset.Zero) { a, c -> a + c.scrollDelta }
-                                if (sd != Offset.Zero) {
-                                    if (abs(sd.y) > 1e-4f) {
-                                        acc.wheelY += -sd.y * 3f
-                                        val n = acc.wheelY.toInt()
-                                        if (n != 0) {
-                                            acc.wheelY -= n
-                                            scrollNotches(true, n)
-                                        }
-                                    }
-                                    if (abs(sd.x) > 1e-4f) {
-                                        acc.wheelX += sd.x * 3f
-                                        val n = acc.wheelX.toInt()
-                                        if (n != 0) {
-                                            acc.wheelX -= n
-                                            scrollNotches(false, n)
-                                        }
-                                    }
-                                    event.changes.forEach { it.consume() }
-                                }
-                            } else if (event.type == PointerEventType.Press) {
-                                val isMouse = event.changes.any { it.type == PointerType.Mouse }
-                                if (isMouse) {
-                                    val pos = event.changes.first().position
-                                    when {
-                                        event.tertiaryPressed() -> middleClickAt(pos)
-                                        event.secondaryPressed() -> rightClickAt(pos)
-                                        event.primaryPressed() -> leftClickAt(pos)
-                                    }
-                                    event.changes.forEach { it.consume() }
-                                }
-                            } else if (event.type == PointerEventType.Move) {
-                                val isMouse = event.changes.any { it.type == PointerType.Mouse }
-                                if (isMouse) {
-                                    val pos = event.changes.first().position
-                                    val mask = when {
-                                        event.primaryPressed() -> Protocol.BUTTON_LEFT
-                                        event.secondaryPressed() -> Protocol.BUTTON_RIGHT
-                                        event.tertiaryPressed() -> Protocol.BUTTON_MIDDLE
-                                        else -> 0
-                                    }
-                                    val (x, y) = mapToStream(pos)
-                                    session.sendMouseMove(x, y, mask)
-                                }
-                            } else if (event.type == PointerEventType.Release) {
-                                val isMouse = event.changes.any { it.type == PointerType.Mouse }
-                                if (isMouse) {
-                                    val pos = event.changes.first().position
-                                    val (x, y) = mapToStream(pos)
+                        // ---- 触屏会话状态 ----
+                        val touches = LinkedHashMap<PointerId, Offset>()
+                        var pressStart = 0L
+                        var pressPos = Offset.Zero
+                        var touchMoved = false
+                        var longFired = false
+                        var leftDownSent = false        // TOUCH 模式：已发送左键按下
+                        var twoFingerStart = 0L
+                        var twoFingerDist = 0f
+                        var twoFingerMoved = false
+                        var lastTapUpAt = 0L            // 双击检测
+
+                        fun endTouchSession(sendRelease: Boolean) {
+                            if (leftDownSent && sendRelease && !viewOnly) {
+                                if (inputMode == InputMode.TOUCH) {
+                                    val (x, y) = mapToStream(pressPos)
                                     session.sendMouseMove(x, y, 0)
-                                    event.changes.forEach { it.consume() }
+                                } else {
+                                    session.sendMouseMoveRelative(0, 0, 0)
                                 }
+                            }
+                            leftDownSent = false
+                        }
+
+                        while (true) {
+                            // 长按计时：单指按下未移动未触发时，等到 LONG_PRESS_MS
+                            val needTimer = touches.size == 1 && !touchMoved && !longFired && !pendingDrag && !viewOnly &&
+                                    (inputMode == InputMode.TOUCH || inputMode == InputMode.TRACKPAD)
+                            val waitMs = if (needTimer) {
+                                (LONG_PRESS_MS - (System.currentTimeMillis() - pressStart)).coerceIn(16L, LONG_PRESS_MS)
+                            } else 60_000L
+                            val event = withTimeoutOrNull(waitMs) {
+                                awaitPointerEvent(PointerEventPass.Initial)
+                            }
+                            if (event == null) {
+                                // 超时：长按 → 右键
+                                if (needTimer) {
+                                    longFired = true
+                                    if (inputMode == InputMode.TOUCH) {
+                                        // 先释放已按下的左键，再发右键
+                                        endTouchSession(true)
+                                        rightClickAt(pressPos)
+                                    } else {
+                                        trackpadClick(Protocol.BUTTON_RIGHT)
+                                    }
+                                }
+                                continue
+                            }
+                            val changes = event.changes
+                            // ---------- 桌面鼠标（滚轮/按键/悬停）----------
+                            if (changes.any { it.type == PointerType.Mouse }) {
+                                when (event.type) {
+                                    PointerEventType.Scroll -> {
+                                        val sd = changes.fold(Offset.Zero) { a, c -> a + c.scrollDelta }
+                                        if (sd != Offset.Zero) {
+                                            if (abs(sd.y) > 1e-4f) {
+                                                acc.wheelY += -sd.y * 3f
+                                                val n = acc.wheelY.toInt()
+                                                if (n != 0) { acc.wheelY -= n; scrollNotches(true, n) }
+                                            }
+                                            if (abs(sd.x) > 1e-4f) {
+                                                acc.wheelX += sd.x * 3f
+                                                val n = acc.wheelX.toInt()
+                                                if (n != 0) { acc.wheelX -= n; scrollNotches(false, n) }
+                                            }
+                                            changes.forEach { it.consume() }
+                                        }
+                                    }
+                                    PointerEventType.Press -> {
+                                        val pos = changes.first().position
+                                        when {
+                                            event.tertiaryPressed() -> middleClickAt(pos)
+                                            event.secondaryPressed() -> rightClickAt(pos)
+                                            event.primaryPressed() -> leftClickAt(pos)
+                                        }
+                                        changes.forEach { it.consume() }
+                                    }
+                                    PointerEventType.Move -> {
+                                        val pos = changes.first().position
+                                        val mask = when {
+                                            event.primaryPressed() -> Protocol.BUTTON_LEFT
+                                            event.secondaryPressed() -> Protocol.BUTTON_RIGHT
+                                            event.tertiaryPressed() -> Protocol.BUTTON_MIDDLE
+                                            else -> 0
+                                        }
+                                        if (!viewOnly) {
+                                            val (x, y) = mapToStream(pos)
+                                            session.sendMouseMove(x, y, mask)
+                                        }
+                                    }
+                                    PointerEventType.Release -> {
+                                        val pos = changes.first().position
+                                        if (!viewOnly) {
+                                            val (x, y) = mapToStream(pos)
+                                            session.sendMouseMove(x, y, 0)
+                                        }
+                                        changes.forEach { it.consume() }
+                                    }
+                                    else -> {}
+                                }
+                                continue
+                            }
+
+                            // ---------- 触屏 ----------
+                            val touchChanges = changes.filter { it.type == PointerType.Touch }
+                            if (touchChanges.isEmpty()) continue
+                            when (event.type) {
+                                PointerEventType.Press -> {
+                                    touchChanges.forEach { touches[it.id] = it.position }
+                                    if (touches.size == 1) {
+                                        // 新的单指会话
+                                        pressStart = System.currentTimeMillis()
+                                        pressPos = touchChanges.first().position
+                                        touchMoved = false
+                                        longFired = false
+                                        leftDownSent = false
+                                        if (!viewOnly) {
+                                            if (inputMode == InputMode.TOUCH) {
+                                                // 直接模式：按下即左键按下（零延迟）
+                                                val (x, y) = mapToStream(pressPos)
+                                                session.sendMouseMove(x, y, Protocol.BUTTON_LEFT)
+                                                leftDownSent = true
+                                            } else if (pendingDrag) {
+                                                // 触摸板双击后按住 = 拖动
+                                                session.sendMouseMoveRelative(0, 0, Protocol.BUTTON_LEFT)
+                                                leftDownSent = true
+                                            }
+                                        }
+                                    } else if (touches.size == 2) {
+                                        // 双指手势开始：取消单指会话（释放左键）
+                                        endTouchSession(true)
+                                        twoFingerStart = System.currentTimeMillis()
+                                        val ps = touches.values.toList()
+                                        twoFingerDist = hypot(ps[0].x - ps[1].x, ps[0].y - ps[1].y)
+                                        twoFingerMoved = false
+                                        acc.scrollY = 0f
+                                        acc.zoom = 1f
+                                    }
+                                    touchChanges.forEach { it.consume() }
+                                }
+                                PointerEventType.Move -> {
+                                    touchChanges.forEach { c -> touches[c.id] = c.position }
+                                    if (touches.size >= 2 && !viewOnly) {
+                                        // 双指：滚动 + 捏合缩放
+                                        val ps = touches.values.toList()
+                                        val d = hypot(ps[0].x - ps[1].x, ps[0].y - ps[1].y)
+                                        val pan = touchChanges.fold(Offset.Zero) { a, c -> a + c.positionChange() }
+                                        if (abs(pan.y) > 0.5f) {
+                                            twoFingerMoved = true
+                                            acc.scrollY += -pan.y / 2f
+                                            val notches = (acc.scrollY / TOUCH_SCROLL_NOTCH_PX).toInt()
+                                            if (notches != 0) {
+                                                acc.scrollY -= notches * TOUCH_SCROLL_NOTCH_PX
+                                                scrollNotches(true, notches)
+                                            }
+                                        }
+                                        if (twoFingerDist > 10f && d > 10f && abs(d - twoFingerDist) > 0.5f) {
+                                            twoFingerMoved = true
+                                            acc.zoom *= d / twoFingerDist
+                                            val n = (log10(acc.zoom.toDouble()) / log10(PINCH_NOTCH_RATIO)).toInt()
+                                            if (n != 0) {
+                                                acc.zoom /= PINCH_NOTCH_RATIO.pow(n.toDouble()).toFloat()
+                                                pinchNotches(n)
+                                            }
+                                        }
+                                        twoFingerDist = d
+                                    } else if (touches.size == 1) {
+                                        val pos = touchChanges.first().position
+                                        val delta = pos - pressPos
+                                        if (!touchMoved && hypot(delta.x, delta.y) > TAP_SLOP_PX) {
+                                            touchMoved = true
+                                        }
+                                        if (!viewOnly && touchMoved) {
+                                            if (inputMode == InputMode.TOUCH) {
+                                                val (x, y) = mapToStream(pos)
+                                                session.sendMouseMove(x, y, if (leftDownSent) Protocol.BUTTON_LEFT else 0)
+                                            } else {
+                                                val d = deltaToStream(touchChanges.first().positionChange())
+                                                session.sendMouseMoveRelative(
+                                                    d.x.roundToInt(), d.y.roundToInt(),
+                                                    if (leftDownSent || pendingDrag) Protocol.BUTTON_LEFT else 0
+                                                )
+                                                if (pendingDrag && !leftDownSent) leftDownSent = true
+                                            }
+                                        }
+                                        pressPos = pos
+                                    }
+                                    touchChanges.forEach { it.consume() }
+                                }
+                                PointerEventType.Release -> {
+                                    touchChanges.forEach { c -> touches.remove(c.id) }
+                                    if (touches.isEmpty()) {
+                                        val dur = System.currentTimeMillis() - twoFingerStart
+                                        val wasTwoFinger = twoFingerStart > pressStart
+                                        if (wasTwoFinger) {
+                                            // 双指轻点 = 右键
+                                            if (!twoFingerMoved && dur < TWO_FINGER_TAP_MS && !viewOnly) {
+                                                if (inputMode == InputMode.TOUCH) rightClickAt(pressPos)
+                                                else trackpadClick(Protocol.BUTTON_RIGHT)
+                                            }
+                                            twoFingerStart = 0L
+                                        } else {
+                                            val tapDur = System.currentTimeMillis() - pressStart
+                                            when (inputMode) {
+                                                InputMode.TOUCH -> {
+                                                    // 松手：释放左键（按下时已发）
+                                                    endTouchSession(true)
+                                                }
+                                                InputMode.TRACKPAD -> {
+                                                    if (!viewOnly && !touchMoved && !longFired) {
+                                                        if (tapDur < TAP_MAX_MS) {
+                                                            // 轻触 = 左键（两次快速轻触自然构成双击，
+                                                            // 远程桌面自行识别，无需额外注入）
+                                                            trackpadClick(Protocol.BUTTON_LEFT)
+                                                        }
+                                                        // 超长按且未发左键 → 长按右键已在超时分支处理
+                                                    } else {
+                                                        endTouchSession(true)
+                                                    }
+                                                    pendingDrag = false
+                                                }
+                                            }
+                                        }
+                                        leftDownSent = false
+                                    }
+                                    touchChanges.forEach { it.consume() }
+                                }
+                                else -> {}
                             }
                         }
                     }
                 }
         ) {
-            VideoSurface(session, Modifier.fillMaxSize())
+            // 等比自适应视频容器：画面按流宽高比居中缩放（不拉伸变形）
+            val ratio = streamSize.second.takeIf { it > 0 }?.let { streamSize.first.toFloat() / it } ?: (16f / 9f)
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                VideoSurface(session, Modifier.aspectRatio(ratio).fillMaxSize())
+            }
+
+            // ============ 本地光标覆盖层 ============
+            // 服务器推送的 cursor 形状（PNG+热点）+ 本地回显位置，与视频等比同坐标
+            if (status == SelkiesSession.Status.CONNECTED && cursorX >= 0f && cursorY >= 0f && !viewOnly) {
+                CursorOverlay(
+                    cursorX = cursorX,
+                    cursorY = cursorY,
+                    shape = cursorShape,
+                    mapFromStream = ::mapFromStream
+                )
+            }
         }
 
         // ============ 状态覆盖层 ============
@@ -588,7 +676,6 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     Text(lastError ?: statusDetail, color = Color.White, fontSize = 14.sp)
                     Spacer(Modifier.height(20.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        // FAILED 可重试；CLOSED 携带错误（如被新客户端顶替/服务器断开）也可手动重连
                         if (status == SelkiesSession.Status.FAILED || lastError != null) {
                             Button(onClick = { session.connect() }) { Text("重试") }
                         }
@@ -639,6 +726,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                         Text(
                             buildString {
                                 append(streamSize.first).append('×').append(streamSize.second)
+                                if (server.resolutionW > 0) append(" · 固定")
                                 if (stats.fps > 0) append(" · ").append(stats.fps).append("fps")
                                 if (stats.latencyMs > 0) append(" · ").append(stats.latencyMs).append("ms")
                                 if (viewOnly) append(" · 只读（viewer 通道）")
@@ -662,7 +750,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     .statusBarsPadding()
                     .padding(top = 4.dp)
                     .size(width = 120.dp, height = 26.dp)
-                    .background(Color.Black.copy(alpha = 0.35f), RoundedCornerShape(13.dp)),
+                    .background(Color.Black.copy(alpha = 0.35f), RoundedCornerShape(13.dp))
+                    .clickable { toolbarVisible = true },
                 contentAlignment = Alignment.Center
             ) {
                 Text(
@@ -673,7 +762,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             }
         }
 
-        // ============ 底部工具栏 ============
+        // ============ 底部工具栏（可横向滑动——修「功能栏无法滑动」）============
         AnimatedVisibility(
             visible = toolbarVisible && status == SelkiesSession.Status.CONNECTED,
             enter = fadeIn() + slideInVertically { it },
@@ -687,9 +776,10 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
                         .padding(horizontal = 6.dp, vertical = 6.dp)
                         .navigationBarsPadding(),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     ToolButton(
@@ -751,7 +841,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     ) {
                         Text(
                             when (panel) {
-                                SessionPanel.KEYBOARD -> "系统输入法（可直接打字）"
+                                SessionPanel.KEYBOARD -> "系统输入法（输入完成后点发送）"
                                 SessionPanel.HOTKEYS -> "快捷键（可固定到快捷按钮栏）"
                                 SessionPanel.CLIPBOARD -> "剪贴板"
                                 SessionPanel.FILES -> "文件传输"
@@ -777,18 +867,15 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             }
         }
 
-        // ============ 悬浮窗可拖动完整键盘（世界最完整 ~151 键）============
+        // ============ 悬浮窗可拖动完整键盘（分类模式 / 完整模式 151 键）============
         if (!viewOnly && status == SelkiesSession.Status.CONNECTED) {
-            val density = androidx.compose.ui.platform.LocalDensity.current
-            val autoScale = with(density) {
-                (viewSize.width.toDp().value / 980f).coerceIn(0.35f, 1f)
-            }
             CompleteKeyboard(
                 session = session,
                 visible = floatingKb,
-                autoScaleHint = autoScale,
                 savedScale = state.store.settings.value.keyboardScale,
+                savedFullMode = state.store.settings.value.keyboardFullMode,
                 onScaleChange = { s -> state.store.updateSettings { it.keyboardScale = s } },
+                onFullModeChange = { f -> state.store.updateSettings { it.keyboardFullMode = f } },
                 onDismiss = { floatingKb = false }
             )
         }
@@ -834,12 +921,12 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         ModeOption(
                             title = "悬浮完整键盘（151 键）",
-                            desc = "可拖动、双指缩放的全尺寸 PC 键盘：功能键/导航/小键盘/媒体键/扩展键，修饰键粘滞组合",
+                            desc = "可拖动、双指缩放的 PC 键盘：默认按键自动分类，可切换完整模式看全部按键；修饰键粘滞组合",
                             selected = floatingKb
                         ) { openInputMethod("float") }
                         ModeOption(
-                            title = "系统输入法（直接打字）",
-                            desc = "调用本机输入法（支持中文），逐字实时发送到远程；配合软键盘文本条亦可",
+                            title = "系统输入法（先输入后发送）",
+                            desc = "直接唤起本机输入法（支持中文），文字先显示在输入区，点「发送」一次性发到远程",
                             selected = panel == SessionPanel.KEYBOARD
                         ) { openInputMethod("ime") }
                         ModeOption(
@@ -868,7 +955,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         ModeOption(
                             title = "触屏模式（直接）",
-                            desc = "手指点哪里就在哪里点击，拖动即拖拽，双指滚动/缩放",
+                            desc = "手指点哪里就在哪里点击，按下即响应；拖动即拖拽，双指滚动/缩放，长按或双指轻点=右键",
                             selected = inputMode == InputMode.TOUCH
                         ) {
                             inputMode = InputMode.TOUCH
@@ -877,7 +964,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                         }
                         ModeOption(
                             title = "鼠标模式（触摸板）",
-                            desc = "手指滑动移动远程光标（相对），轻点=左键，长按=右键，双击后按住拖动，双指滚动",
+                            desc = "手指滑动移动远程光标（相对），轻点=左键，长按/双指点=右键，双击后按住拖动，双指滚动",
                             selected = inputMode == InputMode.TRACKPAD
                         ) {
                             inputMode = InputMode.TRACKPAD
@@ -906,18 +993,59 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                 dismissButton = { TextButton(onClick = { exitConfirm = false }) { Text("取消") } }
             )
         }
+    }
+}
 
-        // IME 宿主（Android 隐藏输入框，常驻）
-        ImeHost(
-            visible = panel == SessionPanel.KEYBOARD,
-            onCommitText = { session.typeText(it) },
-            onEnter = { session.sendKey(Keysyms.XK_Return, true); session.sendKey(Keysyms.XK_Return, false) },
-            onBackspace = {
-                session.sendKey(Keysyms.XK_BackSpace, true)
-                session.sendKey(Keysyms.XK_BackSpace, false)
-            },
-            modifier = Modifier.size(1.dp).align(Alignment.Center)
-        )
+// =====================================================================
+// 本地光标覆盖层
+// =====================================================================
+
+@Composable
+private fun CursorOverlay(
+    cursorX: Float,
+    cursorY: Float,
+    shape: com.selkies.client.model.CursorShape?,
+    mapFromStream: (Float, Float) -> Offset
+) {
+    // 服务器 PNG 形状解码（按 handle 缓存；平台各自解码：Android=BitmapFactory / Desktop=Skia）
+    val bitmap: ImageBitmap? = shape?.let { sh ->
+        remember(sh.handle) {
+            runCatching {
+                val bytes = java.util.Base64.getDecoder().decode(sh.pngBase64)
+                com.selkies.client.platform.decodePngToImageBitmap(bytes)
+            }.getOrNull()
+        }
+    }
+    Canvas(Modifier.fillMaxSize()) {
+        val pos = mapFromStream(cursorX, cursorY)
+        val sh = shape
+        if (bitmap != null && sh != null) {
+            val scale = 1f  // 服务器已按显示 DPI 提供合适尺寸
+            drawImage(
+                image = bitmap,
+                dstOffset = androidx.compose.ui.unit.IntOffset(
+                    (pos.x - sh.hotX * scale).roundToInt(),
+                    (pos.y - sh.hotY * scale).roundToInt()
+                ),
+                dstSize = androidx.compose.ui.unit.IntSize(
+                    (sh.width * scale).roundToInt().coerceAtLeast(1),
+                    (sh.height * scale).roundToInt().coerceAtLeast(1)
+                )
+            )
+        } else {
+            // 回退：绘制经典箭头
+            val arrow = Path().apply {
+                moveTo(pos.x, pos.y)
+                lineTo(pos.x + 12f, pos.y + 18f)
+                lineTo(pos.x + 6.5f, pos.y + 17.5f)
+                lineTo(pos.x + 4f, pos.y + 24f)
+                lineTo(pos.x + 1.5f, pos.y + 23f)
+                lineTo(pos.x + 4f, pos.y + 16f)
+                close()
+            }
+            drawPath(arrow, Color.Black.copy(alpha = 0.8f))
+            drawPath(arrow, Color.White, style = Stroke(width = 1.5f))
+        }
     }
 }
 

@@ -2,9 +2,6 @@ package com.selkies.client.core
 
 import com.selkies.client.model.RemoteFileEntry
 import com.selkies.client.model.TransferTask
-import io.ktor.client.request.prepareGet
-import io.ktor.client.statement.bodyAsChannel
-import io.ktor.utils.io.readAvailable
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -16,59 +13,74 @@ import java.net.URLDecoder
 import java.util.UUID
 
 /**
- * 文件传输客户端：上传（HTTP 分片）/ 下载（流式）/ 远程目录列表
+ * 文件传输客户端：上传（HTTP 分片）/ 下载（认证流式）/ 远程目录列表
+ *
+ * ⚠️ 路径处理约定（修复下载 400/401 与目录判定）：
+ * - 远程路径一律保持服务器 href 的百分号编码形式（空格/中文不解码直接拼接）
+ * - 目录 = href 以 / 结尾（服务器静态目录列表的真实信号，无需逐条探测 301）
+ * - 下载 URL = /api/files/<编码路径>，携带 Authorization/UA 头（否则 nginx 回 401）
  */
 class FilesClient(private val session: SelkiesSession) {
 
     val transfers = MutableStateFlow<List<TransferTask>>(emptyList())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    /** 解析 /api/files HTML 目录列表 */
+    /** 解析 /api/files HTML 目录列表（实测服务器格式：
+     *  <tr><td><a href="encoded%20name">显示名</a></td><td>mtime</td><td>size|-</td></tr>） */
     fun parseListing(html: String): List<RemoteFileEntry> {
         val entries = ArrayList<RemoteFileEntry>()
+        // 行格式（宽松匹配：属性顺序/空白无关）
         val rowRe = Regex(
-            """<tr>\s*<td><a href="([^"]+)">([^<]*)</a></td>\s*<td>([^<]*)</td>\s*<td>([^<]*)</td>\s*</tr>""",
+            """<tr[^>]*>\s*<td[^>]*><a[^>]+href="([^"]+)"[^>]*>([^<]*)</a></td>\s*<td[^>]*>([^<]*)</td>\s*<td[^>]*>([^<]*)</td>\s*</tr>""",
             RegexOption.DOT_MATCHES_ALL
         )
         for (m in rowRe.findAll(html)) {
-            val name = URLDecoder.decode(m.groupValues[1], "UTF-8")
-            if (name.isEmpty() || name == "..") continue
-            val displayName = m.groupValues[2]
-            val mtime = m.groupValues[3]
-            val size = m.groupValues[4]
-            // 目录判定：服务器对目录 301 重定向到带斜杠 URL；HTML 中无法直接区分，
-            // 用常识判断：无扩展名或 size 列为 "-"。更可靠的方式 HEAD 探测，此处用启发式 + 探测回退
-            val isDir = size.trim() == "-" || (size.isBlank() && !displayName.contains('.'))
-            entries.add(RemoteFileEntry(displayName.ifEmpty { name }, isDir, size, mtime))
+            val hrefRaw = m.groupValues[1].trim()
+            if (hrefRaw.isEmpty()) continue
+            // 跳过上级链接（../ 或 ./）
+            if (hrefRaw == "../" || hrefRaw == ".." || hrefRaw == "./" || hrefRaw == ".") continue
+            if (hrefRaw.startsWith("/")) continue  // 绝对路径链接（站点导航）不上传目录内容
+            val isDir = hrefRaw.endsWith("/")
+            val displayRaw = m.groupValues[2].ifBlank { hrefRaw }
+            val displayName = URLDecoder.decode(displayRaw.removeSuffix("/"), "UTF-8")
+            val mtime = m.groupValues[3].trim()
+            val size = m.groupValues[4].trim()
+            entries.add(
+                RemoteFileEntry(
+                    name = displayName,
+                    path = hrefRaw,           // 保持编码形式
+                    isDir = isDir,
+                    size = if (isDir) "" else size,
+                    mtime = mtime
+                )
+            )
         }
         return entries
     }
 
-    /** 列出远程目录（path 为空 = 根 = 上传目录） */
-    suspend fun list(path: String): Result<List<RemoteFileEntry>> = withContext(Dispatchers.IO) {
+    /** 列出远程目录（dirPath 为空 = 根 = 上传目录；目录路径必须以 / 结尾） */
+    suspend fun list(dirPath: String): Result<List<RemoteFileEntry>> = withContext(Dispatchers.IO) {
         runCatching {
-            val clean = path.trimStart('/')
-            val (code, body) = session.connection.apiGetText("/api/files/" + clean.let { if (it.isEmpty()) "" else it })
+            val p = dirPath.trimStart('/')
+            val url = "/api/files/" + p   // p 已带尾斜杠（目录）或为空（根）
+            val (code, body) = session.connection.apiGetText(url)
             if (code != 200) {
                 return@runCatching if (code == 403) {
                     throw IllegalStateException("服务器禁用了文件下载（403）")
+                } else if (code == 401) {
+                    throw IllegalStateException("认证失败（401）：请检查服务器账号密码")
                 } else {
                     throw IllegalStateException("列目录失败：HTTP $code")
                 }
+            }
+            if (!body.contains("<")) {
+                throw IllegalStateException("目录不存在或无内容")
             }
             parseListing(body)
         }
     }
 
-    /** 判断远程条目是否为目录（通过 301 重定向） */
-    suspend fun isDirectory(path: String): Boolean {
-        val clean = path.trim('/')
-        if (clean.isEmpty()) return true
-        val (status, loc) = session.connection.probeApi("/api/files/$clean")
-        return status == 301 && (loc?.endsWith("/") == true)
-    }
-
-    /** 上传本地文件（自动分片，进度回报） */
+    /** 上传本地文件（自动分片，进度回报）；remotePath 为已解码的相对路径 */
     fun upload(file: File, remotePath: String) {
         val task = TransferTask(
             id = UUID.randomUUID().toString(),
@@ -120,57 +132,47 @@ class FilesClient(private val session: SelkiesSession) {
         }
     }
 
-    /** 流式下载远程文件到本地 */
-    fun download(remotePath: String, dest: File) {
+    /**
+     * 流式下载远程文件到本地（带认证，进度回报）。
+     * remotePath 为编码形式的相对路径（RemoteFileEntry.path）。
+     */
+    fun download(remotePath: String, displayName: String, destDir: File) {
         val task = TransferTask(
             id = UUID.randomUUID().toString(),
-            fileName = remotePath.substringAfterLast('/'),
+            fileName = displayName,
             filePath = remotePath,
             totalBytes = 0,
             upload = false
         )
         addTask(task)
+        destDir.mkdirs()
+        val dest = File(destDir, displayName)
         scope.launch {
             try {
                 task.status = "running"
                 updateTask(task)
-                val clean = remotePath.trim('/')
-                val url = session.connection.resolveApiUrl("/api/files/$clean")
-                val (code, file) = withContext(Dispatchers.IO) {
-                    var respCode = 0
-                    val tmp = File(dest.absolutePath + ".part")
-                    session.connection.http.prepareGet(url).execute { resp ->
-                        respCode = resp.status.value
-                        if (respCode != 200) {
-                            return@execute respCode to null
-                        }
-                        val channel = resp.bodyAsChannel()
-                        java.io.FileOutputStream(tmp).use { out ->
-                            val buf = ByteArray(64 * 1024)
-                            var received = 0L
-                            while (true) {
-                                val n = channel.readAvailable(buf, 0, buf.size)
-                                if (n <= 0) break
-                                out.write(buf, 0, n)
-                                received += n
-                                task.sentBytes = received
-                                if (task.totalBytes == 0L) {
-                                    resp.headers[io.ktor.http.HttpHeaders.ContentLength]?.toLongOrNull()?.let {
-                                        task.totalBytes = it
-                                    }
-                                }
-                                updateTask(task)
-                            }
-                        }
-                        respCode to tmp
-                    }
-                    Pair(respCode, null as File?)
+                val (code, written) = session.connection.apiDownloadTo(
+                    "/api/files/" + remotePath.trimStart('/'),
+                    dest
+                ) { received, total ->
+                    task.sentBytes = received
+                    if (task.totalBytes == 0L && total > 0) task.totalBytes = total
+                    updateTask(task)
                 }
-                if (code != 200) throw IllegalStateException("下载失败：HTTP $code")
-                val tmp = file ?: throw IllegalStateException("下载数据为空")
-                if (dest.exists()) dest.delete()
-                tmp.renameTo(dest)
-                task.status = "done"
+                if (code != 200) {
+                    task.status = "error"
+                    task.message = when (code) {
+                        401 -> "下载失败（401）：认证失败，请检查账号密码"
+                        403 -> "下载失败（403）：服务器禁用了文件下载"
+                        404 -> "下载失败（404）：文件不存在或已被移动"
+                        else -> "下载失败：HTTP $code"
+                    }
+                } else {
+                    task.status = "done"
+                    task.sentBytes = written
+                    task.totalBytes = written
+                    task.message = dest.absolutePath
+                }
                 updateTask(task)
             } catch (e: Exception) {
                 task.status = "error"

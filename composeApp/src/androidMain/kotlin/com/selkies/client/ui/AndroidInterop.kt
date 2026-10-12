@@ -12,6 +12,10 @@ import com.selkies.client.video.AndroidVideoSink
 
 /**
  * Android 视频表面：SurfaceView + MediaCodec 直渲
+ * ⚠️ Surface 生命周期与黑屏修复：
+ *    应用退到后台时 SurfaceView 的 surface 会被销毁（解码器随 detachSurface 释放），
+ *    回前台 surfaceCreated 重建后必须立刻向服务器请求关键帧——否则解码器只能拿到
+ *    增量帧无法重建参考链，画面永久黑屏（用户报的“退出再打开就黑屏卡住”根因）。
  */
 @Composable
 actual fun VideoSurface(session: SelkiesSession, modifier: Modifier) {
@@ -24,6 +28,8 @@ actual fun VideoSurface(session: SelkiesSession, modifier: Modifier) {
                 holder.addCallback(object : SurfaceHolder.Callback {
                     override fun surfaceCreated(holder: SurfaceHolder) {
                         sink.attachSurface(holder.surface)
+                        // 重建后强制关键帧（绕过会话层限流），恢复解码参考链
+                        session.forceKeyframe()
                     }
 
                     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
@@ -43,75 +49,4 @@ actual fun VideoSurface(session: SelkiesSession, modifier: Modifier) {
             session.videoSink = null
         }
     }
-}
-
-/**
- * Android IME 宿主：隐藏 EditText 承接输入法，逐键实时发送
- */
-@Composable
-actual fun ImeHost(
-    visible: Boolean,
-    onCommitText: (String) -> Unit,
-    onEnter: () -> Unit,
-    onBackspace: () -> Unit,
-    modifier: Modifier
-) {
-    AndroidView(
-        factory = { ctx ->
-            android.widget.EditText(ctx).apply {
-                layoutParams = android.view.ViewGroup.LayoutParams(1, 1)
-                alpha = 0f
-                isSingleLine = true
-                textSize = 1f
-                setPadding(0, 0, 0, 0)
-                background = null
-                addTextChangedListener(object : android.text.TextWatcher {
-                    private var last: String = ""
-                    override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-                    override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-                    override fun afterTextChanged(s: android.text.Editable?) {
-                        val cur = s?.toString() ?: ""
-                        val old = last
-                        last = cur
-                        when {
-                            cur.length > old.length && cur.startsWith(old) -> {
-                                onCommitText(cur.substring(old.length))
-                            }
-                            cur.length < old.length && old.startsWith(cur) -> {
-                                repeat(old.length - cur.length) { onBackspace() }
-                            }
-                            cur != old -> {
-                                repeat(old.length) { onBackspace() }
-                                if (cur.isNotEmpty()) onCommitText(cur)
-                            }
-                        }
-                        if (last.length > 200) {
-                            last = ""
-                            s?.clear()
-                        }
-                    }
-                })
-                setOnEditorActionListener { _, actionId, event ->
-                    if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_DONE ||
-                        actionId == android.view.inputmethod.EditorInfo.IME_ACTION_SEND ||
-                        actionId == android.view.inputmethod.EditorInfo.IME_ACTION_GO ||
-                        actionId == android.view.inputmethod.EditorInfo.IME_ACTION_NEXT ||
-                        (event?.keyCode == android.view.KeyEvent.KEYCODE_ENTER && event.action == android.view.KeyEvent.ACTION_DOWN)
-                    ) {
-                        onEnter()
-                        true
-                    } else false
-                }
-            }
-        },
-        modifier = modifier,
-        update = { edit ->
-            if (visible) {
-                if (!edit.hasFocus()) edit.requestFocus()
-                val imm = edit.context.getSystemService(android.content.Context.INPUT_METHOD_SERVICE)
-                        as? android.view.inputmethod.InputMethodManager
-                imm?.showSoftInput(edit, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
-            }
-        }
-    )
 }

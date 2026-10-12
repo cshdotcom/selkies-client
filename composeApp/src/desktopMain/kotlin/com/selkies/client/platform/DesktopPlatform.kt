@@ -4,6 +4,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.isPrimaryPressed
 import androidx.compose.ui.input.pointer.isSecondaryPressed
 import androidx.compose.ui.input.pointer.isTertiaryPressed
@@ -88,6 +89,28 @@ object DesktopPlatform : PlatformServices {
     override fun readFileBytes(path: String): ByteArray? = runCatching {
         File(path).takeIf { it.exists() }?.readBytes()
     }.getOrNull()
+
+    override fun openFile(path: String) {
+        runCatching {
+            if (java.awt.Desktop.isDesktopSupported()) {
+                java.awt.Desktop.getDesktop().open(File(path))
+            }
+        }
+    }
+
+    override fun shareFile(path: String, displayName: String) {
+        // 桌面无系统分享面板：用 xdg-open 打开所在目录并选中
+        runCatching {
+            val dir = File(path).parentFile ?: return
+            if (System.getProperty("os.name").lowercase().contains("win")) {
+                Runtime.getRuntime().exec(arrayOf("explorer", "/select,", path))
+            } else {
+                if (java.awt.Desktop.isDesktopSupported()) {
+                    java.awt.Desktop.getDesktop().open(dir)
+                }
+            }
+        }
+    }
 
     override fun exitApp() {
         kotlin.system.exitProcess(0)
@@ -416,3 +439,15 @@ actual fun androidx.compose.ui.input.pointer.PointerEvent.tertiaryPressed(): Boo
 
 /** 桌面平台服务入口 */
 actual fun getPlatformServices(): PlatformServices = DesktopPlatform
+
+/** Desktop PNG 解码：Skia Image.makeFromEncoded → toComposeImageBitmap */
+actual fun decodePngToImageBitmap(bytes: ByteArray): androidx.compose.ui.graphics.ImageBitmap? =
+    runCatching {
+        val skiaImage = org.jetbrains.skia.Image.makeFromEncoded(bytes)
+        val out = androidx.compose.ui.graphics.ImageBitmap(skiaImage.width, skiaImage.height)
+        val canvas = androidx.compose.ui.graphics.Canvas(out)
+        @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+        val skiaCanvas = canvas.nativeCanvas
+        skiaCanvas.drawImage(skiaImage, 0f, 0f, org.jetbrains.skia.Paint())
+        out
+    }.getOrNull()

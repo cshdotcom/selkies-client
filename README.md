@@ -1,13 +1,19 @@
-# Selkies 原生远程桌面客户端 v2.2.0
+# Selkies 原生远程桌面客户端 v2.3.0
 
 原生 Android + 桌面（x86_64 / ARM64）双端客户端，100% 原生实现（**非 WebView 套壳**），直连 Selkies v2 WebSocket 流协议。深色/浅色主题可切换，两端页面与功能完全一致。
 
-> **v2.0.1 修复说明（重要）**：v2.0.0 存在三个叠加的连接层致命缺陷，导致完全无法连接。本版已全部修复，并用**真实服务器完成无头端到端验证**（连接 → 认证 → MODE → 分辨率协商 → START_VIDEO → VIDEO_STARTED → H.264 视频帧接收 → 剪贴板下行）：
-> 1. Ktor `WebSockets` 插件从未安装到 HttpClient —— `webSocketSession` 直接抛异常；
-> 2. WebSocket URL 拼接遗漏主机名（生成 `https:///api/...`）—— 必然 UnknownHostException；
-> 3. `webSocketSession` 使用 `https://` 而非 `wss://` —— 引擎按普通 GET 处理，无 101 升级。
+> **v2.3.0 更新（真机反馈全量修复：点击/自适应/光标/触屏/键盘/文件/分辨率/黑屏）**：
+> 1. **点击与自适应屏幕（根因修复）**：视频 SurfaceView 拉伸变形导致触摸坐标与画面错位——现为 aspectRatio 等比容器（画面永不变形，坐标严格一致）；帧头宽高实时同步流尺寸，stream_resolution 缺失也能正确映射。
+> 2. **零延迟触屏（不灵敏修复）**：弃用系统手势双击等待（旧版每次点击延迟 ~300ms），重写为 Initial 通道直发——手指按下立即发送 m 事件；长按/双指轻点=右键，双指滚动/捏合缩放；触摸板模式轻点=左键、双击后按住拖动。
+> 3. **本地光标**：解析服务器 `cursor,{curdata}` 形状推送（PNG+热点，按 handle 去重）+ 本地位置回显，屏幕上永远可见真实远程光标。
+> 4. **重开不再黑屏卡死**：回前台 SurfaceView 重建即强制请求关键帧 + 会话级帧停顿看门狗（3s 无帧自动 REQUEST_KEYFRAME）。
+> 5. **文件下载 401/400 修复**：下载流携带认证头（401 根因）；路径全程保持百分号编码（中文/空格文件名 400 根因）；目录判定用 href 尾斜杠（秒开，无 301 探测）；面包屑路径显示；下载完成可打开/分享/另存为。
+> 6. **键盘双模式**：默认「分类模式」（常用/功能/导航/小键盘/媒体/扩展/文本，指尖尺寸大键自动适配宽度）；一键切换「完整模式」（151 键 23 单位真实布局，可横向滚动）；双指捏合/± 按钮缩放并持久化；页签可横向滑动。
+> 7. **每连接分辨率**：服务器条目可独立设置 自适应屏幕/1920×1080/1280×720/2560×1440/自定义；会话内统计面板还可「适应本机屏幕」即时切换。
+> 8. **系统输入法重设计**：选它即直接唤起本机输入法，文字先显示在输入区，点「发送」一次性提交到远程；附控制键（回车/Tab/Esc/方向/复制粘贴）直发行。
+> 9. **工具栏可滑动**；远程打印改为主线程调起系统打印界面（旧版无声失败）；麦克风/摄像头错误即时 toast；编码器详情（backend/encoder）显示。
 >
-> 另补齐官方网页客户端必带的 `tabId` 标识（缺失会导致服务器不为本客户端启动视频捕获）。
+> **v2.0.1 修复说明（历史）**：v2.0.0 存在三个叠加的连接层致命缺陷（WebSockets 插件未安装 / URL 遗漏主机名 / https:// 误用作 ws://），全部修复并真实服务器端到端验证。
 
 
 > **v2.2.0 更新（世界最完整键盘）**：
@@ -24,12 +30,12 @@
 
 | 文件 | 说明 |
 |------|------|
-| `Selkies-Android-v2.2.0.apk` | Android 签名正式包（minSdk 26 / Android 8.0+，13MB） |
-| `Selkies-Android-v2.2.0-debug.apk` | Android 调试包（可用 logcat 排查） |
-| `Selkies-Desktop-windows-x64-v2.2.0.zip` | Windows x64 便携完整包（自带 Java 21，双击 `launch.bat` 即用；Win-ARM64 可经 x64 模拟运行） |
-| `Selkies-Desktop-linux-x86_64-v2.2.0.zip` | Linux x86_64 便携完整包（自带 Java 21，运行 `launch.sh`） |
-| `Selkies-Desktop-linux-arm64-v2.2.0.zip` | Linux ARM64 便携完整包（树莓派/ARM 主机可用） |
-| `Selkies-Desktop-all.jar` | 通用 JAR（任意装有 Java 17+ 的系统，含全部平台原生库，235MB） |
+| `Selkies-Android-v2.3.0.apk` | Android 签名正式包（minSdk 26 / Android 8.0+，13MB） |
+| `Selkies-Android-v2.3.0-debug.apk` | Android 调试包（可用 logcat 排查） |
+| `Selkies-Desktop-windows-x64-v2.3.0.zip` | Windows x64 便携完整包（自带 Java 21，双击 `launch.bat` 即用；Win-ARM64 可经 x64 模拟运行） |
+| `Selkies-Desktop-linux-x86_64-v2.3.0.zip` | Linux x86_64 便携完整包（自带 Java 21，运行 `launch.sh`） |
+| `Selkies-Desktop-linux-arm64-v2.3.0.zip` | Linux ARM64 便携完整包（树莓派/ARM 主机可用） |
+| `Selkies-Desktop-all.jar` | 通用 JAR（任意装有 Java 17+ 的系统，含全部平台原生库） |
 | `Selkies-Client-source.zip` | 完整源码（含 Gradle 工程与签名密钥） |
 
 ### 签名密钥（务必自行保管）
@@ -52,7 +58,7 @@
 4. 保存并点击服务器卡片即进入远程桌面。
 
 ### 桌面（以 Windows 为例）
-1. 解压 `Selkies-Desktop-windows-x64-v2.2.0.zip`；
+1. 解压 `Selkies-Desktop-windows-x64-v2.3.0.zip`；
 2. 双击 `Selkies-Desktop/launch.bat`（Linux 为 `launch.sh`）；
 3. 其余与 Android 完全一致（页面相同、功能不减）。
 

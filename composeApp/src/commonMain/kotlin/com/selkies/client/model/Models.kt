@@ -15,6 +15,9 @@ data class ServerEntry(
     var viewOnly: Boolean = false,
     var displayId: String = "primary",
     var framerate: Int = 60,
+    /** 每连接分辨率（0=自适应本机屏幕）——用户要求：每个列表条目可独立设置 */
+    var resolutionW: Int = 0,
+    var resolutionH: Int = 0,
     var videoBitrate: Int = 8000,       // kbps
     var videoCrf: Int = 24,             // 0 = 使用码率模式
     var encoder: String = "h264enc",    // h264enc / h264enc-striped / h264enc-fullcolor? / jpeg / ...
@@ -65,6 +68,7 @@ data class AppSettings(
     var gamepadEnabled: Boolean = true,
     // 键盘
     var keyboardScale: Float = 0f,           // 完整键盘缩放（0 = 未设置，自动适配）
+    var keyboardFullMode: Boolean = false,   // 键盘完整模式（否则分类模式）
     var lastInputMethod: String = "",        // 上次选择的输入方式：float / ime / quick
     // 视频
     var requestKeyframeOnStall: Boolean = true,
@@ -119,9 +123,11 @@ data class TransferTask(
 
 /**
  * 远程文件条目（文件列表）
+ * path 保持服务器 href 的百分号编码形式（含目录尾斜杠），display 才是解码展示名
  */
 data class RemoteFileEntry(
-    val name: String,
+    val name: String,          // 展示名（已解码、无尾斜杠）
+    val path: String,          // 相对上传根的编码路径（目录以 / 结尾）
     val isDir: Boolean,
     val size: String,
     val mtime: String
@@ -135,11 +141,24 @@ data class StatsInfo(
     var latencyMs: Int = 0,
     var resolution: String = "",
     var codec: String = "",
+    var encoderDetail: String = "",
     var bitrateMbps: Double = 0.0,
     var connectedAt: Long = 0,
     var bytesReceived: Long = 0,
     var videoFrames: Long = 0,
     var audioLevel: Float = 0f
+)
+
+/**
+ * 服务器光标形状（cursor,{curdata,width,height,hotx,hoty,handle} 消息）
+ */
+data class CursorShape(
+    val pngBase64: String,
+    val width: Int,
+    val height: Int,
+    val hotX: Int,
+    val hotY: Int,
+    val handle: Long
 )
 
 enum class ThemeMode { SYSTEM, LIGHT, DARK }

@@ -5,8 +5,10 @@ import io.ktor.client.HttpClient
 import io.ktor.client.plugins.websocket.DefaultClientWebSocketSession
 import io.ktor.client.plugins.websocket.webSocketSession
 import io.ktor.client.request.get
+import io.ktor.client.request.head
 import io.ktor.client.request.headers
 import io.ktor.client.request.post
+import io.ktor.client.request.prepareGet
 import io.ktor.client.request.setBody
 import io.ktor.client.request.url
 import io.ktor.client.statement.HttpResponse
@@ -27,6 +29,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import java.io.File
 import java.net.ConnectException
 import java.net.URLEncoder
 import java.net.UnknownHostException
@@ -377,13 +380,18 @@ class SelkiesConnection(
         return h
     }
 
+    /** 与官方前端 encodeURIComponent 一致的路径段编码（空格→%20，而非 +） */
+    fun encodePathSegment(path: String): String =
+        URLEncoder.encode(path, "UTF-8").replace("+", "%20")
+
     suspend fun resolveApiUrl(path: String): String {
         var url = server.baseUrl() + path
         var redirects = 0
         while (redirects < MAX_REDIRECTS) {
+            // ⚠️ 用 HEAD 解析重定向：GET 会把整个文件体拉下来再丢弃（大文件双倍下载）
             val resp: HttpResponse? = try {
                 withTimeout(PROBE_TIMEOUT_MS) {
-                    http.get(url) { headers { apiHeaders().forEach { (k, v) -> append(k, v) } } }
+                    http.head(url) { headers { apiHeaders().forEach { (k, v) -> append(k, v) } } }
                 }
             } catch (_: Exception) {
                 null
@@ -410,6 +418,61 @@ class SelkiesConnection(
         return code to bytes
     }
 
+    /**
+     * ⚠️【下载 401 根因修复】带认证头的流式下载。
+     *    旧版 prepareGet(url) 未携带 Authorization/UA/Origin，
+     *    服务器（nginx Basic Auth）一律回 401。
+     * 返回 (httpCode, 已写字节数)；非 2xx 时写 0。
+     */
+    suspend fun apiDownloadTo(
+        path: String,
+        dest: File,
+        onProgress: (received: Long, total: Long) -> Unit = { _, _ -> }
+    ): Pair<Int, Long> {
+        val url = resolveApiUrl(path)
+        val tmp = File(dest.absolutePath + ".part")
+        return try {
+            val resp = withTimeout(600_000L) {
+                http.prepareGet(url) {
+                    headers { apiHeaders().forEach { (k, v) -> append(k, v) } }
+                }.execute { resp ->
+                    val code = resp.status.value
+                    if (code != 200) {
+                        discardBody(resp)
+                        return@execute code to 0L
+                    }
+                    val total = resp.headers[HttpHeaders.ContentLength]?.toLongOrNull() ?: -1L
+                    val channel = resp.bodyAsChannel()
+                    java.io.FileOutputStream(tmp).use { out ->
+                        val buf = ByteArray(64 * 1024)
+                        var received = 0L
+                        while (true) {
+                            val n = channel.readAvailable(buf, 0, buf.size)
+                            if (n <= 0) break
+                            out.write(buf, 0, n)
+                            received += n
+                            onProgress(received, total)
+                        }
+                    }
+                    code to tmp.length()
+                }
+            }
+            if (resp.first == 200) {
+                if (dest.exists()) dest.delete()
+                if (!tmp.renameTo(dest)) {
+                    tmp.copyTo(dest, overwrite = true)
+                    tmp.delete()
+                }
+            } else {
+                tmp.delete()
+            }
+            resp
+        } catch (e: Exception) {
+            tmp.delete()
+            throw e
+        }
+    }
+
     suspend fun apiGetText(path: String): Pair<Int, String> {
         val url = resolveApiUrl(path)
         val resp = withTimeout(60_000L) {
@@ -432,7 +495,8 @@ class SelkiesConnection(
         val url = resolveApiUrl("/api/upload")
         val extraHeaders = mutableMapOf(
             HttpHeaders.ContentType to "application/octet-stream",
-            "X-Upload-Path" to URLEncoder.encode(path, "UTF-8")
+            // ⚠️ 与官方 file-upload.js 一致：encodeURIComponent 编码（空格=%20）
+            "X-Upload-Path" to encodePathSegment(path)
         )
         if (transferId != null) {
             extraHeaders["X-Upload-Id"] = transferId

@@ -112,6 +112,86 @@ object ProtocolProbe {
 
         val ok = done.await(timeoutSec + 5, TimeUnit.SECONDS)
         watcher.cancel()
+
+        // ===== 第二阶段：新功能端到端验证（光标/分辨率/输入注入/文件传输）=====
+        var cursorEchoOk = false
+        var cursorShapeOk = false
+        var resolutionChangeOk = false
+        var filesOk = false
+        var filesDetail = ""
+        if (ok && frameCount.get() >= 3 && session.status.value == SelkiesSession.Status.CONNECTED) {
+            println()
+            println("=== 第二阶段：输入注入 / 光标 / 分辨率 / 文件 ===")
+            kotlinx.coroutines.runBlocking {
+            // 1) 鼠标绝对移动 → 本地光标回显更新（输入路径真实验证）
+            session.sendMouseMove(500, 400, 0)
+            delay(400)
+            session.sendMouseMove(900, 600, 0)
+            delay(600)
+            cursorEchoOk = session.cursorX.value >= 899f && session.cursorY.value >= 599f
+            println("[光标回显] x=${session.cursorX.value} y=${session.cursorY.value} → ${if (cursorEchoOk) "OK" else "FAIL"}")
+            cursorShapeOk = session.cursorShape.value != null
+            println("[光标形状] ${session.cursorShape.value?.let { "handle=${it.handle} ${it.width}x${it.height} hot=(${it.hotX},${it.hotY})" } ?: "未收到"}")
+
+            // 2) 点击（按下+抬起）
+            session.sendMouseMove(900, 600, 1)
+            delay(150)
+            session.sendMouseMove(900, 600, 0)
+            delay(300)
+            println("[点击注入] 已发送（远程光标形状 handle=${session.cursorShape.value?.handle ?: "-"}）")
+
+            // 3) 分辨率切换
+            val before = session.realizedResolution.value
+            session.sendResolution(1024, 768)
+            var waited = 0
+            while (waited < 8000 && session.realizedResolution.value == before) {
+                delay(250); waited += 250
+            }
+            resolutionChangeOk = session.realizedResolution.value?.first == 1024
+            println("[分辨率] $before → ${session.realizedResolution.value} → ${if (resolutionChangeOk) "OK" else "FAIL"}")
+            // 切回原分辨率
+            before?.let { session.sendResolution(it.first, it.second) }
+            delay(1500)
+
+            // 4) 文件传输：列表 → 上传 → 认证下载（旧版 401/400 回归验证）
+            run {
+                val stamp = System.currentTimeMillis()
+                val probeName = "e2e-probe-$stamp.txt"
+                val probeBytes = "selkies e2e download probe $stamp\n".toByteArray()
+                val result = runCatching {
+                    val entries = session.filesClient.list("").getOrThrow()
+                    println("[文件] 根目录 ${entries.size} 条（目录 ${entries.count { it.isDir }} 个）")
+                    val tmpUp = java.io.File.createTempFile(probeName, null)
+                    tmpUp.writeBytes(probeBytes)
+                    val upOk = uploadProbe(session, tmpUp, probeName)
+                    tmpUp.delete()
+                    if (!upOk) return@run "上传失败"
+                    val destDir = java.io.File(System.getProperty("java.io.tmpdir"), "selkies-e2e-dl")
+                    destDir.mkdirs()
+                    var err: String? = null
+                    session.filesClient.download(probeName, probeName, destDir)
+                    val t0 = System.currentTimeMillis()
+                    while (System.currentTimeMillis() - t0 < 30_000) {
+                        val t = session.filesClient.transfers.value.lastOrNull { it.fileName == probeName }
+                        if (t != null && (t.status == "done" || t.status == "error")) {
+                            if (t.status == "error") err = t.message
+                            break
+                        }
+                        delay(200)
+                    }
+                    if (err != null) return@run "下载失败: $err"
+                    val dl = java.io.File(destDir, probeName)
+                    if (!dl.exists()) return@run "下载文件不存在"
+                    if (!dl.readBytes().contentEquals(probeBytes)) return@run "下载内容不一致"
+                    dl.delete()
+                    true
+                }.getOrElse { "异常: ${it.message}" }
+                filesOk = result == true
+                filesDetail = if (result == true) "上传+认证下载+内容校验通过" else result.toString()
+                println("[文件] $filesDetail → ${if (filesOk) "OK" else "FAIL"}")
+            }
+            }
+        }
         observer.cancel()
 
         val frames = frameCount.get()
@@ -121,6 +201,10 @@ object ProtocolProbe {
         println("最终状态      : ${session.status.value} (${session.statusDetail.value})")
         println("分辨率协商    : ${if (sawResolution.get()) "成功" else "未收到"}")
         println("视频帧        : $frames 帧${codec?.let { "，编码 $it" } ?: ""}")
+        println("光标回显      : ${if (cursorEchoOk) "OK" else "FAIL"}")
+        println("光标形状      : ${if (cursorShapeOk) "OK" else "未收到"}")
+        println("分辨率切换    : ${if (resolutionChangeOk) "OK" else "FAIL"}")
+        println("文件传输      : ${if (filesOk) "OK" else "FAIL"} ${filesDetail}")
         println("统计          : ${session.stats.value}")
         println("剪贴板下行    : ${clipboardTexts.size} 条")
         if (session.lastError.value != null) {
@@ -129,9 +213,27 @@ object ProtocolProbe {
         }
         session.disconnect()
 
-        val success = ok && frames >= 3 && codec != null
+        val success = ok && frames >= 3 && codec != null && cursorEchoOk && resolutionChangeOk && filesOk
         println(if (success) "✅ 协议端到端验证通过" else "❌ 协议验证失败")
         kotlin.system.exitProcess(if (success) 0 else 1)
+    }
+
+    /** 同步等待上传完成 */
+    private fun uploadProbe(session: SelkiesSession, file: java.io.File, remoteName: String): Boolean {
+        session.filesClient.upload(file, remoteName)
+        val t0 = System.currentTimeMillis()
+        while (System.currentTimeMillis() - t0 < 30_000) {
+            val t = session.filesClient.transfers.value.lastOrNull { it.fileName == file.name }
+            if (t != null) {
+                if (t.status == "done") return true
+                if (t.status == "error") {
+                    println("[上传失败] ${t.message}")
+                    return false
+                }
+            }
+            Thread.sleep(200)
+        }
+        return false
     }
 
     private fun sysProp(name: String, default: String): String =
@@ -220,5 +322,7 @@ object ProtocolProbe {
         override fun setPhysicalKeyHandler(handler: ((Int, Boolean) -> Unit)?) {}
         override fun readFileBytes(path: String): ByteArray? = null
         override fun exitApp() {}
+        override fun openFile(path: String) {}
+        override fun shareFile(path: String, displayName: String) {}
     }
 }

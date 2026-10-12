@@ -10,19 +10,24 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.selkies.client.core.Keysyms
 import com.selkies.client.core.SelkiesSession
 
@@ -53,7 +58,7 @@ fun StatsPanel(session: SelkiesSession) {
                 else -> "连接中"
             })
             StatRow("分辨率", stats.resolution.ifBlank { "—" })
-            StatRow("编码器", encoder)
+            StatRow("编码器", encoder + if (stats.encoderDetail.isNotBlank()) "（${stats.encoderDetail}）" else "")
             StatRow("帧率", if (stats.fps > 0) "${stats.fps} fps" else "—")
             StatRow("延迟", if (stats.latencyMs > 0) "${stats.latencyMs} ms" else "—")
             StatRow("码率", if (stats.bitrateMbps > 0) String.format(java.util.Locale.US, "%.1f Mbps", stats.bitrateMbps) else "—")
@@ -86,6 +91,14 @@ fun StatsPanel(session: SelkiesSession) {
                     OutlinedButton(onClick = { session.sendResolution(wh.first, wh.second) }) { Text(label) }
                 }
             }
+            // 自适应本机屏幕：用会话视口尺寸（连接前已由布局写入；竖屏自动换向保证横向桌面）
+            val screenW = session.screenWidthPx
+            val screenH = session.screenHeightPx
+            OutlinedButton(onClick = {
+                val w = maxOf(screenW, screenH)
+                val h = minOf(screenW, screenH)
+                session.sendResolution(w, h)
+            }) { Text("适应本机屏幕（${screenW}×$screenH）") }
         }
 
         SectionCard("应用快捷入口") {
@@ -117,11 +130,23 @@ private fun formatCount(n: Long): String = when {
 }
 
 /**
- * 键盘面板（会话内）：文本框逐键实时发送（追加=打字，删除=退格），支持输入法
+ * 系统输入法面板（重设计）：
+ * - 打开面板直接唤起本机输入法（自动聚焦大文本框）
+ * - 文字先缓冲在输入区，点「发送」一次性 co,end 提交到远程（用户要求：输入完成点发送才可以）
+ * - 常用控制键（回车/Tab/Esc/退格/方向/复制粘贴）一键直发
  */
 @Composable
 fun ImeHostPanel(session: SelkiesSession) {
     var text by remember { mutableStateOf("") }
+    val focusRequester = remember { androidx.compose.ui.focus.FocusRequester() }
+    val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+
+    // 打开面板即唤起输入法（直接弹键盘）
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+        keyboard?.show()
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -129,47 +154,68 @@ fun ImeHostPanel(session: SelkiesSession) {
     ) {
         OutlinedTextField(
             value = text,
-            onValueChange = { newText ->
-                val old = text
-                when {
-                    newText.length > old.length && newText.startsWith(old) -> {
-                        // 追加：逐字实时发送（支持输入法组合后的提交）
-                        session.typeText(newText.substring(old.length))
-                    }
-                    newText.length < old.length && old.startsWith(newText) -> {
-                        repeat(old.length - newText.length) {
-                            session.sendKey(Keysyms.XK_BackSpace, true)
-                            session.sendKey(Keysyms.XK_BackSpace, false)
-                        }
-                    }
-                    else -> {
-                        // 整体替换
-                        repeat(old.length) {
-                            session.sendKey(Keysyms.XK_BackSpace, true)
-                            session.sendKey(Keysyms.XK_BackSpace, false)
-                        }
-                        if (newText.isNotEmpty()) session.typeText(newText)
-                    }
-                }
-                text = newText
-            },
-            modifier = Modifier.fillMaxWidth().height(110.dp),
-            placeholder = { Text("在此输入，逐键实时发送到远程（支持中文输入法）") }
+            onValueChange = { text = it },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(120.dp)
+                .focusRequester(focusRequester),
+            placeholder = { Text("在此输入（支持中文等任意输入法），完成后点「发送」") },
+            textStyle = TextStyle(fontSize = 16.sp)
         )
-        Spacer(Modifier.height(6.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = {
-                session.sendKey(Keysyms.XK_Return, true); session.sendKey(Keysyms.XK_Return, false)
-            }) { Text("回车") }
-            OutlinedButton(onClick = {
-                session.sendKey(Keysyms.XK_BackSpace, true); session.sendKey(Keysyms.XK_BackSpace, false)
-            }) { Text("退格") }
-            OutlinedButton(onClick = {
-                session.sendKey(Keysyms.XK_Tab, true); session.sendKey(Keysyms.XK_Tab, false)
-            }) { Text("Tab") }
-            OutlinedButton(onClick = {
-                session.sendKey(Keysyms.XK_Escape, true); session.sendKey(Keysyms.XK_Escape, false)
-            }) { Text("Esc") }
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            Button(
+                onClick = {
+                    if (text.isNotEmpty()) {
+                        session.typeText(text)
+                        text = ""
+                    }
+                },
+                modifier = Modifier.weight(1.4f)
+            ) { Text("发送到远程 ⏎") }
+            OutlinedButton(
+                onClick = { text = "" },
+                modifier = Modifier.weight(0.6f)
+            ) { Text("清空") }
         }
+        Spacer(Modifier.height(10.dp))
+        Text("控制键（直发）", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(4.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+            ImeQuickKey("⏎ 回车") { session.sendKey(Keysyms.XK_Return, true); session.sendKey(Keysyms.XK_Return, false) }
+            ImeQuickKey("Tab") { session.sendKey(Keysyms.XK_Tab, true); session.sendKey(Keysyms.XK_Tab, false) }
+            ImeQuickKey("Esc") { session.sendKey(Keysyms.XK_Escape, true); session.sendKey(Keysyms.XK_Escape, false) }
+            ImeQuickKey("⌫") {
+                if (text.isNotEmpty()) text = text.dropLast(1)
+                else { session.sendKey(Keysyms.XK_BackSpace, true); session.sendKey(Keysyms.XK_BackSpace, false) }
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth().padding(top = 6.dp)) {
+            ImeQuickKey("←") { session.sendKey(Keysyms.XK_Left, true); session.sendKey(Keysyms.XK_Left, false) }
+            ImeQuickKey("↑") { session.sendKey(Keysyms.XK_Up, true); session.sendKey(Keysyms.XK_Up, false) }
+            ImeQuickKey("↓") { session.sendKey(Keysyms.XK_Down, true); session.sendKey(Keysyms.XK_Down, false) }
+            ImeQuickKey("→") { session.sendKey(Keysyms.XK_Right, true); session.sendKey(Keysyms.XK_Right, false) }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth().padding(top = 6.dp)) {
+            ImeQuickKey("Ctrl+C") { session.sendKeyChord(listOf(Keysyms.XK_Control_L, 'c'.code.toLong())) }
+            ImeQuickKey("Ctrl+V") { session.sendKeyChord(listOf(Keysyms.XK_Control_L, 'v'.code.toLong())) }
+            ImeQuickKey("Ctrl+A") { session.sendKeyChord(listOf(Keysyms.XK_Control_L, 'a'.code.toLong())) }
+            ImeQuickKey("Ctrl+Z") { session.sendKeyChord(listOf(Keysyms.XK_Control_L, 'z'.code.toLong())) }
+        }
+    }
+}
+
+@Composable
+private fun ImeQuickKey(label: String, onClick: () -> Unit) {
+    androidx.compose.material3.Surface(
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        onClick = onClick
+    ) {
+        Text(
+            label,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            fontSize = 13.sp
+        )
     }
 }

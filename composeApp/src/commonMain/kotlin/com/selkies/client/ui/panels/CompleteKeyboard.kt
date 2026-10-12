@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -19,6 +20,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -44,6 +46,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
@@ -55,18 +58,18 @@ import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
 /**
- * 世界最完整键盘（~151 键）——悬浮窗可拖动、可缩放、可折叠：
+ * 世界最完整键盘（151 键）——悬浮窗可拖动、可缩放、可折叠、双模式：
  *
- * - 主键盘页（103 键）：功能行(Esc+F1-F12+PrtSc/ScrLk/Pause) + 完整 ANSI 主区 + 导航区 + 方向键 + 数字小键盘（NumLk 真实切换）
- * - 媒体页（24 键）：音量/播放/上一首下一首 + 主页/邮件/搜索/计算器 + 电源/唤醒/弹出 + F13-F24
- * - 扩展页（24 键）：SysRq/Break/Compose/Linefeed/Clear/Select/Execute/Undo/Redo/Find/Help/Cancel/Begin/ShiftLock + 日韩键 + 小键盘扩展
+ * - 【分类模式（默认）】按键自动分类，指尖尺寸大键：
+ *   常用（打字主区）/ 功能（Esc+F1-F12）/ 导航（编辑区+方向键）/ 小键盘 / 媒体 / 扩展 / 文本合成条
+ * - 【完整模式】完整 23 单位网格真实 PC 布局（151 键一屏），可横向滚动、双指缩放
  * - 修饰键（Ctrl/Shift/Alt/Super/AltGr）单次粘滞，双击锁定，与远程组合键兼容
  * - 文本合成条：与输入法等效——可调用系统输入法（中文等）输入任意文本，回车发送（co,end 协议）
- * - 双指捏合缩放 / +− 按钮缩放（0.35x–1.6x），长按退格/方向键等自动重复
- * - 选择器模式（CompleteKeyboardPicker）：供快捷键创建时用完整键盘选键
+ * - 双指捏合缩放 / +− 按钮缩放，长按退格/方向键等自动重复
+ * - 选择器模式（CompleteKeyboardPicker 语义）：供快捷键创建时用完整键盘选键（onChord）
  */
 
-private enum class KbTab { MAIN, MEDIA, EXTRA }
+private enum class KbTab { MAIN, FUNC, NAV, NUMPAD, MEDIA, EXTRA, TEXT, FULL }
 
 /** 键描述 */
 private class K(
@@ -79,7 +82,7 @@ private class K(
     val dark: Boolean = false,       // 深色底（功能区）
     val tiny: Boolean = false,       // 更小字号
     val ghost: Boolean = false,      // 占位（真实键盘上被跨行键占据的位置，渲染为延伸块）
-    val ghostDark: Boolean = false,  // 延伸块颜色跟随上方键（Ent=深色 / +=普通色）
+    val ghostDark: Boolean = false,  // 延伸块颜色跟随上方键
     val gap: Boolean = false         // 不可见间隙
 ) {
     companion object
@@ -90,8 +93,148 @@ private fun G(w: Float) = K("", 0L, w, gap = true)
 
 private object KbLayout {
 
+    /** 分类模式·常用页：13 单位打字主区（指尖尺寸，自适应宽度） */
+    fun compactMain(): List<List<K>> = listOf(
+        listOf(
+            K("1", '1'.code.toLong(), 1f, shiftLabel = "!"),
+            K("2", '2'.code.toLong(), 1f, shiftLabel = "@"),
+            K("3", '3'.code.toLong(), 1f, shiftLabel = "#"),
+            K("4", '4'.code.toLong(), 1f, shiftLabel = "$"),
+            K("5", '5'.code.toLong(), 1f, shiftLabel = "%"),
+            K("6", '6'.code.toLong(), 1f, shiftLabel = "^"),
+            K("7", '7'.code.toLong(), 1f, shiftLabel = "&"),
+            K("8", '8'.code.toLong(), 1f, shiftLabel = "*"),
+            K("9", '9'.code.toLong(), 1f, shiftLabel = "("),
+            K("0", '0'.code.toLong(), 1f, shiftLabel = ")"),
+            K("-", '-'.code.toLong(), 1f, shiftLabel = "_"),
+            K("=", '='.code.toLong(), 1f, shiftLabel = "+"),
+            K("⌫", Keysyms.XK_BackSpace, 1.3f, dark = true, repeat = true)
+        ),
+        listOf(
+            K("Tab", Keysyms.XK_Tab, 1.4f, dark = true, tiny = true),
+            K("Q", 'q'.code.toLong()), K("W", 'w'.code.toLong()), K("E", 'e'.code.toLong()),
+            K("R", 'r'.code.toLong()), K("T", 't'.code.toLong()), K("Y", 'y'.code.toLong()),
+            K("U", 'u'.code.toLong()), K("I", 'i'.code.toLong()), K("O", 'o'.code.toLong()),
+            K("P", 'p'.code.toLong()),
+            K("[", '['.code.toLong(), 1f, shiftLabel = "{"),
+            K("]", ']'.code.toLong(), 1f, shiftLabel = "}"),
+            K("⏎", Keysyms.XK_Return, 1.6f, dark = true)
+        ),
+        listOf(
+            K("Caps", Keysyms.XK_Caps_Lock, 1.6f, dark = true, tiny = true),
+            K("A", 'a'.code.toLong()), K("S", 's'.code.toLong()), K("D", 'd'.code.toLong()),
+            K("F", 'f'.code.toLong()), K("G", 'g'.code.toLong()), K("H", 'h'.code.toLong()),
+            K("J", 'j'.code.toLong()), K("K", 'k'.code.toLong()), K("L", 'l'.code.toLong()),
+            K(";", ';'.code.toLong(), 1f, shiftLabel = ":"),
+            K("'", '\''.code.toLong(), 1f, shiftLabel = "\""),
+            K("\\", '\\'.code.toLong(), 1f, shiftLabel = "|"),
+            K("Esc", Keysyms.XK_Escape, 1.4f, dark = true, tiny = true)
+        ),
+        listOf(
+            K("⇧", Keysyms.XK_Shift_L, 1.8f, mod = Keysyms.XK_Shift_L, dark = true, tiny = true),
+            K("Z", 'z'.code.toLong()), K("X", 'x'.code.toLong()), K("C", 'c'.code.toLong()),
+            K("V", 'v'.code.toLong()), K("B", 'b'.code.toLong()), K("N", 'n'.code.toLong()),
+            K("M", 'm'.code.toLong()),
+            K(",", ','.code.toLong(), 1f, shiftLabel = "<"),
+            K(".", '.'.code.toLong(), 1f, shiftLabel = ">"),
+            K("/", '/'.code.toLong(), 1f, shiftLabel = "?"),
+            K("↑", Keysyms.XK_Up, 1f, dark = true, repeat = true)
+        ),
+        listOf(
+            K("Ctrl", Keysyms.XK_Control_L, 1.4f, mod = Keysyms.XK_Control_L, dark = true, tiny = true),
+            K("Win", Keysyms.XK_Super_L, 1.2f, mod = Keysyms.XK_Super_L, dark = true, tiny = true),
+            K("Alt", Keysyms.XK_Alt_L, 1.2f, mod = Keysyms.XK_Alt_L, dark = true, tiny = true),
+            K("空格", ' '.code.toLong(), 5.2f),
+            K("AltGr", Keysyms.XK_ISO_Level3_Shift, 1.2f, mod = Keysyms.XK_ISO_Level3_Shift, dark = true, tiny = true),
+            K("←", Keysyms.XK_Left, 1f, dark = true, repeat = true),
+            K("↓", Keysyms.XK_Down, 1f, dark = true, repeat = true),
+            K("→", Keysyms.XK_Right, 1f, dark = true, repeat = true)
+        )
+    )
+
+    /** 分类模式·功能页 */
+    fun compactFunc(): List<List<K>> = listOf(
+        listOf(
+            K("Esc", Keysyms.XK_Escape, 1.4f, dark = true, tiny = true),
+            K("F1", Keysyms.XK_F1), K("F2", Keysyms.XK_F2), K("F3", Keysyms.XK_F3),
+            K("F4", Keysyms.XK_F4), K("F5", Keysyms.XK_F5), K("F6", Keysyms.XK_F6)
+        ),
+        listOf(
+            K("F7", Keysyms.XK_F7), K("F8", Keysyms.XK_F8), K("F9", Keysyms.XK_F9),
+            K("F10", Keysyms.XK_F10), K("F11", Keysyms.XK_F11), K("F12", Keysyms.XK_F12)
+        ),
+        listOf(
+            K("PrtSc", Keysyms.XK_Print, 1.2f, dark = true, tiny = true),
+            K("ScrLk", Keysyms.XK_Scroll_Lock, 1.2f, dark = true, tiny = true),
+            K("Pause", Keysyms.XK_Pause, 1.2f, dark = true, tiny = true),
+            K("Menu", Keysyms.XK_Menu, 1.2f, dark = true, tiny = true),
+            K("NumLk", Keysyms.XK_Num_Lock, 1.2f, dark = true, tiny = true),
+            K("Caps", Keysyms.XK_Caps_Lock, 1.2f, dark = true, tiny = true)
+        ),
+        listOf(
+            K("`", '`'.code.toLong(), 1f, shiftLabel = "~"),
+            K("F13", Keysyms.XK_F13), K("F14", Keysyms.XK_F14), K("F15", Keysyms.XK_F15),
+            K("F16", Keysyms.XK_F16), K("F17", Keysyms.XK_F17), K("F18", Keysyms.XK_F18)
+        )
+    )
+
+    /** 分类模式·导航页 */
+    fun compactNav(): List<List<K>> = listOf(
+        listOf(
+            G(1f),
+            K("Ins", Keysyms.XK_Insert, 1f, dark = true, tiny = true),
+            K("Home", Keysyms.XK_Home, 1f, dark = true, tiny = true),
+            K("PgUp", Keysyms.XK_Page_Up, 1f, dark = true, tiny = true),
+            G(1f),
+            K("Tab", Keysyms.XK_Tab, 1f, dark = true, tiny = true),
+            K("⏎", Keysyms.XK_Return, 1f, dark = true)
+        ),
+        listOf(
+            G(1.5f),
+            K("↑", Keysyms.XK_Up, 1f, dark = true, repeat = true),
+            G(1.5f),
+            K("Del", Keysyms.XK_Delete, 1f, dark = true, tiny = true, repeat = true),
+            K("End", Keysyms.XK_End, 1f, dark = true, tiny = true),
+            K("PgDn", Keysyms.XK_Page_Down, 1f, dark = true, tiny = true),
+            K("Space", ' '.code.toLong(), 1f, dark = true),
+            K("⌫", Keysyms.XK_BackSpace, 1f, dark = true, repeat = true)
+        ),
+        listOf(
+            K("←", Keysyms.XK_Left, 1f, dark = true, repeat = true),
+            K("↓", Keysyms.XK_Down, 1f, dark = true, repeat = true),
+            K("→", Keysyms.XK_Right, 1f, dark = true, repeat = true)
+        )
+    )
+
+    /** 分类模式·小键盘页（4 列真实布局） */
+    fun compactNumpad(): List<List<K>> = listOf(
+        listOf(
+            K("Num", Keysyms.XK_Num_Lock, 1f, dark = true, tiny = true),
+            K("/", Keysyms.XK_KP_Divide, 1f),
+            K("*", Keysyms.XK_KP_Multiply, 1f),
+            K("−", Keysyms.XK_KP_Subtract, 1f)
+        ),
+        listOf(
+            K("7", Keysyms.XK_KP_7), K("8", Keysyms.XK_KP_8), K("9", Keysyms.XK_KP_9),
+            K("+", Keysyms.XK_KP_Add, 1f)
+        ),
+        listOf(
+            K("4", Keysyms.XK_KP_4), K("5", Keysyms.XK_KP_5), K("6", Keysyms.XK_KP_6),
+            K("", 0L, 1f, ghost = true)
+        ),
+        listOf(
+            K("1", Keysyms.XK_KP_1), K("2", Keysyms.XK_KP_2), K("3", Keysyms.XK_KP_3),
+            K("Ent", Keysyms.XK_KP_Enter, 1f, dark = true, tiny = true)
+        ),
+        listOf(
+            K("0", Keysyms.XK_KP_0, 2f),
+            K(".", Keysyms.XK_KP_Decimal, 1f),
+            K("", 0L, 1f, ghost = true, ghostDark = true)
+        )
+    )
+
+    /** 完整模式：23 单位统一网格（所有行权重和恒为 23，列严格对齐） */
     fun main(): List<List<K>> = listOf(
-        // ================= 23 单位统一网格（所有行权重和恒为 23，列严格对齐）=================
         // 主区 15u | 0.5u 间隙 | 导航/方向 3u | 0.5u 间隙 | 小键盘 4u
         // ---- 行 0：功能行（Esc + F1-F12 分三组 + PrtSc/ScrLk/Pause 对齐导航区）----
         listOf(
@@ -340,36 +483,42 @@ fun CompleteKeyboard(
     visible: Boolean,
     autoScaleHint: Float = 1f,
     savedScale: Float = 0f,
+    savedFullMode: Boolean = false,
     onScaleChange: (Float) -> Unit = {},
+    onFullModeChange: (Boolean) -> Unit = {},
     onDismiss: () -> Unit,
     onChord: ((List<Long>) -> Unit)? = null
 ) {
     if (!visible) return
 
-    var tab by remember { mutableStateOf(KbTab.MAIN) }
+    var fullMode by remember { mutableStateOf(savedFullMode) }
+    var tab by remember(fullMode) { mutableStateOf(if (fullMode) KbTab.FULL else KbTab.MAIN) }
     val latches = remember { ModLatches() }
     var numLock by remember { mutableStateOf(true) }
     var collapsed by remember { mutableStateOf(false) }
     var textBarVisible by remember { mutableStateOf(false) }
     var composeText by remember { mutableStateOf("") }
-    var scale by remember(savedScale) {
-        mutableStateOf(if (savedScale > 0f) savedScale else autoScaleHint.coerceIn(0.35f, 1f))
+    // 缩放：分类模式 0.6–1.6（作用于自动键高），完整模式 0.3–2.0（作用于单位宽度）
+    var scale by remember(savedScale, fullMode) {
+        mutableStateOf(if (savedScale > 0f) savedScale else if (fullMode) autoScaleHint.coerceIn(0.3f, 1f) else 1f)
     }
     var repaint by remember { mutableStateOf(0) }   // 触发修饰键高亮重绘
 
     var offset by remember { mutableStateOf(IntOffset.Zero) }
     var parentSize by remember { mutableStateOf(IntSize.Zero) }
     var kbSize by remember { mutableStateOf(IntSize.Zero) }
+    val density = LocalDensity.current
+    var kbWidthDp by remember { mutableStateOf(0f) }
 
     fun doScale(f: Float) {
-        scale = (scale * f).coerceIn(0.35f, 1.6f)
+        scale = (scale * f).coerceIn(if (fullMode) 0.3f else 0.55f, if (fullMode) 2.0f else 1.6f)
         onScaleChange(scale)
     }
 
     /** 发送普通键（含粘滞修饰键组合） */
     fun pressNormal(k: K) {
         if (k.ghost || k.keysym == 0L) return
-        val key = if (!numLock && tab == KbTab.MAIN) KbLayout.numLockOffKey(k) else k
+        val key = if (!numLock && (tab == KbTab.MAIN || tab == KbTab.FULL || tab == KbTab.NUMPAD)) KbLayout.numLockOffKey(k) else k
         val mods = latches.chordPrefix()
         if (onChord != null) {
             onChord(mods + key.keysym)
@@ -394,7 +543,10 @@ fun CompleteKeyboard(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .onSizeChanged { parentSize = it },
+            .onSizeChanged {
+                parentSize = it
+                kbWidthDp = with(density) { it.width.toDp().value }
+            },
         contentAlignment = Alignment.BottomCenter
     ) {
         if (collapsed) {
@@ -427,16 +579,23 @@ fun CompleteKeyboard(
                 }
             }
         } else {
+            // ---- 键高：分类模式按宽度自适应（指尖尺寸），完整模式按缩放单位 ----
+            val compactKeyH = if (kbWidthDp > 0) (kbWidthDp / 13.6f * 1.04f * scale) else 34f
+            val keyH = if (fullMode) (34f * scale).coerceAtLeast(14f)
+            else compactKeyH.coerceIn(24f, 56f)
+            val gap = (keyH * 0.08f).coerceAtLeast(1.4f).dp
+
             Surface(
                 modifier = Modifier
-                    .padding(horizontal = 3.dp, vertical = 4.dp)
+                    .fillMaxWidth()
+                    .padding(horizontal = if (fullMode) 0.dp else 3.dp, vertical = 4.dp)
                     .offset { offset }
                     .onSizeChanged { kbSize = it }
                     // 双指捏合缩放
                     .pointerInput(Unit) {
                         detectTransformGestures { _, _, zoom, _ ->
                             if (zoom != 1f) {
-                                val ns = (scale * zoom).coerceIn(0.35f, 1.6f)
+                                val ns = (scale * zoom).coerceIn(if (fullMode) 0.3f else 0.55f, if (fullMode) 2.0f else 1.6f)
                                 if (kotlin.math.abs(ns - scale) > 0.004f) {
                                     scale = ns
                                     onScaleChange(scale)
@@ -449,7 +608,7 @@ fun CompleteKeyboard(
                 shadowElevation = 10.dp
             ) {
                 Column(modifier = Modifier.padding(3.dp)) {
-                    // ---------- 拖动头 ----------
+                    // ---------- 拖动头 + 分类页签（可横向滑动） + 模式/缩放控制 ----------
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -459,7 +618,7 @@ fun CompleteKeyboard(
                         Box(
                             modifier = Modifier
                                 .weight(1f)
-                                .height(24.dp)
+                                .height(26.dp)
                                 .pointerInput(Unit) {
                                     detectDragGestures { _, drag ->
                                         offset = clampKbOffset(
@@ -468,35 +627,63 @@ fun CompleteKeyboard(
                                         )
                                     }
                                 },
-                            contentAlignment = Alignment.Center
+                            contentAlignment = Alignment.CenterStart
                         ) {
                             Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
                                 Box(
                                     Modifier
-                                        .width(40.dp)
+                                        .width(36.dp)
                                         .height(4.dp)
                                         .background(Color(0x66FFFFFF), RoundedCornerShape(2.dp))
                                 )
                                 Text(
-                                    "151 键 · ${(scale * 100).toInt()}%",
+                                    (if (fullMode) "完整 151 键" else "分类") + " · ${(scale * 100).toInt()}%",
                                     color = Color(0x99FFFFFF), fontSize = 9.sp
                                 )
                             }
                         }
-                        KbChip("主键盘", active = tab == KbTab.MAIN) { tab = KbTab.MAIN }
-                        KbChip("媒体", active = tab == KbTab.MEDIA) { tab = KbTab.MEDIA }
-                        KbChip("扩展", active = tab == KbTab.EXTRA) { tab = KbTab.EXTRA }
+                        // 页签（横向滑动，修「键盘太多」：默认分类只显示当前类的大按键）
+                        Row(
+                            modifier = Modifier
+                                .weight(2.2f)
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(3.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (fullMode) {
+                                KbChip("完整", active = tab == KbTab.FULL) { tab = KbTab.FULL }
+                                KbChip("媒体", active = tab == KbTab.MEDIA) { tab = KbTab.MEDIA }
+                                KbChip("扩展", active = tab == KbTab.EXTRA) { tab = KbTab.EXTRA }
+                                KbChip("文本", active = textBarVisible) { textBarVisible = !textBarVisible }
+                            } else {
+                                KbChip("常用", active = tab == KbTab.MAIN) { tab = KbTab.MAIN }
+                                KbChip("功能", active = tab == KbTab.FUNC) { tab = KbTab.FUNC }
+                                KbChip("导航", active = tab == KbTab.NAV) { tab = KbTab.NAV }
+                                KbChip("小键盘", active = tab == KbTab.NUMPAD) { tab = KbTab.NUMPAD }
+                                KbChip("媒体", active = tab == KbTab.MEDIA) { tab = KbTab.MEDIA }
+                                KbChip("扩展", active = tab == KbTab.EXTRA) { tab = KbTab.EXTRA }
+                                KbChip("文本", active = textBarVisible) { textBarVisible = !textBarVisible }
+                            }
+                        }
                         Spacer(Modifier.width(3.dp))
-                        KbChip("文本", active = textBarVisible) { textBarVisible = !textBarVisible }
-                        Spacer(Modifier.width(3.dp))
+                        // 完整/分类 模式切换（用户要求：自动分类 + 可选完整模式）
+                        KbChip(
+                            if (fullMode) "分类" else "完整",
+                            active = fullMode,
+                            accent = true
+                        ) {
+                            fullMode = !fullMode
+                            tab = if (fullMode) KbTab.FULL else KbTab.MAIN
+                            onFullModeChange(fullMode)
+                        }
                         KbIcon(Icons.Filled.Remove, "缩小") { doScale(1f / 1.15f) }
                         KbIcon(Icons.Filled.Add, "放大") { doScale(1.15f) }
                         KbIcon(Icons.Filled.KeyboardArrowDown, "折叠") { collapsed = true }
                         KbIcon(Icons.Filled.Close, "关闭") { onDismiss() }
                     }
 
-                    // ---------- 文本合成条（输入法等效）----------
-                    if (textBarVisible) {
+                    // ---------- 文本合成条（输入法等效；文本页签=大号版）----------
+                    if (textBarVisible || tab == KbTab.TEXT) {
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -507,18 +694,18 @@ fun CompleteKeyboard(
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
-                                    .height(34.dp)
+                                    .height(38.dp)
                                     .background(Color(0xFF2A323D), RoundedCornerShape(8.dp))
                                     .padding(horizontal = 8.dp),
                                 contentAlignment = Alignment.CenterStart
                             ) {
                                 if (composeText.isEmpty()) {
-                                    Text("输入文本（可调用系统输入法/中文）回车发送", color = Color(0x66FFFFFF), fontSize = 10.sp)
+                                    Text("输入文本（可调用系统输入法/中文）", color = Color(0x66FFFFFF), fontSize = 10.sp)
                                 }
                                 BasicTextField(
                                     value = composeText,
                                     onValueChange = { composeText = it },
-                                    textStyle = TextStyle(color = Color(0xFFE8EDF4), fontSize = 13.sp),
+                                    textStyle = TextStyle(color = Color(0xFFE8EDF4), fontSize = 14.sp),
                                     cursorBrush = SolidColor(Color(0xFF60A5FA)),
                                     singleLine = true,
                                     modifier = Modifier.fillMaxWidth()
@@ -534,51 +721,129 @@ fun CompleteKeyboard(
                             }
                             KbChip("清空") { composeText = "" }
                         }
+                        if (tab == KbTab.TEXT) {
+                            // 文本页：大号快捷键 + 说明
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                KbChip("回车") {
+                                    session?.sendKey(Keysyms.XK_Return, true)
+                                    session?.sendKey(Keysyms.XK_Return, false)
+                                }
+                                KbChip("Tab") {
+                                    session?.sendKey(Keysyms.XK_Tab, true)
+                                    session?.sendKey(Keysyms.XK_Tab, false)
+                                }
+                                KbChip("Esc") {
+                                    session?.sendKey(Keysyms.XK_Escape, true)
+                                    session?.sendKey(Keysyms.XK_Escape, false)
+                                }
+                                KbChip("Ctrl+C 复制") { session?.sendKeyChord(listOf(Keysyms.XK_Control_L, 'c'.code.toLong())) }
+                                KbChip("Ctrl+V 粘贴") { session?.sendKeyChord(listOf(Keysyms.XK_Control_L, 'v'.code.toLong())) }
+                            }
+                        }
                     }
 
                     // ---------- 键区 ----------
-                    val rows = when (tab) {
-                        KbTab.MAIN -> KbLayout.main()
+                    val rows: List<List<K>> = when (tab) {
+                        KbTab.MAIN -> KbLayout.compactMain()
+                        KbTab.FUNC -> KbLayout.compactFunc()
+                        KbTab.NAV -> KbLayout.compactNav()
+                        KbTab.NUMPAD -> KbLayout.compactNumpad()
                         KbTab.MEDIA -> KbLayout.media()
                         KbTab.EXTRA -> KbLayout.extra()
+                        KbTab.TEXT -> KbLayout.compactMain()   // 文本页下方保留打字区
+                        KbTab.FULL -> KbLayout.main()
                     }
-                    val keyH = (42 * scale).coerceAtLeast(15f)
-                    val gap = (3 * scale).coerceAtLeast(1f).dp
                     // 读取 repaint：修饰键粘滞状态变化时触发键区重绘
                     val rp = repaint
 
-                    Column(verticalArrangement = Arrangement.spacedBy(gap)) {
-                        rows.forEach { row ->
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.Start,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                row.forEach { k ->
-                                    KbKey(
-                                        k = k,
-                                        keyH = keyH,
-                                        gap = gap,
-                                        scale = scale,
-                                        latched = k.mod != 0L && latches.isLatched(k.mod),
-                                        locked = k.mod != 0L && latches.isLocked(k.mod),
-                                        showShift = latches.isLatched(Keysyms.XK_Shift_L) || latches.isLatched(Keysyms.XK_Shift_R),
-                                        numLock = numLock,
-                                        onClick = {
-                                            if (k.ghost) return@KbKey
-                                            if (k.mod != 0L) {
-                                                latches.tap(k.mod)
-                                                repaint++
-                                            } else if (k.keysym == Keysyms.XK_Num_Lock) {
-                                                numLock = !numLock
-                                            } else {
-                                                pressNormal(k)
+                    val keyArea: @Composable () -> Unit = {
+                        Column(verticalArrangement = Arrangement.spacedBy(gap)) {
+                            rows.forEach { row ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.Start,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    row.forEach { k ->
+                                        KbKey(
+                                            k = k,
+                                            keyH = keyH,
+                                            gap = gap,
+                                            latched = k.mod != 0L && latches.isLatched(k.mod),
+                                            locked = k.mod != 0L && latches.isLocked(k.mod),
+                                            showShift = latches.isLatched(Keysyms.XK_Shift_L) || latches.isLatched(Keysyms.XK_Shift_R),
+                                            onClick = {
+                                                if (k.ghost) return@KbKey
+                                                if (k.mod != 0L) {
+                                                    latches.tap(k.mod)
+                                                    repaint++
+                                                } else if (k.keysym == Keysyms.XK_Num_Lock) {
+                                                    numLock = !numLock
+                                                } else {
+                                                    pressNormal(k)
+                                                }
                                             }
-                                        }
-                                    )
+                                        )
+                                    }
                                 }
                             }
                         }
+                    }
+
+                    if (fullMode && tab == KbTab.FULL) {
+                        // 完整模式：真实单位宽度（可超出屏幕，横向滚动查看全键盘）
+                        val unitDp = (34f * scale).coerceAtLeast(12f)
+                        val gridWidthDp = (23f * unitDp + 8f)
+                        val screenDp = kbWidthDp
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .width(with(density) { gridWidthDp.coerceAtLeast(screenDp).toDp() })
+                                    .padding(horizontal = 2.dp),
+                                verticalArrangement = Arrangement.spacedBy(gap)
+                            ) {
+                                rows.forEachIndexed { ri, row ->
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.Start,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        row.forEach { k ->
+                                            FixedKbKey(
+                                                k = k,
+                                                unit = unitDp,
+                                                keyH = keyH,
+                                                gap = gap,
+                                                latched = k.mod != 0L && latches.isLatched(k.mod),
+                                                locked = k.mod != 0L && latches.isLocked(k.mod),
+                                                showShift = latches.isLatched(Keysyms.XK_Shift_L) || latches.isLatched(Keysyms.XK_Shift_R),
+                                                numLock = numLock,
+                                                onClick = {
+                                                    if (k.ghost) return@FixedKbKey
+                                                    if (k.mod != 0L) {
+                                                        latches.tap(k.mod)
+                                                        repaint++
+                                                    } else if (k.keysym == Keysyms.XK_Num_Lock) {
+                                                        numLock = !numLock
+                                                    } else {
+                                                        pressNormal(k)
+                                                    }
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        keyArea()
                     }
                 }
             }
@@ -599,29 +864,22 @@ private fun clampKbOffset(off: IntOffset, parent: IntSize, kb: IntSize): IntOffs
 // 单键渲染
 // =====================================================================
 
+/** 权重键（自适应宽度——分类模式） */
 @Composable
 private fun androidx.compose.foundation.layout.RowScope.KbKey(
     k: K,
     keyH: Float,
     gap: androidx.compose.ui.unit.Dp,
-    scale: Float,
     latched: Boolean,
     locked: Boolean,
     showShift: Boolean,
-    numLock: Boolean,
     onClick: () -> Unit
 ) {
-    val gapHalf = (keyH * 0.06f).coerceAtLeast(0.6f).dp
-    // 不可见间隙：仅占据网格宽度
+    val gapHalf = (keyH * 0.05f).coerceAtLeast(0.5f).dp
     if (k.gap) {
-        Box(
-            Modifier
-                .weight(k.weight)
-                .height(keyH.dp)
-        )
+        Box(Modifier.weight(k.weight).height(keyH.dp))
         return
     }
-    // 占位：被跨行键（+/Enter）占据——延伸块上移一个行间隙，与上方键无缝合并成 2u 高键
     if (k.ghost) {
         Box(
             Modifier
@@ -685,7 +943,95 @@ private fun androidx.compose.foundation.layout.RowScope.KbKey(
             Text(
                 label,
                 color = if (latched) Color(0xFF06131F) else Color(0xFFE8EDF4),
-                fontSize = (if (k.tiny) 10f else 14f * scale.coerceAtLeast(0.62f)).coerceAtLeast(7f).sp,
+                fontSize = (if (k.tiny) 10.5f else 15.5f).coerceAtMost(keyH * 0.42f).coerceAtLeast(7f).sp,
+                maxLines = 1
+            )
+        }
+    }
+}
+
+/** 固定单位宽度键（完整模式：真实键盘比例，横向滚动） */
+@Composable
+private fun androidx.compose.foundation.layout.RowScope.FixedKbKey(
+    k: K,
+    unit: Float,
+    keyH: Float,
+    gap: androidx.compose.ui.unit.Dp,
+    latched: Boolean,
+    locked: Boolean,
+    showShift: Boolean,
+    numLock: Boolean,
+    onClick: () -> Unit
+) {
+    val key = if (!numLock) KbLayout.numLockOffKey(k) else k
+    val gapHalf = (unit * 0.06f).coerceAtLeast(0.5f).dp
+    if (key.gap) {
+        Spacer(Modifier.width((unit * key.weight).dp).height(keyH.dp))
+        return
+    }
+    if (key.ghost) {
+        Box(
+            Modifier
+                .width((unit * key.weight).dp)
+                .height(keyH.dp + gap)
+                .offset(y = -gap)
+                .padding(horizontal = gapHalf)
+        ) {
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .height(keyH.dp + gap)
+                    .background(
+                        if (key.ghostDark) Color(0xFF39424E) else Color(0xFF2A323D),
+                        RoundedCornerShape(bottomStart = 6.dp, bottomEnd = 6.dp)
+                    )
+            )
+        }
+        return
+    }
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+
+    LaunchedEffect(pressed) {
+        if (pressed) {
+            onClick()
+            if (key.repeat) {
+                var n = 0
+                while (true) {
+                    delay(if (n == 0) 400 else 60)
+                    onClick()
+                    n++
+                }
+            }
+        }
+    }
+
+    val base = when {
+        latched -> if (locked) Color(0xFF22D3A5) else Color(0xFF3B82F6)
+        else -> if (key.dark) Color(0xFF39424E) else Color(0xFF2A323D)
+    }
+    val label = when {
+        key.shiftLabel != null && showShift -> key.shiftLabel
+        else -> key.label
+    }
+    Box(
+        modifier = Modifier
+            .width((unit * key.weight).dp)
+            .height(keyH.dp)
+            .padding(horizontal = gapHalf)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(keyH.dp)
+                .background(if (pressed) Color(0xFF60A5FA) else base, RoundedCornerShape(6.dp))
+                .clickable(interactionSource = interaction, indication = null) {},
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                label,
+                color = if (latched) Color(0xFF06131F) else Color(0xFFE8EDF4),
+                fontSize = (if (key.tiny) 10f else 14f * unit.coerceAtLeast(0.6f)).coerceAtLeast(7f).sp,
                 maxLines = 1
             )
         }
@@ -693,17 +1039,21 @@ private fun androidx.compose.foundation.layout.RowScope.KbKey(
 }
 
 @Composable
-private fun KbChip(label: String, active: Boolean = false, onClick: () -> Unit) {
+private fun KbChip(label: String, active: Boolean = false, accent: Boolean = false, onClick: () -> Unit) {
     Box(
         modifier = Modifier
             .background(
-                if (active) Color(0xFF3B82F6) else Color(0x33FFFFFF),
+                when {
+                    accent && active -> Color(0xFF22D3A5)
+                    active -> Color(0xFF3B82F6)
+                    else -> Color(0x33FFFFFF)
+                },
                 RoundedCornerShape(6.dp)
             )
             .clickable { onClick() }
             .padding(horizontal = 7.dp, vertical = 3.dp)
     ) {
-        Text(label, color = Color(0xFFE2E8F0), fontSize = 10.sp, maxLines = 1)
+        Text(label, color = if (accent && active) Color(0xFF06131F) else Color(0xFFE2E8F0), fontSize = 10.sp, maxLines = 1)
     }
 }
 
