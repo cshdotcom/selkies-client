@@ -50,6 +50,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.selkies.client.core.Keysyms
 import com.selkies.client.core.SelkiesSession
+import com.selkies.client.model.StreamHealth
 import kotlin.math.max
 
 /**
@@ -63,6 +64,7 @@ fun StatsPanel(session: SelkiesSession) {
     val status by session.status.collectAsState()
     val encoder by session.currentEncoder.collectAsState()
     val realizedRes by session.realizedResolution.collectAsState()
+    val streamHealth by session.streamHealth.collectAsState()
     var resW by remember { mutableStateOf("") }
     var resH by remember { mutableStateOf("") }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -98,6 +100,47 @@ fun StatsPanel(session: SelkiesSession) {
                 SelkiesSession.Status.CLOSED -> "已关闭"
                 else -> "连接中"
             })
+        }
+
+        // 官方四行健康状态（streamRows：encoder/capture/decoder/connection，1:1）
+        streamHealth?.let { sh ->
+            SectionCard("流健康状态（官方同款）") {
+                HealthRow(
+                    "编码器",
+                    listOfNotNull(
+                        sh.encoder.ifBlank { null },
+                        sh.codec.uppercase().ifBlank { null }
+                    ).joinToString(" · "),
+                    when {
+                        sh.hardware -> "good"
+                        !sh.hardware && sh.hardwareExpected && sh.gpuPresent -> "warn"
+                        else -> "neutral"
+                    },
+                    if (sh.hardware) sh.gpu else if (!sh.gpuPresent) "服务器无 GPU（普通部署）" else ""
+                )
+                HealthRow(
+                    "采集",
+                    listOfNotNull(
+                        sh.backend.uppercase().ifBlank { null },
+                        (if (sh.zeroCopy) "Zero-copy" else "Readback") +
+                                (if (sh.capture.isNotBlank()) " (${sh.capture})" else "")
+                    ).joinToString(" · "),
+                    if (sh.zeroCopy) "good" else "neutral",
+                    ""
+                )
+                HealthRow(
+                    "解码器",
+                    if (stats.decodeMs > 0) "硬件解码（本机）" else "检测中",
+                    if (stats.decodeMs > 0) "good" else "neutral",
+                    if (stats.decodeMs > 0) String.format(java.util.Locale.US, "%.1f ms/帧", stats.decodeMs) else ""
+                )
+                HealthRow(
+                    "连接",
+                    "WebSocket 流",
+                    if (stats.throttled) "warn" else "good",
+                    if (stats.throttled) "服务器正在限流（画面为省带宽被延后）" else if (stats.latencyMs > 0) "RTT ${stats.latencyMs} ms" else ""
+                )
+            }
         }
 
         SectionCard("帧率（本端呈现 / 服务器编码）") {
@@ -297,6 +340,43 @@ private fun StatRow(label: String, value: String) {
     Row(modifier = Modifier.fillMaxWidth()) {
         Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
         Text(value, fontWeight = FontWeight.Medium)
+    }
+}
+
+/** 官方四行健康状态行（good=绿✓ / warn=橙! / neutral=灰·） */
+@Composable
+private fun HealthRow(label: String, value: String, state: String, detail: String) {
+    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
+        val (color, icon) = when (state) {
+            "good" -> Color(0xFF22C55E) to "✓"
+            "warn" -> Color(0xFFF59E0B) to "!"
+            else -> Color(0xFF94A3B8) to "·"
+        }
+        Text(
+            icon,
+            color = color,
+            fontWeight = FontWeight.Bold,
+            fontSize = 14.sp,
+            modifier = Modifier.width(18.dp)
+        )
+        Column(Modifier.weight(1f)) {
+            Row {
+                Text(
+                    label,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(end = 8.dp)
+                )
+                Text(value, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium)
+            }
+            if (detail.isNotBlank()) {
+                Text(
+                    detail,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
     }
 }
 

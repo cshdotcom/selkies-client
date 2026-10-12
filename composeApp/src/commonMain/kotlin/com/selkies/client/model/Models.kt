@@ -231,6 +231,19 @@ data class SavedMediaEvent(
     val error: String? = null
 )
 
+/** 服务器流健康信息（官方 stream_info；统计面板四行状态用） */
+data class StreamHealth(
+    val backend: String = "",       // x11 / wayland
+    val capture: String = "",       // NvFBC / DRI3 / XShm / dmabuf / readback
+    val zeroCopy: Boolean = false,
+    val encoder: String = "",       // NVENC / VAAPI / x264...
+    val hardware: Boolean = false,  // 硬件编码
+    val gpuPresent: Boolean = false,
+    val hardwareExpected: Boolean = false,
+    val codec: String = "",
+    val gpu: String = ""
+)
+
 /** 打印任务条目（服务器 print_document 通知 → 下载校验 → 系统打印 → 状态跟踪） */
 data class PrintJobEntry(
     val name: String,

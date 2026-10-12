@@ -7,6 +7,7 @@ import com.selkies.client.model.PrintJobEntry
 import com.selkies.client.model.SavedMediaEvent
 import com.selkies.client.model.ServerEntry
 import com.selkies.client.model.StatsInfo
+import com.selkies.client.model.StreamHealth
 import com.selkies.client.platform.PlatformServices
 import com.selkies.client.platform.PrintBridge
 import com.selkies.client.platform.VideoSink
@@ -95,6 +96,9 @@ class SelkiesSession(
     /** 应用内音量（0..1，独立于系统音量）与静音 */
     val appVolume = MutableStateFlow(-1f)   // -1 = 未初始化（从 settings 读）
     val appMuted = MutableStateFlow(false)
+
+    /** 服务器流健康信息（官方 stream_info → 四行状态显示） */
+    val streamHealth = MutableStateFlow<StreamHealth?>(null)
 
     /** 手柄心跳定时器（js,h 保活） */
     private var gamepadHeartbeatJob: Job? = null
@@ -540,6 +544,18 @@ class SelkiesSession(
                         stats.value.encoderDetail = "$backend/$encoder"
                         stats.value = stats.value
                     }
+                    // 官方四行健康状态数据（stream-stats-view streamRows 同源字段）
+                    streamHealth.value = StreamHealth(
+                        backend = backend,
+                        capture = (info["capture"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: "",
+                        zeroCopy = (info["zero_copy"] as? kotlinx.serialization.json.JsonPrimitive)?.content == "true",
+                        encoder = encoder,
+                        hardware = (info["hardware"] as? kotlinx.serialization.json.JsonPrimitive)?.content == "true",
+                        gpuPresent = (info["gpu_present"] as? kotlinx.serialization.json.JsonPrimitive)?.content == "true",
+                        hardwareExpected = (info["hardware_expected"] as? kotlinx.serialization.json.JsonPrimitive)?.content == "true",
+                        codec = (info["codec"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: "",
+                        gpu = (info["gpu"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: ""
+                    )
                 }
                 "stream_stats" -> {
                     // 官方格式：{"type":"stream_stats","displayId":"primary","stats":{...}}
