@@ -248,12 +248,15 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         }
     }
 
-    // 录屏中：确认退出时提示将自动保存
+    // 录屏中：每秒刷新时长 + 与真实录制状态同步（分辨率切换自动分段/异常终止时 UI 自动复位）
     LaunchedEffect(recording) {
         if (recording) {
             while (recording) {
                 delay(1000)
                 recordingSec = session.recorder.durationSec().toInt()
+                if (session.recorder.state != com.selkies.client.core.StreamRecorder.State.RECORDING) {
+                    recording = false
+                }
             }
         }
     }
