@@ -136,8 +136,6 @@ object DesktopPlatform : PlatformServices {
         }.apply { isDaemon = true }.start()
     }
 
-    override fun makeVideoSink(): VideoSink = com.selkies.client.video.DesktopVideoSink()
-
     override fun makeAudioPlayer(): AudioPlayer = com.selkies.client.audio.DesktopAudioPlayer()
 
     override fun makeMicCapture(): MicCapture = com.selkies.client.audio.DesktopMicCapture()
@@ -219,9 +217,14 @@ object DesktopPlatform : PlatformServices {
         }
     }
 
-    fun init() {}
+    fun init() {
+        // 设置根目录提供者：从全局设置读取（App 启动后由 AppState 注入；这里默认空 = ~/Selkies）
+    }
 
-    fun shutdown() {}
+    fun shutdown() {
+        // 退出前保存录屏（「退出默认视为保存」；与 JVM shutdown hook 双保险）
+        com.selkies.client.core.RecordingShutdownHook.autosave()
+    }
 
     // ---- v2.4.0 硬件选择 ----
 
@@ -325,6 +328,104 @@ object DesktopPlatform : PlatformServices {
                 true
             } else false
         }.getOrDefault(false)
+    }
+
+    // ---- v2.5.0 媒体/手柄/焦点 ----
+
+    @Volatile
+    private var lastDesktopSink: com.selkies.client.video.DesktopVideoSink? = null
+    @Volatile
+    private var desktopFocus = true
+    private var shutdownHookRegistered = false
+    private var settingsRoot: () -> String = { "" }
+
+    /** 注入设置根目录提供者（App 启动时） */
+    fun setStorageRootProvider(provider: () -> String) {
+        settingsRoot = provider
+    }
+
+    override fun makeVideoSink(): VideoSink {
+        val sink = com.selkies.client.video.DesktopVideoSink()
+        lastDesktopSink = sink
+        return sink
+    }
+
+    override fun openFileLocation(path: String) {
+        runCatching {
+            val file = File(path)
+            if (!file.exists()) return
+            val os = System.getProperty("os.name", "").lowercase()
+            when {
+                os.contains("win") -> {
+                    // explorer /select 定位到文件
+                    ProcessBuilder("explorer.exe", "/select,", file.absolutePath).start()
+                }
+                os.contains("mac") || os.contains("darwin") -> {
+                    ProcessBuilder("open", "-R", file.absolutePath).start()
+                }
+                else -> {
+                    // Linux：打开所在目录
+                    ProcessBuilder("xdg-open", file.parentFile?.absolutePath ?: file.absolutePath).start()
+                }
+            }
+        }
+    }
+
+    override fun rumbleGamepad(slot: Int, strong: Float, weak: Float, ms: Int) {
+        // 桌面无通用手柄振动 API（需 JNI/hid）；留给后续版本
+    }
+
+    override fun captureVideoFrame(onDone: (ByteArray?) -> Unit) {
+        val sink = lastDesktopSink
+        val bmp = sink?.bitmapFlow?.value
+        if (sink == null || bmp == null) {
+            onDone(null)
+            return
+        }
+        Thread {
+            runCatching {
+                // Compose ImageBitmap → BufferedImage → PNG
+                val w = bmp.width
+                val h = bmp.height
+                val img = java.awt.image.BufferedImage(w, h, java.awt.image.BufferedImage.TYPE_INT_ARGB)
+                val buffer = IntArray(w * h)
+                bmp.readPixels(buffer)
+                img.setRGB(0, 0, w, h, buffer, 0, w)
+                val out = java.io.ByteArrayOutputStream()
+                javax.imageio.ImageIO.write(img, "png", out)
+                onDone(out.toByteArray())
+            }.onFailure { onDone(null) }
+        }.apply { isDaemon = true; name = "shot-encode" }.start()
+    }
+
+    override fun mediaStore(): MediaStoreBridge {
+        // 每次读取最新设置（storageRoot 热生效）：settings.json → storageRoot 字段
+        val root = runCatching {
+            val f = java.io.File(configDir(), "settings.json")
+            if (f.exists()) {
+                val txt = f.readText()
+                val m = Regex("\"storageRoot\"\\s*:\\s*\"([^\"]*)\"").find(txt)
+                m?.groupValues?.get(1) ?: ""
+            } else ""
+        }.getOrDefault("")
+        return DesktopMediaStoreBridge { root }
+    }
+
+    override fun makeStreamMuxer(outputPath: String): StreamMuxer = DesktopStreamMuxer(outputPath)
+
+    override fun notifyAppFocus(gained: Boolean) {
+        desktopFocus = gained
+    }
+
+    override fun hasAppFocus(): Boolean = desktopFocus
+
+    override fun setRecordingActive(active: Boolean) {
+        if (active && !shutdownHookRegistered) {
+            shutdownHookRegistered = true
+            Runtime.getRuntime().addShutdownHook(Thread {
+                com.selkies.client.core.RecordingShutdownHook.autosave()
+            })
+        }
     }
 
     /** Windows dshow 设备枚举：解析 ffmpeg -list_devices 输出（无 ffmpeg 时回退常见默认名） */
@@ -469,15 +570,23 @@ private object AwtClipboardBridge : ClipboardBridge {
 
     override fun setListener(listener: (() -> Unit)?) {
         this.listener = listener
-        if (listener != null) {
+        if (listener != null) ensurePollThread()
+    }
+
+    @Volatile private var pollThreadStarted = false
+    private fun ensurePollThread() {
+        if (pollThreadStarted) return
+        synchronized(this) {
+            if (pollThreadStarted) return
+            pollThreadStarted = true
             Thread {
                 var last = getText()
-                while (this.listener != null) {
+                while (true) {
                     Thread.sleep(500)
                     val cur = runCatching { getText() }.getOrNull()
                     if (cur != last) {
                         last = cur
-                        this.listener?.invoke()
+                        listener?.invoke()
                     }
                 }
             }.apply { isDaemon = true; name = "clip-poll" }.start()

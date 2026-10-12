@@ -186,6 +186,72 @@ class FilesClient(private val session: SelkiesSession) {
         transfers.value = transfers.value + task
     }
 
+    /**
+     * 下载到媒体库分类目录（v2.5.0）：
+     * - Android: MediaStore Download/Selkies（无需存储权限）
+     * - 桌面: ~/Selkies/Downloads
+     * - 文件名自动带时间戳（不覆盖）+ 完成后触发保存引导弹窗（打开/所在文件夹/复制路径）
+     */
+    fun downloadToMedia(remotePath: String, displayName: String) {
+        val task = TransferTask(
+            id = UUID.randomUUID().toString(),
+            fileName = displayName,
+            filePath = remotePath,
+            totalBytes = 0,
+            upload = false
+        )
+        addTask(task)
+        scope.launch {
+            try {
+                task.status = "running"
+                updateTask(task)
+                val ts = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
+                    .format(java.util.Date())
+                val dot = displayName.lastIndexOf('.')
+                val autoName = if (dot > 0) {
+                    "${displayName.substring(0, dot)}_$ts${displayName.substring(dot)}"
+                } else "${displayName}_$ts"
+                val handle = session.platform.mediaStore().openDownloadStream(autoName)
+                if (handle == null) {
+                    task.status = "error"
+                    task.message = "存储不可用（无法创建下载文件）"
+                    updateTask(task)
+                    return@launch
+                }
+                val (code, written) = session.connection.apiDownloadStream(
+                    "/api/files/" + remotePath.trimStart('/')
+                ) { buf, n, total ->
+                    handle.write(buf, 0, n)
+                    task.sentBytes += n
+                    if (task.totalBytes == 0L && total > 0) task.totalBytes = total
+                    updateTask(task)
+                }
+                handle.close()
+                if (code != 200) {
+                    task.status = "error"
+                    task.message = "下载失败：HTTP $code"
+                } else {
+                    task.status = "done"
+                    task.sentBytes = written
+                    task.totalBytes = written
+                    task.message = handle.path
+                    // 保存引导（打开/所在文件夹/复制路径）
+                    if (session.settings().recordingNotifyOnSave) {
+                        session.savedMediaEvent.value = com.selkies.client.model.SavedMediaEvent(
+                            "download", handle.path, autoName,
+                            detail = String.format(java.util.Locale.US, "%.1f MB", written / 1048576.0)
+                        )
+                    }
+                }
+                updateTask(task)
+            } catch (e: Exception) {
+                task.status = "error"
+                task.message = e.message ?: e.toString()
+                updateTask(task)
+            }
+        }
+    }
+
     private fun updateTask(task: TransferTask) {
         transfers.value = transfers.value.map { if (it.id == task.id) task.copy() else it }
     }

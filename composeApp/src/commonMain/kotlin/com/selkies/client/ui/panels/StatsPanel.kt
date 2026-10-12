@@ -2,6 +2,7 @@ package com.selkies.client.ui.panels
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -9,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -37,6 +39,11 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerInputChange
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
@@ -46,7 +53,9 @@ import com.selkies.client.core.SelkiesSession
 import kotlin.math.max
 
 /**
- * 统计面板 v2.4.0：连接详情 + 实时图表（FPS 双序列/带宽/延迟）+ 服务器管线 + 主机资源 + 分辨率
+ * 统计面板 v2.5.0：对齐官方 Sidebar StreamStats 全集——
+ * 连接详情 + 四行状态 + 趋势图（FPS 双序列/带宽/RTT/解码/上屏，触摸十字线取值）+
+ * 12 项官方 tile + 主机资源 + **上行/下行连接统计** + **客户端统计** + 分辨率
  */
 @Composable
 fun StatsPanel(session: SelkiesSession) {
@@ -92,7 +101,7 @@ fun StatsPanel(session: SelkiesSession) {
         }
 
         SectionCard("帧率（本端呈现 / 服务器编码）") {
-            LineChart(
+            InteractiveLineChart(
                 series = listOf(
                     ChartSeries("本端", stats.fpsHistory, Color(0xFF4ADE80)),
                     ChartSeries("服务器", stats.encodedFpsHistory, Color(0xFF60A5FA))
@@ -100,19 +109,16 @@ fun StatsPanel(session: SelkiesSession) {
                 maxValue = max(
                     max(session.server.framerate.toDouble(), stats.fps.toDouble()),
                     stats.encodedFps
-                ).coerceAtLeast(10.0)
+                ).coerceAtLeast(10.0),
+                unit = "fps"
             )
-            Row(Modifier.fillMaxWidth().padding(top = 4.dp)) {
-                ChartLegend("本端 ${stats.fps}", Color(0xFF4ADE80))
-                Spacer(Modifier.width(16.dp))
-                ChartLegend("服务器 ${stats.encodedFps.toInt()}", Color(0xFF60A5FA))
-            }
         }
 
         SectionCard("视频带宽") {
-            LineChart(
+            InteractiveLineChart(
                 series = listOf(ChartSeries("Mbps", stats.mbpsHistory, Color(0xFFF59E0B))),
-                maxValue = max(stats.bitrateMbps, stats.peakMbps).coerceAtLeast(1.0)
+                maxValue = max(stats.bitrateMbps, stats.peakMbps).coerceAtLeast(1.0),
+                unit = "Mbps"
             )
             Text(
                 String.format(java.util.Locale.US, "当前 %.1f Mbps · 峰值 %.1f Mbps", stats.bitrateMbps, stats.peakMbps) +
@@ -125,9 +131,10 @@ fun StatsPanel(session: SelkiesSession) {
         }
 
         SectionCard("往返延迟（RTT）") {
-            LineChart(
+            InteractiveLineChart(
                 series = listOf(ChartSeries("ms", stats.rttHistory, Color(0xFFEF4444))),
-                maxValue = stats.latencyMs.toDouble().coerceAtLeast(20.0)
+                maxValue = stats.latencyMs.toDouble().coerceAtLeast(20.0),
+                unit = "ms"
             )
             Text(
                 if (stats.latencyMs > 0) "当前 ${stats.latencyMs} ms" else "等待服务器统计…",
@@ -137,17 +144,38 @@ fun StatsPanel(session: SelkiesSession) {
             )
         }
 
-        SectionCard("服务器管线") {
+        SectionCard("客户端解码 / 上屏耗时") {
+            InteractiveLineChart(
+                series = listOf(
+                    ChartSeries("解码 ms", stats.decodeHistory, Color(0xFF22D3EE)),
+                    ChartSeries("上屏 ms", stats.presentHistory, Color(0xFFA78BFA))
+                ),
+                maxValue = max(stats.decodeMs, stats.presentMs).coerceAtLeast(10.0),
+                unit = "ms"
+            )
+        }
+
+        // 官方 12 项 tile（TRANSPORT_TILES.websockets 顺序）
+        SectionCard("管线指标（官方同款 tile）") {
             val tiles = listOf(
-                "编码 ms" to stats.encodeMs,
-                "管线 ms" to stats.pipelineMs,
-                "发送 ms" to stats.sendMs,
-                "最大帧 KB" to stats.frameMaxKb
+                "编码" to stats.encodeMs,
+                "管线" to stats.pipelineMs,
+                "发送" to stats.sendMs,
+                "解码" to stats.decodeMs,
+                "上屏" to stats.presentMs,
+                "音频缓冲" to stats.audioBufferMs.toDouble(),
+                "码率 Mbps" to stats.bitrateMbps,
+                "峰值 Mbps" to stats.peakMbps,
+                "已收 MB" to stats.receivedMb,
+                "丢帧" to stats.lostFrames.toDouble(),
+                "未上屏帧" to stats.framesNotShown.toDouble(),
+                "关键帧请求" to stats.keyframeRequests.toDouble()
             )
             LazyVerticalGrid(
                 columns = GridCells.Fixed(4),
-                modifier = Modifier.fillMaxWidth().height(64.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                modifier = Modifier.fillMaxWidth().height(140.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 items(tiles) { (label, v) ->
                     StatTile(label, if (v > 0) String.format(java.util.Locale.US, "%.1f", v) else "—")
@@ -160,6 +188,48 @@ fun StatsPanel(session: SelkiesSession) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
+        }
+
+        SectionCard("下行统计（服务器 → 本机）") {
+            StatRow("下行带宽", if (stats.mbpsClient > 0) String.format(java.util.Locale.US, "%.2f Mbps（含音频/控制）", stats.mbpsClient) else "—")
+            StatRow("累计接收", formatCount(stats.bytesReceived))
+            StatRow("视频帧", formatCount(stats.videoFrames))
+            StatRow("丢帧（LOST_FRAME）", if (stats.lostFrames > 0) "${stats.lostFrames}" else "0")
+            StatRow("未上屏帧", if (stats.framesNotShown > 0) "${stats.framesNotShown}" else "0")
+            StatRow("传输模式", "WebSocket 流（本客户端原生模式）")
+        }
+
+        SectionCard("上行统计（本机 → 服务器）") {
+            if (!stats.micActive && !stats.webcamActive) {
+                Text(
+                    "麦克风/摄像头未开启。开启后此处显示上行带宽与累计字节。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            StatRow(
+                "麦克风",
+                if (stats.micActive) "开启中 · ${String.format(java.util.Locale.US, "%.2f Mbps", stats.micUplinkMbps)}" else "关闭"
+            )
+            StatRow(
+                "摄像头",
+                if (stats.webcamActive) "开启中 · ${String.format(java.util.Locale.US, "%.2f Mbps", stats.webcamUplinkMbps)}" else "关闭"
+            )
+            StatRow("上行累计", if (stats.uplinkTotalBytes > 0) formatCount(stats.uplinkTotalBytes) else "—")
+            if (stats.uplinkHistory.isNotEmpty()) {
+                InteractiveLineChart(
+                    series = listOf(ChartSeries("上行 Mbps", stats.uplinkHistory, Color(0xFF34D399))),
+                    maxValue = stats.uplinkHistory.max().coerceAtLeast(0.5),
+                    unit = "Mbps"
+                )
+            }
+        }
+
+        SectionCard("客户端统计（本机解码器）") {
+            StatRow("解码器", "MediaCodec 硬解（H.264）/ FFmpeg")
+            StatRow("音频缓冲", if (stats.audioBufferMs > 0) "${stats.audioBufferMs} ms" else "—")
+            StatRow("解码耗时（EMA）", if (stats.decodeMs > 0) String.format(java.util.Locale.US, "%.1f ms", stats.decodeMs) else "—")
+            StatRow("上屏耗时（EMA）", if (stats.presentMs > 0) String.format(java.util.Locale.US, "%.1f ms", stats.presentMs) else "—")
         }
 
         SectionCard("远程主机资源") {
@@ -232,51 +302,115 @@ private fun StatRow(label: String, value: String) {
 
 data class ChartSeries(val label: String, val values: List<Double>, val color: Color)
 
-/** 折线图（官方 stream-stats 同款视觉：填充区 + 网格线） */
+/**
+ * 交互式折线图（官方 stream-graph 体验）：
+ * - 填充区 + 中线网格 + 当前值头部（多序列图例）
+ * - 手指/鼠标按住 → 十字线 + 该时刻各序列取值（官方 onPointerMove 同款）
+ * - 右下角最大刻度（graph-max 同款）
+ */
 @Composable
-private fun LineChart(series: List<ChartSeries>, maxValue: Double) {
-    Canvas(modifier = Modifier.fillMaxWidth().height(96.dp)) {
-        val w = size.width
-        val h = size.height
-        val pad = 4.dp.toPx()
-        // 网格
-        val gridColor = Color.Gray.copy(alpha = 0.2f)
-        for (i in 1..3) {
-            val y = pad + (h - 2 * pad) * i / 4
-            drawLine(gridColor, Offset(pad, y), Offset(w - pad, y), strokeWidth = 1f)
-        }
-        val maxV = maxValue.toFloat().coerceAtLeast(0.1f)
-        for (s in series) {
-            if (s.values.size < 2) continue
-            val step = (w - 2 * pad) / (s.values.size - 1).coerceAtLeast(1).toFloat()
-            val path = Path()
-            val fill = Path()
-            s.values.forEachIndexed { i, v ->
-                val x = pad + step * i
-                val y = (h - pad) - ((v / maxV).toFloat().coerceIn(0f, 1f) * (h - 2 * pad))
-                if (i == 0) {
-                    path.moveTo(x, y); fill.moveTo(x, h - pad); fill.lineTo(x, y)
-                } else {
-                    path.lineTo(x, y); fill.lineTo(x, y)
+private fun InteractiveLineChart(series: List<ChartSeries>, maxValue: Double, unit: String) {
+    var hoverIndex by remember { mutableStateOf<Int?>(null) }
+    val count = series.firstOrNull()?.values?.size ?: 0
+
+    Column(Modifier.fillMaxWidth()) {
+        // 头部：图例 + 悬停时刻取值
+        Row(
+            Modifier.fillMaxWidth().padding(bottom = 2.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            series.forEachIndexed { i, s ->
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(end = 12.dp)
+                ) {
+                    Canvas(modifier = Modifier.size(8.dp)) { drawCircle(s.color) }
+                    Spacer(Modifier.width(3.dp))
+                    val v = if (hoverIndex != null && hoverIndex!! < s.values.size) s.values[hoverIndex!!]
+                    else s.values.lastOrNull() ?: 0.0
+                    Text(
+                        "${s.label} ${String.format(java.util.Locale.US, "%.1f", v)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (hoverIndex != null && series.size > 1 && i == 0) s.color.copy(alpha = 0.5f) else s.color,
+                        fontWeight = androidx.compose.ui.text.font.FontWeight.Medium
+                    )
                 }
             }
-            fill.lineTo(pad + step * (s.values.size - 1), h - pad)
-            fill.close()
-            drawPath(fill, s.color.copy(alpha = 0.12f))
-            drawPath(path, s.color, style = Stroke(width = 2.5f))
         }
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(96.dp)
+        ) {
+            Canvas(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInput(count) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(pass = PointerEventPass.Initial)
+                            hoverIndex = idxForPos(down.position.x, size.width.toFloat(), count)
+                            while (true) {
+                                val event = awaitPointerEvent(pass = PointerEventPass.Initial)
+                                val change = event.changes.firstOrNull() ?: break
+                                if (!change.pressed) break
+                                hoverIndex = idxForPos(change.position.x, size.width.toFloat(), count)
+                            }
+                            hoverIndex = null
+                        }
+                    }
+            ) {
+                val w = size.width
+                val h = size.height
+                val pad = 4.dp.toPx()
+                val gridColor = Color.Gray.copy(alpha = 0.2f)
+                // 中线（官方 stream-graph-grid）
+                drawLine(gridColor, Offset(pad, h / 2), Offset(w - pad, h / 2), strokeWidth = 1f)
+                val maxV = maxValue.toFloat().coerceAtLeast(0.1f)
+                for (s in series) {
+                    if (s.values.size < 2) continue
+                    val step = (w - 2 * pad) / (s.values.size - 1).coerceAtLeast(1).toFloat()
+                    val path = Path()
+                    val fill = Path()
+                    s.values.forEachIndexed { i, v ->
+                        val x = pad + step * i
+                        val y = (h - pad) - ((v / maxV).toFloat().coerceIn(0f, 1f) * (h - 2 * pad))
+                        if (i == 0) {
+                            path.moveTo(x, y); fill.moveTo(x, h - pad); fill.lineTo(x, y)
+                        } else {
+                            path.lineTo(x, y); fill.lineTo(x, y)
+                        }
+                    }
+                    fill.lineTo(pad + step * (s.values.size - 1), h - pad)
+                    fill.close()
+                    drawPath(fill, s.color.copy(alpha = 0.12f))
+                    drawPath(path, s.color, style = Stroke(width = 2.5f))
+                }
+                // 十字线（官方 stream-graph-cross）
+                val hi = hoverIndex
+                if (hi != null && hi < count && count > 1) {
+                    val step = (w - 2 * pad) / (count - 1).toFloat()
+                    val x = pad + step * hi
+                    drawLine(
+                        Color.White.copy(alpha = 0.6f),
+                        Offset(x, 0f), Offset(x, h),
+                        strokeWidth = 1.5f
+                    )
+                }
+            }
+        }
+        Text(
+            "max ${String.format(java.util.Locale.US, "%.0f", maxValue)} $unit（按住图表查看历史值）",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.align(Alignment.End)
+        )
     }
 }
 
-@Composable
-private fun ChartLegend(text: String, color: Color) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Canvas(modifier = Modifier.width(10.dp).height(10.dp)) {
-            drawCircle(color)
-        }
-        Spacer(Modifier.width(4.dp))
-        Text(text, style = MaterialTheme.typography.labelSmall)
-    }
+private fun idxForPos(x: Float, width: Float, count: Int): Int {
+    if (count <= 1 || width <= 0f) return 0
+    val step = width / (count - 1)
+    return ((x / step).toInt()).coerceIn(0, count - 1)
 }
 
 @Composable

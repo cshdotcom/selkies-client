@@ -73,7 +73,12 @@ class AndroidMicCapture : MicCapture {
         onOpusFrame: (ByteArray) -> Unit,
         onError: (String) -> Unit
     ) {
-        if (running) return
+        // ⚠️【闪退修复】防重入：权限回调/快速双击/服务器 CAPTURE_DEMAND 并发触发 start
+        //    时旧版会开两条采集线程（MediaCodec 竞争 → 部分设备 native crash）。
+        synchronized(this) {
+            if (running || starting) return
+            starting = true
+        }
         this.onOpus = onOpusFrame
         this.onError = onError
         this.wantedDevices = deviceIds
@@ -83,25 +88,67 @@ class AndroidMicCapture : MicCapture {
             ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED
         ) {
             AndroidPlatform.ensurePermissions(listOf(Manifest.permission.RECORD_AUDIO)) { granted ->
-                if (granted) start(deviceIds, onOpusFrame, onError) else onError("未授予麦克风权限")
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    synchronized(this) { starting = false }
+                    if (granted) start(deviceIds, onOpusFrame, onError)
+                    else onError("未授予麦克风权限")
+                }
             }
             return
         }
 
-        running = true
-        thread = Thread(this::loop, "selkies-mic").apply { isDaemon = true; start() }
+        synchronized(this) {
+            starting = false
+            if (running) return
+            running = true
+        }
+        // ⚠️ Thread 启动本身也可能抛（OOM/平台限制）——包一层防闪退
+        thread = runCatching {
+            Thread(this::loopSafe, "selkies-mic").apply { isDaemon = true; start() }
+        }.getOrNull().also {
+            if (it == null) {
+                running = false
+                postError("无法启动采集线程")
+            }
+        }
+    }
+
+    @Volatile
+    private var starting = false
+
+    private fun postError(msg: String) {
+        val cb = onError ?: return
+        android.os.Handler(android.os.Looper.getMainLooper()).post { runCatching { cb(msg) } }
     }
 
     override fun stop() {
         running = false
         thread?.interrupt()
+        // 等待采集线程退出（最多 800ms），避免快速 stop→start 时双线程竞争 AudioRecord
+        val t = thread
         thread = null
+        runCatching { t?.join(800) }
     }
 
     private fun findAudioDeviceInfo(id: String): AudioDeviceInfo? {
         val ctx = runCatching { AndroidPlatform.appCtx() }.getOrNull() ?: return null
         val am = ctx.getSystemService(android.content.Context.AUDIO_SERVICE) as? AudioManager ?: return null
         return am.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.address == id || (id.startsWith("mic-") && it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC) }
+    }
+
+    /** 【闪退修复】loop 外再包一层 Throwable（MediaCodec native 层可抛 Error 而非 Exception） */
+    private fun loopSafe() {
+        runCatching {
+            loop()
+        }.onFailure { t ->
+            if (running) {
+                postError(
+                    if (t.message?.contains("opus", true) == true || t is java.lang.IllegalArgumentException)
+                        "此设备不支持 Opus 编码（需 Android 10+）" else (t.message ?: t.javaClass.simpleName)
+                )
+            }
+            running = false
+        }
     }
 
     @SuppressLint("MissingPermission")

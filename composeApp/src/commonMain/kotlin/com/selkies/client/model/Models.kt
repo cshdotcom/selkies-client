@@ -135,10 +135,20 @@ data class AppSettings(
     // 视频
     var requestKeyframeOnStall: Boolean = true,
     var showFpsOverlay: Boolean = false,
-    // 音频
+    // 音频（应用内独立音量，不依赖系统）
     var micEnabled: Boolean = false,
     var webcamEnabled: Boolean = false,
-    var speakerVolume: Float = 1.0f
+    var speakerVolume: Float = 1.0f,
+    var audioMuted: Boolean = false,
+    // 手柄
+    var gamepadRumble: Boolean = true,
+    // 截图/录屏/下载 存储位置（空 = 平台默认：Android 公共 Pictures/Videos/Download 下的 Selkies 子目录；桌面 ~/Pictures/Selkies 等）
+    var storageRoot: String = "",
+    // 录屏
+    var recordingIncludeAudio: Boolean = true,
+    var recordingNotifyOnSave: Boolean = true,
+    // 保持屏幕常亮（会话中）
+    var keepScreenOn: Boolean = true
 )
 
 /**
@@ -195,6 +205,32 @@ data class RemoteFileEntry(
     val mtime: String
 )
 
+/** 保存的媒体文件（截图/录屏/下载）——SavedMediaPanel 浏览 */
+data class SavedMediaEntry(
+    val path: String,
+    val name: String,
+    val kind: String,        // screenshot / recording / download
+    val sizeBytes: Long,
+    val modifiedAt: Long
+) {
+    val sizeText: String
+        get() = when {
+            sizeBytes >= 1L shl 30 -> String.format(java.util.Locale.US, "%.2f GB", sizeBytes / 1073741824.0)
+            sizeBytes >= 1L shl 20 -> String.format(java.util.Locale.US, "%.1f MB", sizeBytes / 1048576.0)
+            sizeBytes >= 1L shl 10 -> String.format(java.util.Locale.US, "%.1f KB", sizeBytes / 1024.0)
+            else -> "$sizeBytes B"
+        }
+}
+
+/** 截图/录屏/下载保存完成事件（UI 弹「打开/打开文件夹/复制路径」引导） */
+data class SavedMediaEvent(
+    val kind: String,          // screenshot / recording / download
+    val path: String?,
+    val name: String,
+    val detail: String = "",   // 帧数/大小等信息
+    val error: String? = null
+)
+
 /** 打印任务条目（服务器 print_document 通知 → 下载校验 → 系统打印 → 状态跟踪） */
 data class PrintJobEntry(
     val name: String,
@@ -247,13 +283,36 @@ data class StatsInfo(
     var gpuPercent: Double = 0.0,
     var gpuMemUsed: Long = 0,
     var gpuMemTotal: Long = 0,
+    // 客户端统计（本地测量，对齐官方 websockets tile 集）
+    var decodeMs: Double = 0.0,           // 解码耗时
+    var presentMs: Double = 0.0,          // 到达→上屏
+    var framesNotShown: Long = 0,         // 解码但未上屏（队列溢出丢弃）
+    var lostFrames: Long = 0,             // LOST_FRAME 上报计数
+    var keyframeRequests: Long = 0,       // REQUEST_KEYFRAME 发送计数
+    var audioBufferMs: Int = 0,           // 音频缓冲（播放器报告）
+    var receivedMb: Double = 0.0,         // 累计接收 MB
+    var mbpsClient: Double = 0.0,         // 客户端侧带宽（含音频/控制，比 video_mbps 更全）
+    // 上行（麦克风/摄像头）统计
+    var micActive: Boolean = false,
+    var micBytesSent: Long = 0,
+    var micUplinkMbps: Double = 0.0,
+    var webcamActive: Boolean = false,
+    var webcamBytesSent: Long = 0,
+    var webcamUplinkMbps: Double = 0.0,
+    var uplinkTotalBytes: Long = 0,
     // 历史采样（每秒，最多 120 点，供图表）
     val fpsHistory: ArrayDeque<Double> = ArrayDeque(),
     val encodedFpsHistory: ArrayDeque<Double> = ArrayDeque(),
     val mbpsHistory: ArrayDeque<Double> = ArrayDeque(),
-    val rttHistory: ArrayDeque<Double> = ArrayDeque()
+    val rttHistory: ArrayDeque<Double> = ArrayDeque(),
+    val decodeHistory: ArrayDeque<Double> = ArrayDeque(),
+    val presentHistory: ArrayDeque<Double> = ArrayDeque(),
+    val uplinkHistory: ArrayDeque<Double> = ArrayDeque()
 ) {
-    fun pushSample(clientFps: Double, encFps: Double, mbps: Double, rtt: Double) {
+    fun pushSample(
+        clientFps: Double, encFps: Double, mbps: Double, rtt: Double,
+        decodeMs: Double = 0.0, presentMs: Double = 0.0, uplinkMbps: Double = 0.0
+    ) {
         fun push(q: ArrayDeque<Double>, v: Double) {
             if (v <= 0.0) return
             q.addLast(v)
@@ -263,6 +322,9 @@ data class StatsInfo(
         push(encodedFpsHistory, encFps)
         push(mbpsHistory, mbps)
         push(rttHistory, rtt)
+        push(decodeHistory, decodeMs)
+        push(presentHistory, presentMs)
+        push(uplinkHistory, uplinkMbps)
     }
 }
 

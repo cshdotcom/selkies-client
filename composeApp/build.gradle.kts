@@ -51,6 +51,14 @@ kotlin {
                 implementation("org.bytedeco:javacv:1.5.12")
                 implementation("org.bytedeco:ffmpeg:7.1.1-1.5.12")
                 implementation("org.bytedeco:ffmpeg:7.1.1-1.5.12:linux-x86_64")
+                // 桌面手柄：LWJGL GLFW gamepad（Windows XInput/macOS/Linux 全平台）
+                val lwjgl = "3.3.4"
+                implementation("org.lwjgl:lwjgl:$lwjgl")
+                implementation("org.lwjgl:lwjgl-glfw:$lwjgl")
+                listOf("natives-windows", "natives-windows-arm64", "natives-linux", "natives-linux-arm64", "natives-macos", "natives-macos-arm64").forEach { n ->
+                    runtimeOnly("org.lwjgl:lwjgl:$lwjgl:$n")
+                    runtimeOnly("org.lwjgl:lwjgl-glfw:$lwjgl:$n")
+                }
             }
         }
     }
@@ -84,8 +92,8 @@ android {
         applicationId = "com.selkies.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 20400
-        versionName = "2.4.0"
+        versionCode = 20500
+        versionName = "2.5.0"
         ndkVersion = ""
     }
     signingConfigs {

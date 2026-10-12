@@ -4,6 +4,7 @@ import com.selkies.client.model.AppSettings
 import com.selkies.client.model.CursorShape
 import com.selkies.client.model.HardwareDevice
 import com.selkies.client.model.PrintJobEntry
+import com.selkies.client.model.SavedMediaEvent
 import com.selkies.client.model.ServerEntry
 import com.selkies.client.model.StatsInfo
 import com.selkies.client.platform.PlatformServices
@@ -85,6 +86,19 @@ class SelkiesSession(
     val micActive = MutableStateFlow(false)
     val webcamActive = MutableStateFlow(false)
 
+    /** 录屏引擎（WS 流直采，无系统录屏权限） */
+    val recorder = StreamRecorder { path -> platform.makeStreamMuxer(path) }
+
+    /** 截图/录屏保存结果通知（路径 + 帧数 + 错误；UI 弹保存引导） */
+    val savedMediaEvent = MutableStateFlow<SavedMediaEvent?>(null)
+
+    /** 应用内音量（0..1，独立于系统音量）与静音 */
+    val appVolume = MutableStateFlow(-1f)   // -1 = 未初始化（从 settings 读）
+    val appMuted = MutableStateFlow(false)
+
+    /** 手柄心跳定时器（js,h 保活） */
+    private var gamepadHeartbeatJob: Job? = null
+
     var videoSink: VideoSink? = null
         set(value) {
             field?.let { old -> if (value !== old) old.close() }
@@ -127,6 +141,12 @@ class SelkiesSession(
     private var statsSampler: Job? = null
     private var localFrameCount = 0L
     private var localFrameWindowStart = 0L
+    /** 上行字节窗口（统计：mic/webcam Mbps） */
+    private var uplinkBytesWindow = 0L
+    private var uplinkWindowStart = 0L
+    /** 剪贴板：待应用内容（Android 后台写剪贴板受限 → 回焦点时补写） */
+    private var pendingClipboardWrite: String? = null
+    private var pendingClipboardImage: ByteArray? = null
     /** 帧停顿看门狗：CONNECTED 且已请求视频但超时无新帧 → 自动 REQUEST_KEYFRAME */
     private var stallWatchdog: Job? = null
     private var lastKeyframeRequestAt = 0L
@@ -192,7 +212,12 @@ class SelkiesSession(
         stallWatchdog?.cancel()
         statsSampler?.cancel()
         keyHeartbeatJob?.cancel()
+        stopGamepadHeartbeat()
         heldKeys.clear()
+        // 录屏中退出会话 → 自动保存（用户要求：退出默认视为保存）
+        if (recorder.state == StreamRecorder.State.RECORDING) {
+            recorder.stopAndSave("session-end")
+        }
         runCatching { micCapture.stop() }
         runCatching { webcamCapture.stop() }
         runCatching { audioPlayer.stop() }
@@ -561,11 +586,19 @@ class SelkiesSession(
             val action = (obj["action"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: return
             when {
                 action.startsWith("rumble,") -> {
+                    // 官方格式：rumble,slot,strong,weak,ms —— 手柄马达振动（无手柄时手机振动兜底）
                     val parts = action.split(",")
                     if (parts.size >= 5) {
-                        val strong = parts[2].toDoubleOrNull() ?: 0.0
-                        val ms = parts[4].toLongOrNull() ?: 200
-                        if (strong > 0) platform.vibrate(ms)
+                        val slot = parts[1].toIntOrNull() ?: 0
+                        val strong = parts[2].toFloatOrNull() ?: 0f
+                        val weak = parts[3].toFloatOrNull() ?: 0f
+                        val ms = parts[4].toIntOrNull() ?: 200
+                        if (strong > 0 || weak > 0) {
+                            if (settings().gamepadRumble) {
+                                platform.rumbleGamepad(slot, strong, weak, ms)
+                                if (platform.isTouchDevice()) platform.vibrate(ms.toLong())
+                            }
+                        }
                     }
                 }
                 action.startsWith("command_error,") -> { /* 命令错误提示 */ }
@@ -729,13 +762,22 @@ class SelkiesSession(
                     val frames = Protocol.parseAudioFrames(data, length, audioParseState)
                     for ((opus, quiet) in frames) {
                         if (quiet) audioPlayer.onQuiet()
-                        if (opus.isNotEmpty()) audioPlayer.playOpus(opus)
+                        if (opus.isNotEmpty()) {
+                            audioPlayer.playOpus(opus)
+                            // 录屏：录主 Opus 载荷
+                            if (recorder.state == StreamRecorder.State.RECORDING) {
+                                recorder.onAudioFrame(opus)
+                            }
+                        }
                     }
                 }
                 Protocol.FRAME_JPEG -> {
                     Protocol.parseJpegStripeHeader(data, length)?.let { (frameId, stripeY, off) ->
                         noteVideoChunk(frameId)
                         videoSink?.onJpegStripe(frameId, stripeY, data, off, length)
+                        if (recorder.state == StreamRecorder.State.RECORDING) {
+                            recorder.onJpegStripe(frameId, stripeY, data, off, length)
+                        }
                     }
                 }
                 Protocol.FRAME_VIDEO -> {
@@ -753,6 +795,9 @@ class SelkiesSession(
                         }
                         stats.value.videoFrames++
                         videoSink?.onVideoFrame(header, data, off, length)
+                        if (recorder.state == StreamRecorder.State.RECORDING) {
+                            recorder.onVideoFrame(header, data, off, length)
+                        }
                     }
                 }
                 Protocol.FRAME_GZ -> {
@@ -774,6 +819,7 @@ class SelkiesSession(
                 System.currentTimeMillis() - lastLostFrameReportAt > 1000
             ) {
                 lastLostFrameReportAt = System.currentTimeMillis()
+                stats.value.lostFrames += (frameId - lastReceivedFrameId - 1).coerceAtLeast(1)
                 post { connection.sendText("LOST_FRAME $frameId") }
             }
             lastReceivedFrameId = frameId
@@ -898,15 +944,47 @@ class SelkiesSession(
         startStatsSamplerIfNeeded()
     }
 
-    /** 每秒采样：本地 fps + 服务器统计 → 历史序列（最多 120 点，供图表）；每 5 秒上报 _f/_l */
+    /** 每秒采样：本地 fps/decode/present/上行带宽 + 服务器统计 → 历史序列（最多 120 点，供图表）；每 5 秒上报 _f/_l */
     private fun startStatsSamplerIfNeeded() {
         if (statsSampler?.isActive == true) return
+        uplinkWindowStart = System.currentTimeMillis()
         statsSampler = scope.launch {
             var tick = 0
+            var lastTotalBytes = 0L
+            var lastTotalAt = System.currentTimeMillis()
             while (isActive && !userClosed) {
                 delay(1000)
                 val s = stats.value
-                s.pushSample(s.fps.toDouble(), s.encodedFps, s.bitrateMbps, s.latencyMs.toDouble())
+                // 客户端侧带宽（含音频/控制，全部 WS 字节）
+                val now = System.currentTimeMillis()
+                val dt = (now - lastTotalAt).coerceAtLeast(1)
+                s.mbpsClient = (s.bytesReceived - lastTotalBytes) * 8.0 / 1e6 / (dt / 1000.0)
+                lastTotalBytes = s.bytesReceived
+                lastTotalAt = now
+                s.receivedMb = s.bytesReceived / 1e6
+                // 客户端解码/上屏/丢帧（来自 VideoSink EMA）
+                videoSink?.let { sink ->
+                    s.decodeMs = sink.avgDecodeMs
+                    s.presentMs = sink.avgPresentMs
+                    s.framesNotShown = sink.framesDropped
+                }
+                s.audioBufferMs = audioPlayer.bufferLevelMs
+                // 上行带宽
+                val upDt = (now - uplinkWindowStart).coerceAtLeast(1)
+                val upMbps = uplinkBytesWindow * 8.0 / 1e6 / (upDt / 1000.0)
+                uplinkBytesWindow = 0
+                uplinkWindowStart = now
+                s.micActive = micActive.value
+                s.webcamActive = webcamActive.value
+                s.micUplinkMbps = if (micActive.value) upMbps else 0.0
+                s.webcamUplinkMbps = if (webcamActive.value) upMbps else 0.0
+                s.pushSample(
+                    s.fps.toDouble(), s.encodedFps,
+                    if (s.bitrateMbps > 0) s.bitrateMbps else s.mbpsClient,
+                    s.latencyMs.toDouble(),
+                    s.decodeMs, s.presentMs,
+                    if (upMbps > 0) upMbps else 0.0
+                )
                 stats.value = s
                 if (++tick % 5 == 0) {
                     runCatching {
@@ -1026,6 +1104,7 @@ class SelkiesSession(
         val now = System.currentTimeMillis()
         if (now - lastKeyframeRequestAt > 3000) {
             lastKeyframeRequestAt = now
+            stats.value.keyframeRequests++
             connection.sendText("REQUEST_KEYFRAME")
         } else if (now - lastKeyframeRequestAt < 0) {
             lastKeyframeRequestAt = now
@@ -1035,6 +1114,7 @@ class SelkiesSession(
     /** Surface 重建/解码器重建后的强制关键帧（绕过限流） */
     fun forceKeyframe() = post {
         lastKeyframeRequestAt = System.currentTimeMillis()
+        stats.value.keyframeRequests++
         connection.sendText("REQUEST_KEYFRAME")
     }
 
@@ -1165,7 +1245,13 @@ class SelkiesSession(
                 onClipboardFromRemote(text, mime)
                 if (!isReply && settings().clipboardAutoReceive && text.isNotEmpty()) {
                     applyRemoteClipboardLocally {
-                        platform.clipboard().setText(text)
+                        // 后台（无焦点）时 Android 禁止写剪贴板 → 挂起，回焦点补写
+                        if (!hasWindowFocus()) {
+                            pendingClipboardWrite = text
+                            pendingClipboardImage = null
+                        } else {
+                            platform.clipboard().setText(text)
+                        }
                     }
                 }
             } else {
@@ -1173,13 +1259,22 @@ class SelkiesSession(
                 if (!isReply && settings().clipboardAutoReceive && settings().clipboardBinaryEnabled) {
                     if (mime == "image/png") {
                         applyRemoteClipboardLocally {
-                            platform.clipboard().setImagePng(bytes)
+                            if (!hasWindowFocus()) {
+                                pendingClipboardImage = bytes
+                                pendingClipboardWrite = null
+                            } else {
+                                platform.clipboard().setImagePng(bytes)
+                            }
                         }
                     }
                 }
             }
         }
     }
+
+    /** 窗口焦点（Android 后台剪贴板限制判定；由 UI 层经 onAppFocusChanged 驱动维护） */
+    @Volatile
+    internal var hasWindowFocus: () -> Boolean = { true }
 
     /** 应用远程剪贴板到本地（抑制回声） */
     private fun applyRemoteClipboardLocally(apply: () -> Unit) {
@@ -1254,6 +1349,7 @@ class SelkiesSession(
         micCapture.start(
             deviceIds = selectedMicIds.value,
             onOpusFrame = { opus ->
+                noteUplinkBytes(opus.size + 1)
                 ioScope.launch {
                     val frame = ByteArray(opus.size + 1)
                     frame[0] = Protocol.FRAME_MIC
@@ -1283,6 +1379,7 @@ class SelkiesSession(
             targetW = server.webcamWidth,
             targetH = server.webcamHeight,
             onFrame = { codecId, keyframe, data ->
+                noteUplinkBytes(data.size + 3)
                 ioScope.launch {
                     val frame = ByteArray(data.size + 3)
                     frame[0] = Protocol.FRAME_WEBCAM
@@ -1308,6 +1405,145 @@ class SelkiesSession(
     /** 请求执行远程命令 */
     fun sendCommand(command: String) = post {
         connection.sendText("cmd,$command")
+    }
+
+    // =====================================================================
+    // v2.5.0：应用内音量 / 截图 / 录屏 / 剪贴板焦点 / 手柄保活
+    // =====================================================================
+
+    /** 初始化音量状态（SessionScreen 连接后调用一次） */
+    fun initAudioVolume() {
+        val s = settings()
+        if (appVolume.value < 0) appVolume.value = s.speakerVolume
+        appMuted.value = s.audioMuted
+        applyVolumeNow()
+    }
+
+    /** 应用内音量（0..1，感知曲线；独立于系统音量——AudioTrack.setVolume/PCM 增益） */
+    fun setAppVolume(v: Float) {
+        appVolume.value = v.coerceIn(0f, 1f)
+        settingsProvider().speakerVolume = v.coerceIn(0f, 1f)
+        applyVolumeNow()
+    }
+
+    fun setAppMuted(muted: Boolean) {
+        appMuted.value = muted
+        settingsProvider().audioMuted = muted
+        applyVolumeNow()
+    }
+
+    private fun applyVolumeNow() {
+        // 感知（平方）曲线：小音量段调节更细腻
+        val v = if (appMuted.value) 0f else {
+            val base = appVolume.value.coerceIn(0f, 1f)
+            base * base
+        }
+        runCatching { audioPlayer.setVolume(v) }
+    }
+
+    /** 截图当前视频帧（平台直取解码 Surface/位图；无系统截图权限） */
+    fun captureScreenshot() {
+        platform.captureVideoFrame { png ->
+            if (png == null || png.isEmpty()) {
+                savedMediaEvent.value = SavedMediaEvent("screenshot", null, "", error = "暂无可截取的视频帧")
+                return@captureVideoFrame
+            }
+            val name = StreamRecorder.autoScreenshotName()
+            val path = platform.mediaStore().saveScreenshot(png, name)
+            savedMediaEvent.value = if (path != null) {
+                SavedMediaEvent("screenshot", path, name, detail = "${png.size / 1024} KB")
+            } else {
+                SavedMediaEvent("screenshot", null, name, error = "保存失败（存储不可用）")
+            }
+        }
+    }
+
+    /** 开始录屏（WS 流直采；Android 前台服务保活→后台持续录） */
+    fun startRecording(): Boolean {
+        if (recorder.state == StreamRecorder.State.RECORDING) return false
+        recorder.includeAudio = settings().recordingIncludeAudio && server.audioEnabled
+        val name = StreamRecorder.autoName("")
+        val target = platform.mediaStore().createRecordingFile(name) ?: return false
+        val ok = recorder.start(target)
+        if (ok) {
+            RecordingShutdownHook.register(recorder)
+            platform.setRecordingActive(true)
+            recorder.onSaved = { path, frames, error ->
+                platform.setRecordingActive(false)
+                RecordingShutdownHook.register(null)
+                savedMediaEvent.value = SavedMediaEvent(
+                    "recording", path,
+                    path?.substringAfterLast('/') ?: "",
+                    detail = "$frames 帧 · ${recorder.durationSec().coerceAtLeast(0)}s",
+                    error = error
+                )
+            }
+        }
+        return ok
+    }
+
+    /** 停止录屏并保存（幂等） */
+    fun stopRecording() {
+        if (recorder.state == StreamRecorder.State.RECORDING) {
+            recorder.stopAndSave("manual")
+        }
+    }
+
+    /** 应用焦点变化：Android 后台剪贴板读写受限 → 回前台时追赶 */
+    fun onAppFocusChanged(gained: Boolean) {
+        platform.notifyAppFocus(gained)
+        if (!gained) return
+        // 1) 远程→本地：补写挂起的剪贴板
+        val pendingText = pendingClipboardWrite
+        val pendingImg = pendingClipboardImage
+        if (pendingText != null || pendingImg != null) {
+            pendingClipboardWrite = null
+            pendingClipboardImage = null
+            ioScope.launch {
+                applyRemoteClipboardLocally {
+                    if (pendingText != null) platform.clipboard().setText(pendingText)
+                    else if (pendingImg != null) platform.clipboard().setImagePng(pendingImg)
+                }
+            }
+        }
+        // 2) 本地→远程：回前台重读剪贴板（后台期间复制的内容此时才可读）
+        ioScope.launch {
+            delay(300) // 等 ClipboardManager 就绪
+            runCatching {
+                val t = platform.clipboard().getText()
+                if (t != null && t != lastRemoteClipboardText) {
+                    // 仅当与上次发送不同才推（lastText 追踪在 SessionScreen 的监听闭包里）
+                    pushLocalClipboard(t)
+                }
+            }
+        }
+    }
+
+    /** 麦克风/摄像头上行字节计数（onFrame 回调里累加） */
+    internal fun noteUplinkBytes(bytes: Int) {
+        stats.value.uplinkTotalBytes += bytes.toLong()
+        uplinkBytesWindow += bytes.toLong()
+    }
+
+    /** 启动手柄保活心跳（每 2s 对全部已连手柄发 js,h） */
+    internal fun startGamepadHeartbeat() {
+        if (gamepadHeartbeatJob?.isActive == true) return
+        gamepadHeartbeatJob = scope.launch {
+            while (isActive && !userClosed) {
+                delay(2000)
+                sendGamepadHeartbeats(this@SelkiesSession)
+            }
+        }
+    }
+
+    internal fun stopGamepadHeartbeat() {
+        gamepadHeartbeatJob?.cancel()
+        gamepadHeartbeatJob = null
+    }
+
+    /** 手柄面板「测试振动」：本地直测 rumble 通路（不经服务器） */
+    fun platformTestRumble(slot: Int) {
+        platform.rumbleGamepad(slot, 0.8f, 0.5f, 300)
     }
 
     companion object {

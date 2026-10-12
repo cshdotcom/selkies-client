@@ -174,10 +174,8 @@ fun FilesPanel(state: AppState, session: SelkiesSession) {
                         }) { Icon(Icons.Filled.SelectAll, "全选文件") }
                         IconButton(
                             onClick = {
-                                val dir = File(state.platform.configDir(), "downloads")
-                                dir.mkdirs()
                                 for (e in entries.filter { it.path in selected }) {
-                                    session.filesClient.download(e.path, e.name, dir)
+                                    session.filesClient.downloadToMedia(e.path, e.name)
                                 }
                                 showTransfers = true
                             },
@@ -218,9 +216,8 @@ fun FilesPanel(state: AppState, session: SelkiesSession) {
                             // 目录：href 已带尾斜杠，直接列出（无需 301 探测——秒开）
                             load(entry.path)
                         } else {
-                            val dir = File(state.platform.configDir(), "downloads")
-                            dir.mkdirs()
-                            session.filesClient.download(entry.path, entry.name, dir)
+                            // 下载到媒体库分类目录（自动时间戳命名 + 保存引导）
+                            session.filesClient.downloadToMedia(entry.path, entry.name)
                             showTransfers = true
                         }
                     }

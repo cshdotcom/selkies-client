@@ -57,6 +57,19 @@ object AndroidPlatform : PlatformServices {
     private var appContext: Context? = null
     private var activityRef: ComponentActivity? = null
 
+    /** 应用焦点（Android 10+ 后台剪贴板限制判定） */
+    @Volatile
+    var hasFocus = true
+        private set
+
+    fun setFocus(gained: Boolean) {
+        hasFocus = gained
+    }
+
+    /** 最近创建的视频 sink（PixelCopy 截图取其 Surface） */
+    @Volatile
+    private var lastVideoSink: com.selkies.client.video.AndroidVideoSink? = null
+
     private var pendingPick: ((List<PickedFile>) -> Unit)? = null
     private var pendingSave: ((Boolean) -> Unit)? = null
     private var pendingSaveBytes: ByteArray? = null
@@ -192,9 +205,13 @@ object AndroidPlatform : PlatformServices {
     override fun openFile(path: String) {
         runCatching {
             val ctx = appContext ?: return
-            val file = java.io.File(path)
-            if (!file.exists()) return
-            val uri = androidx.core.content.FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
+            val uri = if (path.startsWith("content://")) {
+                android.net.Uri.parse(path)
+            } else {
+                val file = java.io.File(path)
+                if (!file.exists()) return
+                androidx.core.content.FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
+            }
             val mime = ctx.contentResolver.getType(uri) ?: "*/*"
             val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
                 setDataAndType(uri, mime)
@@ -208,9 +225,13 @@ object AndroidPlatform : PlatformServices {
     override fun shareFile(path: String, displayName: String) {
         runCatching {
             val ctx = appContext ?: return
-            val file = java.io.File(path)
-            if (!file.exists()) return
-            val uri = androidx.core.content.FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
+            val uri = if (path.startsWith("content://")) {
+                android.net.Uri.parse(path)
+            } else {
+                val file = java.io.File(path)
+                if (!file.exists()) return
+                androidx.core.content.FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
+            }
             val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
                 type = ctx.contentResolver.getType(uri) ?: "application/octet-stream"
                 putExtra(android.content.Intent.EXTRA_STREAM, uri)
@@ -242,7 +263,11 @@ object AndroidPlatform : PlatformServices {
         launcher.launch(suggestedName)
     }
 
-    override fun makeVideoSink(): VideoSink = AndroidVideoSink()
+    override fun makeVideoSink(): VideoSink {
+        val sink = com.selkies.client.video.AndroidVideoSink()
+        lastVideoSink = sink
+        return sink
+    }
 
     override fun makeAudioPlayer(): AudioPlayer = AndroidAudioPlayer()
 
@@ -440,6 +465,89 @@ object AndroidPlatform : PlatformServices {
             true
         }.getOrDefault(false)
     }
+
+    // ---- v2.5.0 媒体/手柄/焦点 ----
+
+    override fun openFileLocation(path: String) {
+        // Android 无通用「定位到文件」；尽力打开文件管理器对应目录/文件
+        runCatching {
+            val ctx = appContext ?: return
+            val uri = if (path.startsWith("content://")) android.net.Uri.parse(path)
+            else runCatching {
+                androidx.core.content.FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", File(path))
+            }.getOrNull() ?: android.net.Uri.fromFile(File(path))
+            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "*/*")
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            ctx.startActivity(intent)
+        }
+    }
+
+    override fun rumbleGamepad(slot: Int, strong: Float, weak: Float, ms: Int) {
+        com.selkies.client.core.GamepadBridge.rumble(slot, strong, weak, ms)
+    }
+
+    override fun captureVideoFrame(onDone: (ByteArray?) -> Unit) {
+        val sink = lastVideoSink
+        val surface = sink?.surface
+        if (sink == null || surface == null || !surface.isValid) {
+            onDone(null)
+            return
+        }
+        runCatching {
+            val w = sink.streamWidth.coerceAtLeast(16)
+            val h = sink.streamHeight.coerceAtLeast(16)
+            val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+            val latch = java.util.concurrent.CountDownLatch(1)
+            var ok = false
+            android.view.PixelCopy.request(
+                surface, bitmap,
+                { result -> ok = (result == android.view.PixelCopy.SUCCESS); latch.countDown() },
+                android.os.Handler(android.os.Looper.getMainLooper())
+            )
+            latch.await(2, java.util.concurrent.TimeUnit.SECONDS)
+            if (ok) {
+                Thread {
+                    runCatching {
+                        val out = java.io.ByteArrayOutputStream()
+                        bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
+                        onDone(out.toByteArray())
+                    }.onFailure { onDone(null) }
+                }.start()
+            } else onDone(null)
+        }.onFailure { onDone(null) }
+    }
+
+    override fun mediaStore(): MediaStoreBridge {
+        val ctx = appContext
+            ?: return object : MediaStoreBridge {
+                override fun screenshotsDir() = ""
+                override fun recordingsDir() = ""
+                override fun downloadsDir() = ""
+                override fun saveScreenshot(png: ByteArray, fileName: String): String? = null
+                override fun saveDownload(fileName: String, bytes: ByteArray): String? = null
+                override fun openDownloadStream(fileName: String): OutputStreamHandle? = null
+                override fun createRecordingFile(fileName: String): String? = null
+                override fun listMedia() = emptyList<com.selkies.client.model.SavedMediaEntry>()
+                override fun deleteMedia(entry: com.selkies.client.model.SavedMediaEntry) = false
+            }
+        return AndroidMediaStoreBridge(ctx)
+    }
+
+    override fun makeStreamMuxer(outputPath: String): StreamMuxer = AndroidStreamMuxer(outputPath)
+
+    override fun notifyAppFocus(gained: Boolean) {
+        setFocus(gained)
+    }
+
+    override fun hasAppFocus(): Boolean = hasFocus
+
+    override fun setRecordingActive(active: Boolean) {
+        val ctx = appContext ?: return
+        if (active) RecordingService.start(ctx) else RecordingService.stop(ctx)
+    }
 }
 
 /** 平台 HttpClient（OkHttp 引擎，可选信任所有证书）
@@ -536,17 +644,23 @@ private class AndroidClipboardBridge : ClipboardBridge {
     }
 
     override fun setListener(listener: (() -> Unit)?) {
-        val c = cm ?: return
-        c.removePrimaryClipChangedListener(clipListener)
-        pendingListener = listener
-        if (listener != null) {
-            c.addPrimaryClipChangedListener(clipListener)
-        }
+        if (listener != null) addListener(listener) else listeners.toSet().forEach { removeListener(it) }
     }
 
-    private var pendingListener: (() -> Unit)? = null
+    private val listeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+    override fun addListener(listener: () -> Unit) {
+        if (!listeners.contains(listener)) listeners.add(listener)
+        cm?.addPrimaryClipChangedListener(clipListener)
+    }
+
+    override fun removeListener(listener: () -> Unit) {
+        listeners.remove(listener)
+        if (listeners.isEmpty()) cm?.removePrimaryClipChangedListener(clipListener)
+    }
+
     private val clipListener = android.content.ClipboardManager.OnPrimaryClipChangedListener {
-        pendingListener?.invoke()
+        listeners.forEach { runCatching { it() } }
     }
 }
 

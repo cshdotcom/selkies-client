@@ -424,6 +424,40 @@ class SelkiesConnection(
      *    服务器（nginx Basic Auth）一律回 401。
      * 返回 (httpCode, 已写字节数)；非 2xx 时写 0。
      */
+    /** 流式下载（v2.5.0）：逐块回调——写入 MediaStore content URI / 任意流 */
+    suspend fun apiDownloadStream(
+        path: String,
+        onChunk: (buf: ByteArray, len: Int, total: Long) -> Unit
+    ): Pair<Int, Long> {
+        val url = resolveApiUrl(path)
+        return try {
+            withTimeout(600_000L) {
+                http.prepareGet(url) {
+                    headers { apiHeaders().forEach { (k, v) -> append(k, v) } }
+                }.execute { resp ->
+                    val code = resp.status.value
+                    if (code != 200) {
+                        discardBody(resp)
+                        return@execute code to 0L
+                    }
+                    val total = resp.headers[HttpHeaders.ContentLength]?.toLongOrNull() ?: -1L
+                    val channel = resp.bodyAsChannel()
+                    val buf = ByteArray(64 * 1024)
+                    var received = 0L
+                    while (true) {
+                        val n = channel.readAvailable(buf, 0, buf.size)
+                        if (n <= 0) break
+                        onChunk(buf, n, total)
+                        received += n
+                    }
+                    code to received
+                }
+            }
+        } catch (e: Exception) {
+            throw e
+        }
+    }
+
     suspend fun apiDownloadTo(
         path: String,
         dest: File,

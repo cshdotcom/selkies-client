@@ -42,12 +42,18 @@ import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Mouse
+import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.QueryStats
-import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.SportsEsports
+import androidx.compose.material.icons.filled.StopCircle
 import androidx.compose.material.icons.filled.TouchApp
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VideocamOff
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -101,11 +107,13 @@ import com.selkies.client.ui.panels.AppsPanel
 import com.selkies.client.ui.panels.ClipboardPanel
 import com.selkies.client.ui.panels.CompleteKeyboard
 import com.selkies.client.ui.panels.FilesPanel
+import com.selkies.client.ui.panels.GamepadPanel
 import com.selkies.client.ui.panels.HardwarePanel
 import com.selkies.client.ui.panels.HotkeysPanel
 import com.selkies.client.ui.panels.ImeHostPanel
 import com.selkies.client.ui.panels.PrintJobsPanel
 import com.selkies.client.ui.panels.QuickShortcutBar
+import com.selkies.client.ui.panels.SavedMediaPanel
 import com.selkies.client.ui.panels.SessionSettingsPanel
 import com.selkies.client.ui.panels.StatsPanel
 import kotlinx.coroutines.delay
@@ -119,7 +127,7 @@ import kotlin.math.pow
 import kotlin.math.roundToInt
 
 /** 底部面板类型 */
-enum class SessionPanel { NONE, KEYBOARD, HOTKEYS, CLIPBOARD, FILES, STATS, APPS, HARDWARE, PRINT, SETTINGS }
+enum class SessionPanel { NONE, KEYBOARD, HOTKEYS, CLIPBOARD, FILES, STATS, APPS, HARDWARE, PRINT, SETTINGS, GAMEPAD, MEDIA }
 
 /** 触控输入模式 */
 enum class InputMode { TOUCH, TRACKPAD }
@@ -186,6 +194,14 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     var exitConfirm by remember { mutableStateOf(false) }
     var pendingDrag by remember { mutableStateOf(false) } // 触摸板双击后按住拖动
 
+    // v2.5.0：截图/录屏/音量/保存引导
+    var recording by remember { mutableStateOf(false) }
+    var recordingSec by remember { mutableStateOf(0) }
+    var showVolumePopup by remember { mutableStateOf(false) }
+    val savedEvent by session.savedMediaEvent.collectAsState()
+    val appMuted by session.appMuted.collectAsState()
+    val appVolume by session.appVolume.collectAsState()
+
     // 视口几何
     var viewSize by remember { mutableStateOf(IntSize.Zero) }
     var streamSize by remember { mutableStateOf(realizedRes ?: Pair(1280, 720)) }
@@ -222,6 +238,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     PlatformBackHandler {
         when {
             panel != SessionPanel.NONE -> panel = SessionPanel.NONE
+            showVolumePopup -> showVolumePopup = false
             floatingKb -> floatingKb = false
             quickBar -> quickBar = false
             showModeSelector -> showModeSelector = false
@@ -231,7 +248,17 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         }
     }
 
-    // 连接生命周期 + 剪贴板监听 + 桌面物理键直通 + 手柄挂载
+    // 录屏中：确认退出时提示将自动保存
+    LaunchedEffect(recording) {
+        if (recording) {
+            while (recording) {
+                delay(1000)
+                recordingSec = session.recorder.durationSec().toInt()
+            }
+        }
+    }
+
+    // 连接生命周期 + 剪贴板监听 + 桌面物理键直通 + 手柄挂载 + 焦点追赶
     DisposableEffect(session) {
         // ⚠️ 等待首次布局拿到真实视口尺寸再连接：SETTINGS 的 initialClientWidth/Height
         //    与自适应分辨率依赖它（旧版在布局前连接，恒发 1280x720）。
@@ -241,7 +268,11 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             session.screenWidthPx = viewSize.width.takeIf { it > 0 } ?: 1280
             session.screenHeightPx = viewSize.height.takeIf { it > 0 } ?: 720
             session.connect()
+            session.initAudioVolume()
         }
+
+        // 焦点追踪（Android 后台剪贴板限制 → 回前台追赶）
+        session.hasWindowFocus = { platform.hasAppFocus() }
 
         // 服务器端光标渲染进视频流（官方 SET_NATIVE_CURSOR_RENDERING）+ 本地覆盖层双保险
         session.post { session.connection.sendText("SET_NATIVE_CURSOR_RENDERING,1") }
@@ -251,13 +282,29 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             attachGamepadSession(session)
         }
 
+        // 【剪贴板修复】多监听器：面板/UI 共存，不再互相顶掉
         val clip = platform.clipboard()
         var lastText: String? = clip.getText()
-        clip.setListener {
+        val clipListener: () -> Unit = {
             val t = clip.getText()
             if (t != null && t != lastText) {
                 lastText = t
                 session.pushLocalClipboard(t)
+            }
+        }
+        clip.addListener(clipListener)
+
+        // 焦点变化：剪贴板追赶（双向）
+        // （平台层在 Activity/Window 回调里驱动 focus 标志；这里轮询触发会话层追赶）
+        val focusJob = scope.launch {
+            var lastFocus = true
+            while (true) {
+                delay(300)
+                val f = platform.hasAppFocus()
+                if (f != lastFocus) {
+                    lastFocus = f
+                    session.onAppFocusChanged(f)
+                }
             }
         }
 
@@ -275,9 +322,10 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
 
         onDispose {
             job.cancel()
+            focusJob.cancel()
             platform.setPhysicalKeyHandler(null)
             attachGamepadSession(null)
-            clip.setListener(null)
+            clip.removeListener(clipListener)
             session.disconnect()
             platform.setFullscreen(false)
         }
@@ -662,6 +710,33 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     mapFromStream = ::mapFromStream
                 )
             }
+
+            // ============ FPS/带宽/延迟悬浮条（官方 StreamStrip 等效，设置开关） ============
+            if (status == SelkiesSession.Status.CONNECTED &&
+                state.store.settings.value.showFpsOverlay
+            ) {
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .statusBarsPadding()
+                        .padding(top = 52.dp, start = 6.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    color = Color.Black.copy(alpha = 0.55f)
+                ) {
+                    Text(
+                        buildString {
+                            if (stats.fps > 0) append(stats.fps).append(" fps")
+                            if (stats.bitrateMbps > 0) append("  ·  ").append(
+                                String.format(java.util.Locale.US, "%.1f Mbps", stats.bitrateMbps)
+                            )
+                            if (stats.latencyMs > 0) append("  ·  ").append(stats.latencyMs).append(" ms")
+                        },
+                        color = Color.White,
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+            }
         }
 
         // ============ 状态覆盖层 ============
@@ -844,6 +919,30 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     }
                     ToolButton(Icons.Filled.Apps, "应用") { panel = if (panel == SessionPanel.APPS) SessionPanel.NONE else SessionPanel.APPS }
                     ToolButton(Icons.Filled.QueryStats, "统计") { panel = if (panel == SessionPanel.STATS) SessionPanel.NONE else SessionPanel.STATS }
+                    // v2.5.0：截图 / 录屏 / 音量 / 手柄 / 媒体库
+                    ToolButton(Icons.Filled.PhotoCamera, "截图") {
+                        session.captureScreenshot()
+                    }
+                    ToolButton(
+                        if (recording) Icons.Filled.StopCircle else Icons.Filled.Videocam,
+                        if (recording) "停止(${recordingSec}s)" else "录屏",
+                        tint = if (recording) Color(0xFFEF4444) else Color.White
+                    ) {
+                        if (recording) {
+                            session.stopRecording()
+                            recording = false
+                        } else {
+                            if (session.startRecording()) recording = true
+                            else toast = "无法开始录制（存储不可用）"
+                        }
+                    }
+                    ToolButton(
+                        if (appMuted) Icons.Filled.VolumeOff else Icons.Filled.VolumeUp,
+                        if (appMuted) "取消静音" else "音量",
+                        tint = if (appMuted || appVolume <= 0f) Color(0xFFF59E0B) else Color.White
+                    ) { showVolumePopup = !showVolumePopup }
+                    ToolButton(Icons.Filled.SportsEsports, "手柄") { panel = if (panel == SessionPanel.GAMEPAD) SessionPanel.NONE else SessionPanel.GAMEPAD }
+                    ToolButton(Icons.Filled.PhotoLibrary, "媒体库") { panel = if (panel == SessionPanel.MEDIA) SessionPanel.NONE else SessionPanel.MEDIA }
                     ToolButton(
                         if (fullscreen) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen, "全屏",
                         tint = if (fullscreen) Color(0xFF60A5FA) else Color.White
@@ -879,7 +978,9 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                 SessionPanel.APPS -> "远程应用"
                                 SessionPanel.HARDWARE -> "远程硬件（麦克风/摄像头/扬声器）"
                                 SessionPanel.PRINT -> "打印任务"
-                                SessionPanel.SETTINGS -> "画质与性能"
+                                SessionPanel.SETTINGS -> "画质与性能（实时生效）"
+                                SessionPanel.GAMEPAD -> "手柄（实时状态/振动测试）"
+                                SessionPanel.MEDIA -> "媒体库（截图/录屏/下载）"
                                 SessionPanel.NONE -> ""
                             },
                             style = MaterialTheme.typography.titleMedium,
@@ -897,6 +998,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                         SessionPanel.HARDWARE -> HardwarePanel(session)
                         SessionPanel.PRINT -> PrintJobsPanel(session)
                         SessionPanel.SETTINGS -> SessionSettingsPanel(state, session)
+                        SessionPanel.GAMEPAD -> GamepadPanel(session)
+                        SessionPanel.MEDIA -> SavedMediaPanel(state)
                         SessionPanel.NONE -> {}
                     }
                 }
@@ -925,6 +1028,135 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                 onDismiss = { quickBar = false },
                 onOpenManager = { quickBar = false; panel = SessionPanel.HOTKEYS }
             )
+        }
+
+        // ============ 音量弹窗（应用内独立音量：滑条 + 静音；不依赖系统音量） ============
+        if (showVolumePopup && status == SelkiesSession.Status.CONNECTED) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .padding(bottom = 96.dp),
+                shape = RoundedCornerShape(16.dp),
+                color = Color.Black.copy(alpha = 0.75f),
+                shadowElevation = 8.dp
+            ) {
+                Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "远程声音音量",
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleSmall,
+                            modifier = Modifier.weight(1f)
+                        )
+                        androidx.compose.material3.IconButton(onClick = { session.setAppMuted(!appMuted) }) {
+                            Icon(
+                                if (appMuted) Icons.Filled.VolumeOff else Icons.Filled.VolumeUp,
+                                if (appMuted) "取消静音" else "静音",
+                                tint = if (appMuted) Color(0xFFEF4444) else Color.White
+                            )
+                        }
+                    }
+                    androidx.compose.material3.Slider(
+                        value = if (appVolume < 0) 1f else appVolume,
+                        onValueChange = { session.setAppVolume(it) },
+                        valueRange = 0f..1f,
+                        colors = androidx.compose.material3.SliderDefaults.colors(
+                            thumbColor = Color.White,
+                            activeTrackColor = Color(0xFF60A5FA),
+                            inactiveTrackColor = Color.White.copy(alpha = 0.3f)
+                        )
+                    )
+                    Text(
+                        "${(if (appVolume < 0) 1f else appVolume * 100).toInt()}%  ·  仅调节本应用播放音量，不影响系统",
+                        color = Color.White.copy(alpha = 0.7f),
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                    TextButton(onClick = { showVolumePopup = false }) { Text("关闭") }
+                }
+            }
+        }
+
+        // ============ 保存引导对话框（截图/录屏/下载完成 → 打开/文件夹/复制路径） ============
+        savedEvent?.let { ev ->
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { session.savedMediaEvent.value = null },
+                title = {
+                    Text(
+                        when {
+                            ev.error != null -> "保存失败"
+                            ev.kind == "screenshot" -> "截图已保存"
+                            ev.kind == "recording" -> "录屏已保存"
+                            else -> "已保存"
+                        }
+                    )
+                },
+                text = {
+                    Column {
+                        Text(
+                            when {
+                                ev.error != null -> ev.error
+                                else -> "${ev.name}${if (ev.detail.isNotBlank()) "\n${ev.detail}" else ""}"
+                            }
+                        )
+                        ev.path?.let { p ->
+                            Text(
+                                p,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    Row {
+                        if (ev.path != null) {
+                            androidx.compose.material3.TextButton(onClick = {
+                                platform.openFile(ev.path)
+                            }) { Text("打开") }
+                            androidx.compose.material3.TextButton(onClick = {
+                                platform.openFileLocation(ev.path)
+                            }) { Text("所在文件夹") }
+                            androidx.compose.material3.TextButton(onClick = {
+                                platform.clipboard().setText(ev.path)
+                                toast = "已复制完整路径"
+                            }) { Text("复制路径") }
+                        }
+                        androidx.compose.material3.TextButton(onClick = {
+                            session.savedMediaEvent.value = null
+                        }) { Text("完成") }
+                    }
+                }
+            )
+        }
+
+        // ============ 录屏指示器（红点闪烁 + 时长） ============
+        if (recording) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .statusBarsPadding()
+                    .padding(top = 52.dp, end = 8.dp),
+                shape = RoundedCornerShape(12.dp),
+                color = Color.Black.copy(alpha = 0.6f)
+            ) {
+                Row(
+                    Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        Modifier
+                            .size(8.dp)
+                            .background(Color(0xFFEF4444), androidx.compose.foundation.shape.CircleShape)
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        formatRecSec(recordingSec),
+                        color = Color.White,
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
+            }
         }
 
         // ============ 轻提示（打印到达等） ============
@@ -1030,10 +1262,16 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             AlertDialog(
                 onDismissRequest = { exitConfirm = false },
                 title = { Text("断开连接") },
-                text = { Text("确定断开远程会话并返回服务器列表？") },
+                text = {
+                    Text(
+                        if (recording) "确定断开远程会话并返回服务器列表？\n\n⏺ 录屏正在进行中：断开后将自动保存录屏文件。"
+                        else "确定断开远程会话并返回服务器列表？"
+                    )
+                },
                 confirmButton = {
                     TextButton(onClick = {
                         exitConfirm = false
+                        if (recording) session.stopRecording()
                         state.navigate(com.selkies.client.Screen.ServerList)
                     }) { Text("断开返回", color = MaterialTheme.colorScheme.error) }
                 },
@@ -1041,6 +1279,14 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             )
         }
     }
+}
+
+private fun formatRecSec(sec: Int): String {
+    val h = sec / 3600
+    val m = (sec % 3600) / 60
+    val s = sec % 60
+    return if (h > 0) String.format(java.util.Locale.US, "%d:%02d:%02d", h, m, s)
+    else String.format(java.util.Locale.US, "%02d:%02d", m, s)
 }
 
 // =====================================================================

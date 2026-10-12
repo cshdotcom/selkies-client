@@ -4,3 +4,14 @@ package com.selkies.client.core
 actual fun attachGamepadSession(session: SelkiesSession?) {
     GamepadBridge.attach(session)
 }
+
+actual fun sendGamepadHeartbeats(session: SelkiesSession?) {
+    GamepadBridge.sendHeartbeats(session)
+}
+
+actual fun gamepadSnapshot(): List<GamepadInfo> {
+    return GamepadBridge.connectedPads().mapNotNull { (index, name, _) ->
+        val snap = GamepadBridge.snapshot(index) ?: return@mapNotNull null
+        GamepadInfo(index, name, snap.first, snap.second)
+    }
+}

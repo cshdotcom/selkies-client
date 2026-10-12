@@ -33,7 +33,21 @@ class AndroidVideoSink : VideoSink {
 
     override val firstFrameRendered = MutableStateFlow(false)
 
-    private class FrameBuf(val header: VideoFrameHeader, val data: ByteArray)
+    /** 当前流尺寸（截图 PixelCopy 用） */
+    @Volatile var streamWidth: Int = 1280
+        private set
+    @Volatile var streamHeight: Int = 720
+        private set
+
+    // ---- 解码计时（统计面板：decode/present tile，EMA 平滑） ----
+    @Volatile private var emaDecodeMs = 0.0
+    @Volatile private var emaPresentMs = 0.0
+    @Volatile private var droppedFrames = 0L
+    override val avgDecodeMs: Double get() = emaDecodeMs
+    override val avgPresentMs: Double get() = emaPresentMs
+    override val framesDropped: Long get() = droppedFrames
+
+    private class FrameBuf(val header: VideoFrameHeader, val data: ByteArray, val arrivedAt: Long)
 
     init {
         decodeThread = Thread(this::decoderLoop, "selkies-video-decode").apply {
@@ -57,12 +71,17 @@ class AndroidVideoSink : VideoSink {
         if (header.stripeY != 0) return
         // ⚠️【视频黑屏修复】length 为整条二进制消息总长（含 12B 帧头），payload 区间是 [offset, length)，
         //    copyOfRange(offset, offset + length) 会恒定越界 12 字节（见 DesktopVideoSink 同步修复）。
-        if (length <= offset) return
+                        if (header.width > 0 && header.height > 0) {
+                            streamWidth = header.width
+                            streamHeight = header.height
+                        }
+                        if (length <= offset) return
         val copy = data.copyOfRange(offset, length)
-        if (!queue.offer(FrameBuf(header, copy))) {
+        if (!queue.offer(FrameBuf(header, copy, System.nanoTime()))) {
             // 队列满：丢帧并请求关键帧由上层处理
+            droppedFrames++
             queue.clear()
-            queue.offer(FrameBuf(header, copy))
+            queue.offer(FrameBuf(header, copy, System.nanoTime()))
         }
     }
 
@@ -137,6 +156,7 @@ class AndroidVideoSink : VideoSink {
                 }
                 val c = codec ?: continue
                 if (!codecReady) continue
+                val decodeStartNs = System.nanoTime()
                 val idx = c.dequeueInputBuffer(15_000_000) // 15ms
                 if (idx >= 0) {
                     val buf = c.getInputBuffer(idx)
@@ -151,6 +171,15 @@ class AndroidVideoSink : VideoSink {
                     }
                 }
                 drainOutput(c)
+                // 到达→出帧耗时 = present；解码段（含输入等待）= decode（粗粒度但趋势正确）
+                val nowNs = System.nanoTime()
+                val presentMs = (nowNs - fb.arrivedAt) / 1e6
+                val decodeMs = (nowNs - decodeStartNs) / 1e6
+                if (emaPresentMs == 0.0) { emaPresentMs = presentMs; emaDecodeMs = decodeMs }
+                else {
+                    emaPresentMs = emaPresentMs * 0.9 + presentMs * 0.1
+                    emaDecodeMs = emaDecodeMs * 0.9 + decodeMs * 0.1
+                }
             } catch (e: Exception) {
                 // 解码错误：重建（下一个关键帧恢复）
                 releaseCodec()

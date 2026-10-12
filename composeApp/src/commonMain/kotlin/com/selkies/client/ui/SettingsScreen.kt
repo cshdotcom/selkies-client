@@ -12,11 +12,15 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
@@ -24,6 +28,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -129,16 +134,61 @@ fun SettingsScreen(state: AppState) {
                 SettingSwitch("允许摄像头（远程可请求）", settings.webcamEnabled) {
                     toggle { it.webcamEnabled = !it.webcamEnabled }
                 }
+                SettingSwitch("手柄振动（远程游戏 rumble）", settings.gamepadRumble) {
+                    toggle { it.gamepadRumble = !it.gamepadRumble }
+                }
                 var volume by remember { mutableFloatStateOf(settings.speakerVolume) }
-                Text("扬声器音量：${(volume * 100).toInt()}%", style = MaterialTheme.typography.bodyMedium)
-                Slider(
-                    value = volume,
-                    onValueChange = {
-                        volume = it
-                        settings.speakerVolume = it
-                        state.store.saveSettings()
-                    },
-                    valueRange = 0f..1f
+                Text("应用内音量（独立于系统）：${(volume * 100).toInt()}%" + if (settings.audioMuted) " · 已静音" else "", style = MaterialTheme.typography.bodyMedium)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Slider(
+                        value = volume,
+                        onValueChange = {
+                            volume = it
+                            settings.speakerVolume = it
+                            settings.audioMuted = false
+                            state.store.saveSettings()
+                        },
+                        valueRange = 0f..1f,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    androidx.compose.material3.IconButton(onClick = {
+                        toggle { it.audioMuted = !it.audioMuted }
+                    }) {
+                        Icon(
+                            if (settings.audioMuted) Icons.Filled.VolumeOff else Icons.Filled.VolumeUp,
+                            if (settings.audioMuted) "取消静音" else "静音"
+                        )
+                    }
+                }
+            }
+
+            SectionCard("截图 / 录屏 / 下载") {
+                SettingSwitch("录屏包含远程声音", settings.recordingIncludeAudio) {
+                    toggle { it.recordingIncludeAudio = !it.recordingIncludeAudio }
+                }
+                SettingSwitch("保存后弹窗引导（打开/复制路径）", settings.recordingNotifyOnSave) {
+                    toggle { it.recordingNotifyOnSave = !it.recordingNotifyOnSave }
+                }
+                var storageRoot by remember { mutableStateOf(settings.storageRoot) }
+                OutlinedTextField(
+                    value = storageRoot,
+                    onValueChange = { storageRoot = it },
+                    label = { Text("存储位置（留空 = 默认）") },
+                    placeholder = { Text(state.platform.mediaStore().let { "截图 ${it.screenshotsDir()}" }) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    trailingIcon = {
+                        androidx.compose.material3.TextButton(onClick = {
+                            settings.storageRoot = storageRoot.trim()
+                            state.store.saveSettings()
+                        }) { Text("保存") }
+                    }
+                )
+                Text(
+                    "自动分类：截图 → ${state.platform.mediaStore().screenshotsDir()}\n录屏 → ${state.platform.mediaStore().recordingsDir()}\n下载 → ${state.platform.mediaStore().downloadsDir()}\n文件名自动带时间戳，避免覆盖。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
 
@@ -148,6 +198,9 @@ fun SettingsScreen(state: AppState) {
                 }
                 SettingSwitch("卡顿时自动请求关键帧", settings.requestKeyframeOnStall) {
                     toggle { it.requestKeyframeOnStall = !it.requestKeyframeOnStall }
+                }
+                SettingSwitch("会话中保持屏幕常亮", settings.keepScreenOn) {
+                    toggle { it.keepScreenOn = !it.keepScreenOn }
                 }
             }
 

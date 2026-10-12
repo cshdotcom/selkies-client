@@ -39,6 +39,14 @@ class DesktopVideoSink : VideoSink {
     @Volatile var diagFramesPublished: Long = 0
     @Volatile var diagLastError: String? = null
 
+    // ---- 解码计时（统计面板） ----
+    @Volatile private var emaDecodeMs = 0.0
+    @Volatile private var emaPresentMs = 0.0
+    @Volatile private var droppedFrames = 0L
+    override val avgDecodeMs: Double get() = emaDecodeMs
+    override val avgPresentMs: Double get() = emaPresentMs
+    override val framesDropped: Long get() = droppedFrames
+
     /** 最新解码帧（UI 观察绘制） */
     val bitmapFlow = MutableStateFlow<ImageBitmap?>(null)
 
@@ -66,7 +74,7 @@ class DesktopVideoSink : VideoSink {
     // JPEG 合成画布
     private var jpegCanvas: BufferedImage? = null
 
-    private class FrameBuf(val header: VideoFrameHeader, val data: ByteArray)
+    private class FrameBuf(val header: VideoFrameHeader, val data: ByteArray, val arrivedAt: Long)
 
     init {
         avutil.av_log_set_level(avutil.AV_LOG_ERROR)
@@ -87,9 +95,10 @@ class DesktopVideoSink : VideoSink {
         if (length <= offset) return
         diagFramesIn++
         val copy = data.copyOfRange(offset, length)
-        if (!queue.offer(FrameBuf(header, copy))) {
+        if (!queue.offer(FrameBuf(header, copy, System.nanoTime()))) {
+            droppedFrames++
             queue.clear()
-            queue.offer(FrameBuf(header, copy))
+            queue.offer(FrameBuf(header, copy, System.nanoTime()))
         }
     }
 
@@ -182,6 +191,7 @@ class DesktopVideoSink : VideoSink {
                 break
             }
             if (fb.header.codecId != 1) continue // 仅 H.264；其他编码由设置层切换
+            val decodeStartNs = System.nanoTime()
             runCatching {
                 ensureDecoder(fb.header.width.coerceAtLeast(16), fb.header.height.coerceAtLeast(16))
                 val ctx = codecCtx!!
@@ -225,6 +235,17 @@ class DesktopVideoSink : VideoSink {
                 diagDecodeErrors++
                 diagLastError = "${it.javaClass.simpleName}: ${it.message}"
                 reset()
+            }
+            // 计时（EMA）
+            if (diagFramesDecoded > 0) {
+                val nowNs = System.nanoTime()
+                val presentMs = (nowNs - fb.arrivedAt) / 1e6
+                val decodeMs = (nowNs - decodeStartNs) / 1e6
+                if (emaPresentMs == 0.0) { emaPresentMs = presentMs; emaDecodeMs = decodeMs }
+                else {
+                    emaPresentMs = emaPresentMs * 0.9 + presentMs * 0.1
+                    emaDecodeMs = emaDecodeMs * 0.9 + decodeMs * 0.1
+                }
             }
         }
     }

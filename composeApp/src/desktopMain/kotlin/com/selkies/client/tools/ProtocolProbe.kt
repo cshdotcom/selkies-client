@@ -8,6 +8,9 @@ import com.selkies.client.platform.ClipboardBridge
 import com.selkies.client.platform.MicCapture
 import com.selkies.client.platform.PickedFile
 import com.selkies.client.platform.PlatformServices
+import com.selkies.client.platform.MediaStoreBridge
+import com.selkies.client.platform.OutputStreamHandle
+import com.selkies.client.platform.StreamMuxer
 import com.selkies.client.platform.PrintBridge
 import com.selkies.client.platform.VideoFrameHeader
 import com.selkies.client.platform.VideoSink
@@ -291,6 +294,26 @@ object ProtocolProbe {
             onDone(false)
         }
         override fun makeVideoSink(): VideoSink = sink
+        override fun mediaStore(): MediaStoreBridge = object : MediaStoreBridge {
+            override fun screenshotsDir() = ""
+            override fun recordingsDir() = ""
+            override fun downloadsDir() = ""
+            override fun saveScreenshot(png: ByteArray, fileName: String): String? = null
+            override fun saveDownload(fileName: String, bytes: ByteArray): String? = null
+            override fun openDownloadStream(fileName: String): OutputStreamHandle? = null
+            override fun createRecordingFile(fileName: String): String? = null
+            override fun listMedia() = emptyList<com.selkies.client.model.SavedMediaEntry>()
+            override fun deleteMedia(entry: com.selkies.client.model.SavedMediaEntry) = false
+        }
+        override fun makeStreamMuxer(outputPath: String): StreamMuxer = object : StreamMuxer {
+            override val outputPath: String = outputPath
+            override fun addVideoTrack(codecId: Int, width: Int, height: Int) = false
+            override fun addAudioTrack(sampleRate: Int, channels: Int) = false
+            override fun writeVideoFrame(data: ByteArray, keyframe: Boolean, ptsUs: Long) = false
+            override fun writeAudioFrame(data: ByteArray, ptsUs: Long) = false
+            override fun writeJpegFrame(parts: List<Pair<Int, ByteArray>>, ptsUs: Long) = false
+            override fun close() = false
+        }
         override fun makeAudioPlayer(): AudioPlayer = object : AudioPlayer {
             override fun start(sampleRate: Int, channels: Int) {}
             override fun playOpus(opus: ByteArray) {}

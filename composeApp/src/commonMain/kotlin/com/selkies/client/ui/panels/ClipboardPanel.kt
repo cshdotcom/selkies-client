@@ -32,7 +32,8 @@ import com.selkies.client.AppState
 import com.selkies.client.core.SelkiesSession
 
 /**
- * 剪贴板面板：双向同步 + 手动发送 + 同步开关
+ * 剪贴板面板：双向同步 + 手动发送 + 同步开关 + 历史
+ * 【v2.5.0 修复】监听器改为 add/remove：不再顶掉会话层自动同步（旧版打开过此面板后自动同步失效的根因）
  */
 @Composable
 fun ClipboardPanel(state: AppState, session: SelkiesSession) {
@@ -49,8 +50,8 @@ fun ClipboardPanel(state: AppState, session: SelkiesSession) {
         val listener: () -> Unit = {
             localText = state.platform.clipboard().getText() ?: localText
         }
-        state.platform.clipboard().setListener(listener)
-        onDispose { state.platform.clipboard().setListener(null) }
+        state.platform.clipboard().addListener(listener)
+        onDispose { state.platform.clipboard().removeListener(listener) }
     }
 
     Column(

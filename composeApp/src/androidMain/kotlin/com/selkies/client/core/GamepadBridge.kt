@@ -19,10 +19,14 @@ import kotlin.math.abs
  */
 object GamepadBridge {
 
+    /** 服务器手柄槽位上限（官方 num_gamepads = 4） */
+    const val MAX_PADS = 4
+
     private class PadState(val index: Int) {
         val buttons = FloatArray(17)
         val axes = FloatArray(6)
         var connected = false
+        var deviceId = -1
     }
 
     @Volatile
@@ -42,6 +46,20 @@ object GamepadBridge {
         } else {
             registerDeviceListener()
         }
+    }
+
+    /** 已连接手柄信息（测试面板显示） */
+    fun connectedPads(): List<Triple<Int, String, Int>> {
+        return pads.values.filter { it.connected }.map { pad ->
+            val name = InputDevice.getDevice(pad.deviceId)?.name ?: "pad-${pad.index}"
+            Triple(pad.index, name ?: "pad-${pad.index}", pad.deviceId)
+        }
+    }
+
+    /** 实时快照（测试面板：按钮值 + 轴值） */
+    fun snapshot(padIndex: Int): Pair<FloatArray, FloatArray>? {
+        val pad = pads.values.firstOrNull { it.connected && it.index == padIndex } ?: return null
+        return pad.buttons.copyOf() to pad.axes.copyOf()
     }
 
     private fun registerDeviceListener() {
@@ -80,16 +98,57 @@ object GamepadBridge {
         pads[deviceId]?.let { return it }
         val dev = InputDevice.getDevice(deviceId) ?: return null
         if (!isGamepad(deviceId)) return null
+        // 服务器只有 4 个槽位：超出不再连接
+        if (pads.values.count { it.connected } >= MAX_PADS) return null
         val pad = PadState(nextIndex.getAndIncrement())
         pads[deviceId] = pad
+        pad.deviceId = deviceId
         // 首次事件即连接：id 用设备名 base64（官方格式）
         val idB64 = java.util.Base64.getEncoder()
             .encodeToString((dev.name ?: "android-pad").take(64).toByteArray(Charsets.ISO_8859_1))
         runCatching {
             session?.sendGamepadConnect(pad.index, idB64, 6, 17)
+            session?.startGamepadHeartbeat()
         }
         pad.connected = true
         return pad
+    }
+
+    /** 对全部已连手柄发 js,h 保活（会话层定时器调用） */
+    fun sendHeartbeats(s: SelkiesSession?) {
+        pads.values.filter { it.connected }.forEach { pad ->
+            runCatching { s?.sendGamepadHeartbeat(pad.index) }
+        }
+    }
+
+    /** rumble：振动指定槽位的手柄（Android InputDevice 振动器） */
+    fun rumble(slot: Int, strong: Float, weak: Float, ms: Int) {
+        val pad = pads.values.firstOrNull { it.connected && it.index == slot } ?: return
+        if (pad.deviceId < 0) return
+        runCatching {
+            val dev = InputDevice.getDevice(pad.deviceId) ?: return
+            val vibrator = if (android.os.Build.VERSION.SDK_INT >= 31) {
+                val vm = dev.vibratorManager
+                vm?.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                dev.vibrator
+            } ?: return
+            if (vibrator.hasVibrator()) {
+                val amplitude = ((strong * 0.6f + weak * 0.4f).coerceIn(0f, 1f) * 255).toInt().coerceAtLeast(1)
+                if (android.os.Build.VERSION.SDK_INT >= 26) {
+                    vibrator.vibrate(
+                        android.os.VibrationEffect.createOneShot(
+                            ms.toLong(),
+                            android.os.VibrationEffect.DEFAULT_AMPLITUDE.takeIf { amplitude >= 255 } ?: amplitude
+                        )
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    vibrator.vibrate(ms.toLong())
+                }
+            }
+        }
     }
 
     /** 键事件（按钮）。返回 true 表示已消费 */
