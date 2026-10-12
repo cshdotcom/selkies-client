@@ -1,6 +1,7 @@
 package com.selkies.client.ui
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -43,6 +44,7 @@ import com.selkies.client.AppState
 import com.selkies.client.Screen
 import com.selkies.client.core.SelkiesConnection
 import com.selkies.client.model.ServerEntry
+import com.selkies.client.model.VideoPresets
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -79,13 +81,18 @@ fun AddServerScreen(state: AppState, serverId: String?) {
     var showAdvanced by remember { mutableStateOf(false) }
     var jpegQuality by remember { mutableFloatStateOf((existing?.jpegQuality ?: 0).toFloat()) }
     var videoFullcolor by remember { mutableStateOf(existing?.videoFullcolor ?: false) }
+    var video10bit by remember { mutableStateOf(existing?.video10bit ?: false) }
+    var turbo by remember { mutableStateOf(existing?.turboMode ?: true) }
     var useCpu by remember { mutableStateOf(existing?.useCpu ?: false) }
     var forceAligned by remember { mutableStateOf(existing?.forceAlignedResolution ?: false) }
-    var streamingMode by remember { mutableStateOf(existing?.videoStreamingMode ?: "") }
+    var keyframeInt by remember { mutableFloatStateOf((existing?.keyframeInterval ?: -1.0).toFloat().coerceAtLeast(-1f)) }
     var paintOverCrf by remember { mutableFloatStateOf((existing?.paintOverCrf ?: 0).toFloat()) }
     var paintOverBurst by remember { mutableFloatStateOf((existing?.paintOverBurstFrames ?: 0).toFloat()) }
     var paintOverJpeg by remember { mutableFloatStateOf((existing?.paintOverJpegQuality ?: 0).toFloat()) }
     var usePaintOverQuality by remember { mutableStateOf(existing?.usePaintOverQuality ?: false) }
+    var audioBr by remember { mutableFloatStateOf(((existing?.audioBitrate ?: 0) / 1000).toFloat()) }
+    var dpi by remember { mutableFloatStateOf((existing?.scalingDpi ?: 0).toFloat()) }
+    var preset by remember { mutableStateOf(existing?.preset ?: "balanced") }
 
     var testing by remember { mutableStateOf(false) }
     var testResult by remember { mutableStateOf<String?>(null) }
@@ -169,6 +176,40 @@ fun AddServerScreen(state: AppState, serverId: String?) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilterChip(selected = displayId == "primary", onClick = { displayId = "primary" }, label = { Text("主屏") })
             }
+
+            SectionTitle("质量预设")
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                VideoPresets.ALL.forEach { p ->
+                    FilterChip(
+                        selected = preset == p.key,
+                        onClick = {
+                            preset = p.key
+                            if (p.key != "custom") {
+                                framerate = when (p.key) { "smooth" -> 30f; "compat" -> 30f; else -> 60f }
+                                encoder = when (p.key) { "quality", "cinema" -> "h265enc"; "compat" -> "jpeg"; else -> "h264enc" }
+                                videoBitrate = when (p.key) {
+                                    "smooth" -> 4000f; "balanced" -> 8000f; "text" -> 12000f
+                                    "quality" -> 20000f; "cinema" -> 30000f; else -> 8000f
+                                }
+                                videoCrf = when (p.key) {
+                                    "smooth" -> 30f; "balanced" -> 24f; "text" -> 18f
+                                    "quality" -> 20f; "cinema" -> 16f; else -> 24f
+                                }
+                                useCrf = true
+                                videoFullcolor = p.key == "text"
+                                video10bit = p.key == "cinema"
+                                turbo = true
+                            }
+                        },
+                        label = { Text(p.label) }
+                    )
+                }
+            }
+            Text(
+                VideoPresets.ALL.firstOrNull { it.key == preset }?.desc ?: "手动微调全部参数",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
 
             SectionTitle("视频质量")
             Text("分辨率（每个服务器可独立设置）：", style = MaterialTheme.typography.bodyMedium)
@@ -257,12 +298,20 @@ fun AddServerScreen(state: AppState, serverId: String?) {
                 )
             }
             if (showAdvanced) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = turbo, onCheckedChange = { turbo = it })
+                    Text("Turbo 逐帧编码（video_streaming_mode，最流畅）")
+                }
                 Text("JPEG 质量：${if (jpegQuality < 1) "默认" else jpegQuality.toInt().toString()}（仅 JPEG 编码器生效）",
                     style = MaterialTheme.typography.bodySmall)
                 Slider(value = jpegQuality, onValueChange = { jpegQuality = it }, valueRange = 0f..100f)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = videoFullcolor, onCheckedChange = { videoFullcolor = it })
-                    Text("全色彩（video_fullcolor，带宽↑）")
+                    Text("全色彩 4:4:4（video_fullcolor，文字锐利）")
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = video10bit, onCheckedChange = { video10bit = it })
+                    Text("10bit 色深（video_10bit，渐变更平滑）")
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = useCpu, onCheckedChange = { useCpu = it })
@@ -270,29 +319,45 @@ fun AddServerScreen(state: AppState, serverId: String?) {
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = forceAligned, onCheckedChange = { forceAligned = it })
-                    Text("强制对齐分辨率")
+                    Text("强制 16 像素对齐分辨率")
                 }
-                Text("流式模式：", style = MaterialTheme.typography.bodySmall)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(selected = streamingMode.isEmpty(), onClick = { streamingMode = "" }, label = { Text("默认") })
-                    FilterChip(selected = streamingMode == "standard", onClick = { streamingMode = "standard" }, label = { Text("标准") })
-                    FilterChip(selected = streamingMode == "paint-over", onClick = { streamingMode = "paint-over" }, label = { Text("Paint-over") })
+                Text(
+                    String.format(java.util.Locale.US, "关键帧间隔：%.0f 秒（0 = 无限 GOP 仅按需关键帧，最省带宽；-1 = 服务器默认）", keyframeInt),
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Slider(value = keyframeInt.coerceAtLeast(0f), onValueChange = { keyframeInt = it }, valueRange = 0f..300f)
+                // paint-over（静止画面质量清理）
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = usePaintOverQuality, onCheckedChange = { usePaintOverQuality = it })
+                    Text("静止画面质量清理（paint-over）")
                 }
-                if (streamingMode == "paint-over") {
-                    Text("Paint-over CRF：${if (paintOverCrf < 1) "默认" else paintOverCrf.toInt().toString()}",
+                if (usePaintOverQuality) {
+                    Text("Paint-over CRF：${if (paintOverCrf < 1) "默认 18" else paintOverCrf.toInt().toString()}",
                         style = MaterialTheme.typography.bodySmall)
                     Slider(value = paintOverCrf, onValueChange = { paintOverCrf = it }, valueRange = 0f..51f)
-                    Text("突发帧数：${if (paintOverBurst < 1) "默认" else paintOverBurst.toInt().toString()}",
+                    Text("突发帧数：${if (paintOverBurst < 1) "默认 5" else paintOverBurst.toInt().toString()}",
                         style = MaterialTheme.typography.bodySmall)
                     Slider(value = paintOverBurst, onValueChange = { paintOverBurst = it }, valueRange = 0f..30f)
-                    Text("覆盖层 JPEG 质量：${if (paintOverJpeg < 1) "默认" else paintOverJpeg.toInt().toString()}",
+                    Text("覆盖层 JPEG 质量：${if (paintOverJpeg < 1) "默认 90" else paintOverJpeg.toInt().toString()}",
                         style = MaterialTheme.typography.bodySmall)
                     Slider(value = paintOverJpeg, onValueChange = { paintOverJpeg = it }, valueRange = 0f..100f)
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Checkbox(checked = usePaintOverQuality, onCheckedChange = { usePaintOverQuality = it })
-                        Text("使用 Paint-over 质量参数（CRF 模式）")
-                    }
                 }
+                Text(
+                    if (audioBr < 1f) "音频码率：服务器默认（128 kbps）"
+                    else String.format(java.util.Locale.US, "音频码率：%.0f kbps", audioBr),
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Slider(value = audioBr, onValueChange = { audioBr = (it / 32).toInt() * 32f }, valueRange = 0f..256f)
+                Text(
+                    if (dpi < 96f) "远程界面 DPI：服务器默认（96）"
+                    else "远程界面 DPI：${dpi.toInt()}（越大远程 UI 元素越大，适合手机）",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Slider(
+                    value = if (dpi < 96f) 96f else dpi,
+                    onValueChange = { dpi = (it / 24).toInt() * 24f },
+                    valueRange = 96f..288f
+                )
                 Text("以上选项留默认 = 不发送，由服务器端配置决定。",
                     style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
@@ -323,13 +388,18 @@ fun AddServerScreen(state: AppState, serverId: String?) {
                             audioEnabled = audioEnabled,
                             jpegQuality = jpegQuality.toInt(),
                             videoFullcolor = videoFullcolor,
+                            video10bit = video10bit,
+                            turboMode = turbo,
                             useCpu = useCpu,
                             forceAlignedResolution = forceAligned,
-                            videoStreamingMode = streamingMode,
+                            keyframeInterval = keyframeInt.toDouble(),
                             paintOverCrf = paintOverCrf.toInt(),
                             paintOverBurstFrames = paintOverBurst.toInt(),
                             paintOverJpegQuality = paintOverJpeg.toInt(),
                             usePaintOverQuality = usePaintOverQuality,
+                            audioBitrate = if (audioBr >= 32f) audioBr.toInt() * 1000 else 0,
+                            scalingDpi = if (dpi >= 96f) dpi.toInt() else 0,
+                            preset = preset,
                             useTokenAuth = useToken, token = token,
                             allowUntrustedCert = allowUntrusted
                         )
@@ -369,13 +439,18 @@ fun AddServerScreen(state: AppState, serverId: String?) {
                         audioEnabled = audioEnabled,
                         jpegQuality = jpegQuality.toInt(),
                         videoFullcolor = videoFullcolor,
+                        video10bit = video10bit,
+                        turboMode = turbo,
                         useCpu = useCpu,
                         forceAlignedResolution = forceAligned,
-                        videoStreamingMode = streamingMode,
+                        keyframeInterval = keyframeInt.toDouble(),
                         paintOverCrf = paintOverCrf.toInt(),
                         paintOverBurstFrames = paintOverBurst.toInt(),
                         paintOverJpegQuality = paintOverJpeg.toInt(),
                         usePaintOverQuality = usePaintOverQuality,
+                        audioBitrate = if (audioBr >= 32f) audioBr.toInt() * 1000 else 0,
+                        scalingDpi = if (dpi >= 96f) dpi.toInt() else 0,
+                        preset = preset,
                         useTokenAuth = useToken, token = token,
                         allowUntrustedCert = allowUntrusted
                     )

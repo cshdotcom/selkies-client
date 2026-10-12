@@ -27,9 +27,14 @@ import javax.net.ssl.X509TrustManager
 import javax.print.PrintServiceLookup
 import javax.print.attribute.HashPrintRequestAttributeSet
 import javax.print.attribute.standard.JobName
+import javax.sound.sampled.AudioSystem
+import javax.sound.sampled.DataLine
+import javax.sound.sampled.SourceDataLine
+import javax.sound.sampled.TargetDataLine
 import javax.swing.JFileChooser
 import javax.swing.SwingUtilities
 import javax.swing.filechooser.FileNameExtensionFilter
+import com.selkies.client.model.HardwareDevice
 
 /**
  * 桌面平台服务实现（Linux/macOS/Windows，x86_64 + ARM64）
@@ -217,6 +222,130 @@ object DesktopPlatform : PlatformServices {
     fun init() {}
 
     fun shutdown() {}
+
+    // ---- v2.4.0 硬件选择 ----
+
+    /** 枚举麦克风：Java Sound 中支持 TargetDataLine 的 mixer */
+    override fun enumerateMics(): List<HardwareDevice> {
+        return runCatching {
+            AudioSystem.getMixerInfo().mapIndexedNotNull { idx, info ->
+                val mixer = AudioSystem.getMixer(info)
+                val ok = runCatching {
+                    mixer.isLineSupported(DataLine.Info(TargetDataLine::class.java, javax.sound.sampled.AudioFormat(48000f, 16, 1, true, false)))
+                }.getOrDefault(false)
+                if (ok) HardwareDevice(
+                    id = "mixer:$idx",
+                    name = info.name.ifBlank { "麦克风 ${idx + 1}" },
+                    type = "mic",
+                    detail = info.vendor?.ifBlank { "" } ?: ""
+                ) else null
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    /** 枚举摄像头：v4l2 / dshow / avfoundation 探测 */
+    override fun enumerateCameras(): List<HardwareDevice> {
+        val os = System.getProperty("os.name").lowercase()
+        return runCatching {
+            when {
+                os.contains("win") -> listDshowDevices()
+                os.contains("mac") -> listOf(HardwareDevice("0", "默认摄像头（avfoundation）", "camera", "macOS 摄像头"))
+                else -> {
+                    (0 until 8).mapNotNull { i ->
+                        val p = "/dev/video$i"
+                        if (File(p).exists()) {
+                            val name = runCatching { File("/sys/class/video4linux/video$i/name").readText().trim() }.getOrNull() ?: p
+                            HardwareDevice(p, name.ifBlank { p }, "camera", "v4l2 设备")
+                        } else null
+                    }
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    /** 枚举扬声器：Java Sound 中支持 SourceDataLine 的 mixer */
+    override fun enumerateSpeakers(): List<HardwareDevice> {
+        return runCatching {
+            AudioSystem.getMixerInfo().mapIndexedNotNull { idx, info ->
+                val mixer = AudioSystem.getMixer(info)
+                val ok = runCatching {
+                    mixer.isLineSupported(DataLine.Info(SourceDataLine::class.java, javax.sound.sampled.AudioFormat(48000f, 16, 2, true, false)))
+                }.getOrDefault(false)
+                if (ok) HardwareDevice(
+                    id = "mixer:$idx",
+                    name = info.name.ifBlank { "扬声器 ${idx + 1}" },
+                    type = "speaker",
+                    detail = info.vendor?.ifBlank { "" } ?: ""
+                ) else null
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    /** 唤起操作系统屏幕键盘 */
+    override fun showOnScreenKeyboard(): Boolean {
+        val os = System.getProperty("os.name").lowercase()
+        return runCatching {
+            val proc = when {
+                os.contains("win") -> ProcessBuilder("cmd", "/c", "start", "osk.exe").start()
+                os.contains("mac") -> ProcessBuilder("open", "-a", "KeyboardViewer").start()
+                else -> {
+                    // Linux: 依次尝试常见屏幕键盘
+                    val candidates = listOf("onboard", "cellwriter", "wvkbd-mobintl")
+                    var started: Process? = null
+                    for (c in candidates) {
+                        val p = runCatching { ProcessBuilder("sh", "-c", "command -v $c >/dev/null 2>&1 && $c &").start() }.getOrNull()
+                        if (p != null) { started = p; break }
+                    }
+                    started ?: throw IllegalStateException("未找到可用屏幕键盘（已尝试 onboard/cellwriter/wvkbd）")
+                }
+            }
+            proc != null
+        }.getOrDefault(false)
+    }
+
+    override fun setSpeakerDevice(deviceId: String) {
+        // Java Sound 的输出设备选择由 DesktopAudioPlayer 的 mixer 参数处理
+    }
+
+    override fun savePrintPdf(fileName: String, pdfBytes: ByteArray): String? {
+        return runCatching {
+            val home = System.getProperty("user.home")
+            val dir = File(home, "Downloads")
+            dir.mkdirs()
+            val f = File(dir, fileName.ifBlank { "document.pdf" })
+            f.writeBytes(pdfBytes)
+            f.absolutePath
+        }.getOrNull()
+    }
+
+    override fun openLocalFile(path: String): Boolean {
+        return runCatching {
+            if (Desktop.isDesktopSupported()) {
+                Desktop.getDesktop().browse(File(path).toURI())
+                true
+            } else false
+        }.getOrDefault(false)
+    }
+
+    /** Windows dshow 设备枚举：解析 ffmpeg -list_devices 输出（无 ffmpeg 时回退常见默认名） */
+    private fun listDshowDevices(): List<HardwareDevice> {
+        val out = runCatching {
+            val ffmpeg = sequenceOf("ffmpeg", "avconv").firstOrNull { bin ->
+                runCatching { ProcessBuilder("sh", "-c", "command -v $bin").start().waitFor() == 0 }.getOrDefault(false)
+            } ?: return emptyList()
+            val p = ProcessBuilder(ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy").start()
+            p.errorStream.readBytes().toString(Charsets.UTF_8)  // ffmpeg 输出在 stderr
+        }.getOrDefault("")
+        val devices = ArrayList<HardwareDevice>()
+        val regex = Regex("\"([^\"]+)\" \\(video\\)")
+        for (m in regex.findAll(out)) {
+            devices.add(HardwareDevice("video=" + m.groupValues[1], m.groupValues[1], "camera", "DirectShow 设备"))
+        }
+        if (devices.isEmpty()) {
+            devices.add(HardwareDevice("video=Integrated Camera", "集成摄像头", "camera", "DirectShow 设备（猜测）"))
+        }
+        return devices
+    }
 }
 
 /** AWT 键码 → X11 keysym */
@@ -356,9 +485,9 @@ private object AwtClipboardBridge : ClipboardBridge {
     }
 }
 
-/** 桌面打印桥接（javax.print） */
+/** 桌面打印桥接（javax.print，PDF 直通 + 打印对话框 + 结果回调） */
 private object DesktopPrintBridge : PrintBridge {
-    override fun printPdf(pdfBytes: ByteArray, fileName: String) {
+    override fun printPdf(pdfBytes: ByteArray, fileName: String, onResult: (Boolean, String?) -> Unit) {
         Thread {
             runCatching {
                 val services = PrintServiceLookup.lookupPrintServices(
@@ -371,15 +500,22 @@ private object DesktopPrintBridge : PrintBridge {
                     val f = File(dir, fileName.ifBlank { "document.pdf" })
                     f.writeBytes(pdfBytes)
                     DesktopPlatform.openUrl(f.toURI().toString())
+                    onResult(true, "已保存到 ${f.absolutePath}（系统无 PDF 直印服务）")
                     return@runCatching
                 }
                 val service = javax.print.ServiceUI.printDialog(
                     null, 100, 100,
                     services, services.first(), javax.print.DocFlavor.BYTE_ARRAY.PDF,
                     HashPrintRequestAttributeSet().apply { add(JobName(fileName, null)) }
-                ) ?: return@runCatching
+                ) ?: run {
+                    onResult(false, "已取消打印对话框")
+                    return@runCatching
+                }
                 val doc = javax.print.SimpleDoc(pdfBytes, javax.print.DocFlavor.BYTE_ARRAY.PDF, null)
                 service.createPrintJob().print(doc, HashPrintRequestAttributeSet())
+                onResult(true, null)
+            }.onFailure {
+                onResult(false, it.message ?: it.toString())
             }
         }.apply { isDaemon = true }.start()
     }

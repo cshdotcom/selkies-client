@@ -192,20 +192,27 @@ class DesktopAudioPlayer : AudioPlayer {
 
 /**
  * 桌面麦克风：TargetDataLine 48kHz 单声道 s16 → FFmpeg Opus 编码（0x02 上行）
- * 自动适配编码器采样格式（s16 / flt / fltp）
+ * 自动适配编码器采样格式（s16 / flt / fltp）；v2.4.0 支持 mixer 设备选择与多设备混音
  */
 class DesktopMicCapture : MicCapture {
 
     @Volatile
     private var running = false
     private var thread: Thread? = null
+    @Volatile
+    private var wantedDevices: List<String> = emptyList()
     private var onOpus: ((ByteArray) -> Unit)? = null
 
     override val active: Boolean get() = running
 
-    override fun start(onOpusFrame: (ByteArray) -> Unit, onError: (String) -> Unit) {
+    override fun start(
+        deviceIds: List<String>,
+        onOpusFrame: (ByteArray) -> Unit,
+        onError: (String) -> Unit
+    ) {
         if (running) return
         onOpus = onOpusFrame
+        wantedDevices = deviceIds
         running = true
         thread = Thread({ loop(onError) }, "selkies-mic").apply {
             isDaemon = true
@@ -219,8 +226,22 @@ class DesktopMicCapture : MicCapture {
         thread = null
     }
 
+    /** mixer:N → 打开第 N 个 mixer 的 TargetDataLine；null → 系统默认 */
+    private fun openLine(deviceId: String?, format: AudioFormat, info: DataLine.Info): TargetDataLine? {
+        if (deviceId == null) {
+            if (!AudioSystem.isLineSupported(info)) return null
+            return AudioSystem.getTargetDataLine(format) as TargetDataLine
+        }
+        if (!deviceId.startsWith("mixer:")) return null
+        val idx = deviceId.removePrefix("mixer:").toIntOrNull() ?: return null
+        val mixerInfo = AudioSystem.getMixerInfo().getOrNull(idx) ?: return null
+        val mixer = AudioSystem.getMixer(mixerInfo)
+        if (!mixer.isLineSupported(info)) return null
+        return mixer.getLine(info) as TargetDataLine
+    }
+
     private fun loop(onError: (String) -> Unit) {
-        var line: TargetDataLine? = null
+        val lines = ArrayList<TargetDataLine>()
         var ctx: AVCodecContext? = null
         var frame: AVFrame? = null
         var pkt: AVPacket? = null
@@ -229,10 +250,21 @@ class DesktopMicCapture : MicCapture {
             val channels = 1
             val format = AudioFormat(sampleRate.toFloat(), 16, channels, true, false)
             val info = DataLine.Info(TargetDataLine::class.java, format)
-            if (!AudioSystem.isLineSupported(info)) throw IllegalStateException("未找到麦克风设备")
-            line = AudioSystem.getTargetDataLine(format) as TargetDataLine
-            line.open(format, sampleRate / 10 * 4)
-            line.start()
+            // 打开选中的设备（单台失败跳过；全部失败才算失败）
+            val wanted = if (wantedDevices.isEmpty()) listOf<String?>(null) else wantedDevices
+            for (id in wanted) {
+                runCatching {
+                    val l = openLine(id, format, info)
+                    if (l != null) {
+                        l.open(format, sampleRate / 10 * 4)
+                        l.start()
+                        lines.add(l)
+                    }
+                }
+            }
+            if (lines.isEmpty()) {
+                throw IllegalStateException("未找到可用麦克风设备" + if (wantedDevices.isNotEmpty()) "（${wantedDevices.joinToString(",")}）" else "")
+            }
 
             val codec = avcodec.avcodec_find_encoder(AV_CODEC_ID_OPUS)
                 ?: throw IllegalStateException("未找到 Opus 编码器")
@@ -276,16 +308,41 @@ class DesktopMicCapture : MicCapture {
             pkt = AVPacket()
             val pcm = ByteArray(frameSamples * channels * bytesPerSample)
             val floatBuf = FloatArray(frameSamples * channels)
+            val mixShort = ShortArray(frameSamples)
             var pts = 0L
 
             while (running) {
-                var read = 0
-                while (read < pcm.size && running) {
-                    val n = line.read(pcm, read, pcm.size - read)
-                    if (n <= 0) break
-                    read += n
+                // 多设备混音：逐设备读同长帧后平均；单设备直读
+                if (lines.size == 1) {
+                    var read = 0
+                    while (read < pcm.size && running) {
+                        val n = lines[0].read(pcm, read, pcm.size - read)
+                        if (n <= 0) break
+                        read += n
+                    }
+                    if (read < pcm.size) continue
+                } else {
+                    java.util.Arrays.fill(mixShort, 0)
+                    var got = 0
+                    for (l in lines) {
+                        val tmp = ByteArray(pcm.size)
+                        var read = 0
+                        while (read < tmp.size && running) {
+                            val n = l.read(tmp, read, tmp.size - read)
+                            if (n <= 0) break
+                            read += n
+                        }
+                        if (read == tmp.size) {
+                            val sb = ByteBuffer.wrap(tmp).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+                            for (i in 0 until frameSamples) {
+                                mixShort[i] = (mixShort[i] + sb.get(i) / lines.size).toShort()
+                            }
+                            got++
+                        }
+                    }
+                    if (got == 0) continue
+                    ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(mixShort)
                 }
-                if (read < pcm.size) continue
 
                 // s16le → 目标格式
                 when (useFmt) {
@@ -333,7 +390,7 @@ class DesktopMicCapture : MicCapture {
             if (running) onError("麦克风错误：${e.message ?: e.toString()}")
         } finally {
             running = false
-            runCatching { line?.stop(); line?.close() }
+            for (l in lines) runCatching { l.stop(); l.close() }
             // ⚠️ 同 DesktopAudioPlayer：JavaCPP 对象用 deallocate()，避免双重释放
             runCatching { ctx?.deallocate() }
             runCatching { frame?.deallocate() }

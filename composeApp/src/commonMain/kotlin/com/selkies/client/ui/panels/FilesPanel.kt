@@ -17,17 +17,23 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.OpenInNew
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -52,7 +58,8 @@ import java.net.URLDecoder
 import java.util.Locale
 
 /**
- * 文件面板：远程目录浏览（面包屑 + 目录秒开）+ 上传 + 认证下载 + 传输管理（打开/分享/另存为）
+ * 文件面板 v2.4.0：远程目录浏览（面包屑 + 目录秒开）+ 搜索过滤 + 多选批量下载 + 上传 + 传输管理（打开/分享/另存为）
+ * 说明：官方服务器 API 仅提供 列表/下载/上传，无删除/重命名端点。
  */
 @Composable
 fun FilesPanel(state: AppState, session: SelkiesSession) {
@@ -61,6 +68,9 @@ fun FilesPanel(state: AppState, session: SelkiesSession) {
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var showTransfers by remember { mutableStateOf(false) }
+    var search by remember { mutableStateOf("") }
+    var selectMode by remember { mutableStateOf(false) }
+    var selected by remember { mutableStateOf(setOf<String>()) }   // 编码 path 集合
     val scope = rememberCoroutineScope()
 
     fun load(p: String) {
@@ -69,7 +79,7 @@ fun FilesPanel(state: AppState, session: SelkiesSession) {
         scope.launch(Dispatchers.IO) {
             val result = session.filesClient.list(p)
             launch {
-                result.onSuccess { entries = it; path = p }
+                result.onSuccess { entries = it; path = p; selected = setOf() }
                     .onFailure { error = it.message }
                 loading = false
             }
@@ -78,8 +88,12 @@ fun FilesPanel(state: AppState, session: SelkiesSession) {
 
     LaunchedEffect(Unit) { load("") }
 
+    val filtered = entries.filter {
+        search.isBlank() || it.name.contains(search, true)
+    }
+
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
-        // 顶部：面包屑路径（解码显示）+ 传输切换
+        // 顶部：面包屑路径（解码显示）+ 刷新 + 传输切换
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             IconButton(onClick = {
                 // 返回上级：去掉最后一段（编码路径）
@@ -93,12 +107,32 @@ fun FilesPanel(state: AppState, session: SelkiesSession) {
                 modifier = Modifier.weight(1f),
                 maxLines = 1, overflow = TextOverflow.Ellipsis
             )
+            IconButton(onClick = { load(path) }) { Icon(Icons.Filled.Refresh, "刷新") }
             OutlinedButton(onClick = { showTransfers = !showTransfers }) {
                 Text(if (showTransfers) "浏览文件" else "传输(${session.filesClient.transfers.value.size})")
             }
         }
 
         if (!showTransfers) {
+            // 搜索 + 多选切换
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                OutlinedTextField(
+                    value = search,
+                    onValueChange = { search = it },
+                    label = { Text("搜索当前目录") },
+                    leadingIcon = { Icon(Icons.Filled.Search, null) },
+                    modifier = Modifier.weight(1f),
+                    singleLine = true
+                )
+                Spacer(Modifier.size(6.dp))
+                FilterChip(
+                    selected = selectMode,
+                    onClick = { selectMode = !selectMode; selected = setOf() },
+                    label = { Text(if (selectMode) "退出多选" else "多选") }
+                )
+            }
+            Spacer(Modifier.height(4.dp))
+
             Button(
                 onClick = {
                     state.platform.pickFiles(listOf("*/*")) { files ->
@@ -119,6 +153,46 @@ fun FilesPanel(state: AppState, session: SelkiesSession) {
             }
             Spacer(Modifier.height(4.dp))
 
+            // 多选操作条
+            if (selectMode) {
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f),
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            "已选 ${selected.size} 项",
+                            style = MaterialTheme.typography.labelMedium,
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(onClick = {
+                            selected = filtered.filter { !it.isDir }.map { it.path }.toSet()
+                        }) { Icon(Icons.Filled.SelectAll, "全选文件") }
+                        IconButton(
+                            onClick = {
+                                val dir = File(state.platform.configDir(), "downloads")
+                                dir.mkdirs()
+                                for (e in entries.filter { it.path in selected }) {
+                                    session.filesClient.download(e.path, e.name, dir)
+                                }
+                                showTransfers = true
+                            },
+                            enabled = selected.isNotEmpty()
+                        ) { Icon(Icons.Filled.Download, "批量下载") }
+                    }
+                }
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    "官方服务器 API 仅支持 列表/下载/上传，暂不支持远程删除/重命名",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
             if (loading) {
                 CircularProgressIndicator(modifier = Modifier.padding(24.dp))
             }
@@ -130,9 +204,17 @@ fun FilesPanel(state: AppState, session: SelkiesSession) {
                 verticalArrangement = Arrangement.spacedBy(4.dp),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 12.dp)
             ) {
-                items(entries, key = { it.path }) { entry ->
-                    FileRow(entry) {
-                        if (entry.isDir) {
+                items(filtered, key = { it.path }) { entry ->
+                    FileRow(
+                        entry = entry,
+                        selectMode = selectMode,
+                        selected = entry.path in selected
+                    ) {
+                        if (selectMode) {
+                            if (!entry.isDir) {
+                                selected = if (entry.path in selected) selected - entry.path else selected + entry.path
+                            }
+                        } else if (entry.isDir) {
                             // 目录：href 已带尾斜杠，直接列出（无需 301 探测——秒开）
                             load(entry.path)
                         } else {
@@ -245,10 +327,11 @@ private fun formatBytes(b: Long): String = when {
 }
 
 @Composable
-private fun FileRow(entry: RemoteFileEntry, onClick: () -> Unit) {
+private fun FileRow(entry: RemoteFileEntry, selectMode: Boolean = false, selected: Boolean = false, onClick: () -> Unit) {
     Surface(
         shape = RoundedCornerShape(8.dp),
-        color = androidx.compose.ui.graphics.Color.Transparent
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
+        else androidx.compose.ui.graphics.Color.Transparent
     ) {
         Row(
             modifier = Modifier
@@ -257,6 +340,15 @@ private fun FileRow(entry: RemoteFileEntry, onClick: () -> Unit) {
                 .padding(horizontal = 10.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            if (selectMode) {
+                Icon(
+                    Icons.Filled.Download,
+                    if (selected) "已选择" else null,
+                    tint = if (selected) MaterialTheme.colorScheme.primary else androidx.compose.ui.graphics.Color.Transparent,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(Modifier.size(6.dp))
+            }
             Icon(
                 if (entry.isDir) Icons.Filled.Folder else Icons.AutoMirrored.Filled.InsertDriveFile,
                 null,

@@ -34,6 +34,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.ContentPaste
+import androidx.compose.material.icons.filled.DevicesOther
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
@@ -41,7 +42,9 @@ import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Mouse
+import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.QueryStats
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VideocamOff
@@ -98,9 +101,12 @@ import com.selkies.client.ui.panels.AppsPanel
 import com.selkies.client.ui.panels.ClipboardPanel
 import com.selkies.client.ui.panels.CompleteKeyboard
 import com.selkies.client.ui.panels.FilesPanel
+import com.selkies.client.ui.panels.HardwarePanel
 import com.selkies.client.ui.panels.HotkeysPanel
 import com.selkies.client.ui.panels.ImeHostPanel
+import com.selkies.client.ui.panels.PrintJobsPanel
 import com.selkies.client.ui.panels.QuickShortcutBar
+import com.selkies.client.ui.panels.SessionSettingsPanel
 import com.selkies.client.ui.panels.StatsPanel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -113,7 +119,7 @@ import kotlin.math.pow
 import kotlin.math.roundToInt
 
 /** 底部面板类型 */
-enum class SessionPanel { NONE, KEYBOARD, HOTKEYS, CLIPBOARD, FILES, STATS, APPS }
+enum class SessionPanel { NONE, KEYBOARD, HOTKEYS, CLIPBOARD, FILES, STATS, APPS, HARDWARE, PRINT, SETTINGS }
 
 /** 触控输入模式 */
 enum class InputMode { TOUCH, TRACKPAD }
@@ -162,6 +168,12 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     val cursorX by session.cursorX.collectAsState()
     val cursorY by session.cursorY.collectAsState()
     val cursorShape by session.cursorShape.collectAsState()
+    // v2.4.0：打印任务/硬件状态（会话层真实状态驱动 UI）
+    val printJobs by session.printJobs.collectAsState()
+    val micSessionOn by session.micActive.collectAsState()
+    val camSessionOn by session.webcamActive.collectAsState()
+    var now by remember { androidx.compose.runtime.mutableLongStateOf(System.currentTimeMillis()) }
+    val connectAt = remember { System.currentTimeMillis() }
 
     var panel by remember { mutableStateOf(SessionPanel.NONE) }
     var fullscreen by remember { mutableStateOf(false) }
@@ -172,8 +184,6 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     var inputMode by remember { mutableStateOf(if (state.store.settings.value.touchMouseMode) InputMode.TRACKPAD else InputMode.TOUCH) }
     var showModeSelector by remember { mutableStateOf(false) }
     var exitConfirm by remember { mutableStateOf(false) }
-    var micOn by remember { mutableStateOf(false) }
-    var camOn by remember { mutableStateOf(false) }
     var pendingDrag by remember { mutableStateOf(false) } // 触摸板双击后按住拖动
 
     // 视口几何
@@ -199,6 +209,13 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     // 会话级通知（打印/硬件/传输）→ toast
     LaunchedEffect(notices) {
         if (notices != null) { toast = notices; session.notices.value = null }
+    }
+    // 连接时长每秒刷新
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1000)
+            now = System.currentTimeMillis()
+        }
     }
 
     // 返回键：逐层退出（面板→悬浮键盘/快捷栏→选择器→全屏→确认断开）
@@ -729,6 +746,11 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                 if (server.resolutionW > 0) append(" · 固定")
                                 if (stats.fps > 0) append(" · ").append(stats.fps).append("fps")
                                 if (stats.latencyMs > 0) append(" · ").append(stats.latencyMs).append("ms")
+                                // 连接时长
+                                val dur = (now - connectAt) / 1000
+                                val h = dur / 3600; val m = (dur % 3600) / 60; val s = dur % 60
+                                if (h > 0) append(String.format(java.util.Locale.US, " · %d:%02d:%02d", h, m, s))
+                                else append(String.format(java.util.Locale.US, " · %d:%02d", m, s))
                                 if (viewOnly) append(" · 只读（viewer 通道）")
                                 if (inputMode == InputMode.TRACKPAD) append(" · 触摸板")
                             },
@@ -791,20 +813,28 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     ToolButton(Icons.Filled.Bolt, "快捷键") { panel = if (panel == SessionPanel.HOTKEYS) SessionPanel.NONE else SessionPanel.HOTKEYS }
                     ToolButton(Icons.Filled.ContentPaste, "剪贴板") { panel = if (panel == SessionPanel.CLIPBOARD) SessionPanel.NONE else SessionPanel.CLIPBOARD }
                     ToolButton(Icons.Filled.Folder, "文件") { panel = if (panel == SessionPanel.FILES) SessionPanel.NONE else SessionPanel.FILES }
+                    // v2.4.0：打印任务（带数量角标，出错变红）
                     ToolButton(
-                        if (micOn) Icons.Filled.Mic else Icons.Filled.MicOff, "麦克风",
-                        tint = if (micOn) Color(0xFF4ADE80) else Color.White
+                        Icons.Filled.Print,
+                        "打印" + if (printJobs.isNotEmpty()) "(${printJobs.size})" else "",
+                        tint = if (printJobs.any { it.status == "error" }) MaterialTheme.colorScheme.error else Color.White
+                    ) { panel = if (panel == SessionPanel.PRINT) SessionPanel.NONE else SessionPanel.PRINT }
+                    ToolButton(
+                        if (micSessionOn) Icons.Filled.Mic else Icons.Filled.MicOff, "麦克风",
+                        tint = if (micSessionOn) Color(0xFF4ADE80) else Color.White
                     ) {
-                        micOn = !micOn
-                        if (micOn) session.startMicUplink() else session.stopMicUplink()
+                        if (micSessionOn) session.stopMicUplink() else session.startMicUplink()
                     }
                     ToolButton(
-                        if (camOn) Icons.Filled.Videocam else Icons.Filled.VideocamOff, "摄像头",
-                        tint = if (camOn) Color(0xFF4ADE80) else Color.White
+                        if (camSessionOn) Icons.Filled.Videocam else Icons.Filled.VideocamOff, "摄像头",
+                        tint = if (camSessionOn) Color(0xFF4ADE80) else Color.White
                     ) {
-                        camOn = !camOn
-                        if (camOn) session.startWebcamUplink() else session.stopWebcamUplink()
+                        if (camSessionOn) session.stopWebcamUplink() else session.startWebcamUplink()
                     }
+                    // v2.4.0：硬件设备选择（麦克风多选混音/摄像头切换/扬声器，带搜索）
+                    ToolButton(Icons.Filled.DevicesOther, "硬件") { panel = if (panel == SessionPanel.HARDWARE) SessionPanel.NONE else SessionPanel.HARDWARE }
+                    // v2.4.0：画质与性能（预设+全部官方参数热更新）
+                    ToolButton(Icons.Filled.Tune, "画质") { panel = if (panel == SessionPanel.SETTINGS) SessionPanel.NONE else SessionPanel.SETTINGS }
                     if (platform.isTouchDevice()) {
                         ToolButton(
                             if (inputMode == InputMode.TRACKPAD) Icons.Filled.Mouse else Icons.Filled.TouchApp,
@@ -847,6 +877,9 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                 SessionPanel.FILES -> "文件传输"
                                 SessionPanel.STATS -> "会话统计"
                                 SessionPanel.APPS -> "远程应用"
+                                SessionPanel.HARDWARE -> "远程硬件（麦克风/摄像头/扬声器）"
+                                SessionPanel.PRINT -> "打印任务"
+                                SessionPanel.SETTINGS -> "画质与性能"
                                 SessionPanel.NONE -> ""
                             },
                             style = MaterialTheme.typography.titleMedium,
@@ -861,6 +894,9 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                         SessionPanel.FILES -> FilesPanel(state, session)
                         SessionPanel.STATS -> StatsPanel(session)
                         SessionPanel.APPS -> AppsPanel(session)
+                        SessionPanel.HARDWARE -> HardwarePanel(session)
+                        SessionPanel.PRINT -> PrintJobsPanel(session)
+                        SessionPanel.SETTINGS -> SessionSettingsPanel(state, session)
                         SessionPanel.NONE -> {}
                     }
                 }
@@ -934,6 +970,17 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                             desc = "CTL/ALT/WIN 粘滞 + TAB/ESC/ENTER 单发 + 固定的常用快捷键，一键直发",
                             selected = quickBar
                         ) { openInputMethod("quick") }
+                        // v2.4.0：唤起操作系统自带屏幕键盘（Windows osk / Linux onboard / macOS 键盘查看器；Android=系统输入法）
+                        ModeOption(
+                            title = "系统屏幕键盘（操作系统自带）",
+                            desc = "调起本机操作系统自带的屏幕键盘，点击物理屏幕键盘输入——适合触屏笔记本/平板",
+                            selected = false
+                        ) {
+                            showInputPicker = false
+                            if (!platform.showOnScreenKeyboard()) {
+                                toast = "当前系统未找到可用的屏幕键盘"
+                            }
+                        }
                         Text(
                             "选择后下次点“键盘”直接打开该方式；长按“键盘”可重新选择。",
                             style = MaterialTheme.typography.labelSmall,

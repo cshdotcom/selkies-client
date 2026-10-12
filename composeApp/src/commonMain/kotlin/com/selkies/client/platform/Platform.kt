@@ -3,6 +3,7 @@ package com.selkies.client.platform
 import androidx.compose.runtime.Immutable
 import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.pointer.PointerEvent
+import com.selkies.client.model.HardwareDevice
 import io.ktor.client.HttpClient
 import kotlinx.coroutines.flow.StateFlow
 
@@ -38,7 +39,7 @@ interface VideoSink {
 
 /** 平台音频播放器（下行 Opus 48kHz） */
 interface AudioPlayer {
-    fun start(sampleRate: Int = 48000, channels: Int = 1)
+    fun start(sampleRate: Int = 48000, channels: Int = 2)
     fun playOpus(opus: ByteArray)
     /** 静音标记（服务器告知音频暂停） */
     fun onQuiet()
@@ -47,18 +48,27 @@ interface AudioPlayer {
     val bufferLevelMs: Int
 }
 
-/** 平台麦克风采集（上行 Opus 24kHz mono） */
+/** 平台麦克风采集（上行 Opus 24kHz mono；支持多设备混音） */
 interface MicCapture {
-    fun start(onOpusFrame: (ByteArray) -> Unit, onError: (String) -> Unit)
+    /** @param deviceIds 设备 id 列表（多个时客户端混音为单流）；空 = 默认设备 */
+    fun start(
+        deviceIds: List<String> = emptyList(),
+        onOpusFrame: (ByteArray) -> Unit,
+        onError: (String) -> Unit
+    )
     fun stop()
     val active: Boolean
 }
 
 /** 平台摄像头采集（上行编码帧） */
 interface WebcamCapture {
-    /** codecId: 0=MJPEG 1=H264 2=VP8 3=VP9 4=AV1 5=H265 */
+    /** codecId: 0=MJPEG 1=H264 2=VP8 3=VP9 4=AV1 5=H265
+     *  @param deviceId 指定设备（空 = 默认）；@param targetW/H 期望分辨率 */
     fun start(
         encoder: String,
+        deviceId: String = "",
+        targetW: Int = 1280,
+        targetH: Int = 720,
         onFrame: (codecId: Int, keyframe: Boolean, data: ByteArray) -> Unit,
         onError: (String) -> Unit
     )
@@ -88,7 +98,7 @@ interface ClipboardBridge {
 /** 平台打印接口 */
 interface PrintBridge {
     /** 打印 PDF 文档字节 */
-    fun printPdf(pdfBytes: ByteArray, fileName: String)
+    fun printPdf(pdfBytes: ByteArray, fileName: String, onResult: (Boolean, String?) -> Unit = { _, _ -> })
 }
 
 /** 文件选择/保存结果 */
@@ -133,6 +143,22 @@ interface PlatformServices {
     fun shareFile(path: String, displayName: String)
     /** 退出应用（Android=finish；Desktop=System.exit） */
     fun exitApp()
+
+    // ---- v2.4.0 硬件选择 ----
+    /** 枚举麦克风设备（含内置/外接/蓝牙） */
+    fun enumerateMics(): List<HardwareDevice> = emptyList()
+    /** 枚举摄像头设备（含前置/后置/外接） */
+    fun enumerateCameras(): List<HardwareDevice> = emptyList()
+    /** 枚举音频输出设备（扬声器/耳机/蓝牙） */
+    fun enumerateSpeakers(): List<HardwareDevice> = emptyList()
+    /** 唤起操作系统自带屏幕键盘（Windows osk / Linux onboard / macOS 键盘查看器 / Android 软键盘） */
+    fun showOnScreenKeyboard(): Boolean = false
+    /** 选择音频输出设备（空 = 默认） */
+    fun setSpeakerDevice(deviceId: String) {}
+    /** 本地保存打印 PDF 备份；返回保存路径 */
+    fun savePrintPdf(fileName: String, pdfBytes: ByteArray): String? = null
+    /** 打开本地文件（Android=FileProvider+ACTION_VIEW；Desktop=Desktop.browse） */
+    fun openLocalFile(path: String): Boolean = false
 }
 
 expect fun getPlatformServices(): PlatformServices

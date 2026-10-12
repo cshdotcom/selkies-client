@@ -2,6 +2,8 @@ package com.selkies.client.core
 
 import com.selkies.client.model.AppSettings
 import com.selkies.client.model.CursorShape
+import com.selkies.client.model.HardwareDevice
+import com.selkies.client.model.PrintJobEntry
 import com.selkies.client.model.ServerEntry
 import com.selkies.client.model.StatsInfo
 import com.selkies.client.platform.PlatformServices
@@ -62,6 +64,27 @@ class SelkiesSession(
     /** 当前生效编码器（服务器通知） */
     val currentEncoder = MutableStateFlow("h264enc")
 
+    /** 服务器上报的音频声道数（默认 2，与官方 audio_channels 一致） */
+    val audioChannels = MutableStateFlow(2)
+
+    /** 打印任务队列（下载校验→系统打印→状态跟踪） */
+    val printJobs = MutableStateFlow<List<PrintJobEntry>>(emptyList())
+
+    /** 硬件设备列表（UI 打开硬件面板时刷新） */
+    val micDevices = MutableStateFlow<List<HardwareDevice>>(emptyList())
+    val cameraDevices = MutableStateFlow<List<HardwareDevice>>(emptyList())
+    val speakerDevices = MutableStateFlow<List<HardwareDevice>>(emptyList())
+
+    /** 当前选中的麦克风设备 id 列表（多选混音） */
+    val selectedMicIds = MutableStateFlow<List<String>>(emptyList())
+
+    /** 当前选中的摄像头设备 id（单选；服务器虚拟摄像头一次一路） */
+    val selectedCameraId = MutableStateFlow("")
+
+    /** 麦克风/摄像头上行开关（UI 观察） */
+    val micActive = MutableStateFlow(false)
+    val webcamActive = MutableStateFlow(false)
+
     var videoSink: VideoSink? = null
         set(value) {
             field?.let { old -> if (value !== old) old.close() }
@@ -100,6 +123,10 @@ class SelkiesSession(
     private var startVideoAttempts = 0
     private var clipboardTid = 0
     private var statsSubscriptionActive = false
+    /** 每秒统计采样（本地 fps + 服务器统计 → 历史序列，供图表） */
+    private var statsSampler: Job? = null
+    private var localFrameCount = 0L
+    private var localFrameWindowStart = 0L
     /** 帧停顿看门狗：CONNECTED 且已请求视频但超时无新帧 → 自动 REQUEST_KEYFRAME */
     private var stallWatchdog: Job? = null
     private var lastKeyframeRequestAt = 0L
@@ -163,6 +190,7 @@ class SelkiesSession(
         ackTimer?.cancel()
         watchdogTimer?.cancel()
         stallWatchdog?.cancel()
+        statsSampler?.cancel()
         keyHeartbeatJob?.cancel()
         heldKeys.clear()
         runCatching { micCapture.stop() }
@@ -220,24 +248,46 @@ class SelkiesSession(
             payload["rate_control_mode"] = "crf"
         } else {
             payload["video_bitrate"] = server.videoBitrate
-            payload["rate_control_mode"] = "bitrate"
+            // ⚠️ 官方合法枚举仅 cbr/crf（旧版误发 "bitrate" 会被服务器拒绝）
+            payload["rate_control_mode"] = "cbr"
         }
-        payload["audio_bitrate"] = 128000
         payload["enable_binary_clipboard"] = s.clipboardBinaryEnabled
         // ---- 官方前端视频高级设置（仅非默认时发送，与官方 postSetting 键名一致）----
         if (server.jpegQuality in 1..100) payload["jpeg_quality"] = server.jpegQuality
         if (server.videoFullcolor) payload["video_fullcolor"] = true
+        if (server.video10bit) payload["video_10bit"] = true
         if (server.useCpu) payload["use_cpu"] = true
         if (server.forceAlignedResolution) payload["force_aligned_resolution"] = true
-        if (server.videoStreamingMode in listOf("standard", "paint-over")) {
-            payload["video_streaming_mode"] = server.videoStreamingMode
-        }
+        // video_streaming_mode：官方为布尔（true = Turbo 逐帧编码）
+        payload["video_streaming_mode"] = server.turboMode
+        if (server.keyframeInterval >= 0) payload["keyframe_interval"] = server.keyframeInterval
+        if (server.videoMinQp in 1..51) payload["video_min_qp"] = server.videoMinQp
+        if (server.videoMaxQp in 1..51) payload["video_max_qp"] = server.videoMaxQp
         if (server.paintOverCrf in 1..51) payload["video_paintover_crf"] = server.paintOverCrf
         if (server.paintOverBurstFrames > 0) payload["video_paintover_burst_frames"] = server.paintOverBurstFrames
         if (server.paintOverJpegQuality in 1..100) payload["paint_over_jpeg_quality"] = server.paintOverJpegQuality
         if (server.usePaintOverQuality) payload["use_paint_over_quality"] = true
+        if (server.audioBitrate >= 6000) payload["audio_bitrate"] = server.audioBitrate
+        if (server.scalingDpi in 96..288) payload["scaling_dpi"] = server.scalingDpi
+        if (server.webcamEncoder != "auto") payload["webcam_encoder"] = server.webcamEncoder
         connection.sendText("SETTINGS," + jsonEncode(payload))
     }
+
+    /** 会话内动态应用设置（部分 SETTINGS；服务器按字段热更新/重启捕获自行处理） */
+    fun applySettings(patch: Map<String, Any>) = post {
+        if (patch.isNotEmpty()) {
+            connection.sendText("SETTINGS," + jsonEncode(patch))
+        }
+    }
+
+    /** 单值热路径：视频码率（vb） */
+    fun sendVideoBitrate(kbps: Int) = post { connection.sendText("vb,$kbps") }
+
+    /** 单值热路径：音频码率（ab） */
+    fun sendAudioBitrate(bps: Int) = post { connection.sendText("ab,$bps") }
+
+    /** 单值热路径：帧率（_arg_fps） */
+    fun sendFramerate(fps: Int) = post { connection.sendText("_arg_fps,$fps") }
 
     /** UI 层在连接前设置屏幕物理像素尺寸 */
     var screenWidthPx: Int = 0
@@ -314,9 +364,16 @@ class SelkiesSession(
                 startVideoAttempts = 0
             }
             text == "VIDEO_STOPPED" -> { statusDetail.value = "视频流已停止" }
-            text == "AUDIO_STARTED" -> { runCatching { audioPlayer.start(48000, 1) } }
+            text == "AUDIO_STARTED" -> {
+                // 声道数来自 server_settings（官方默认 2 声道；旧版硬编码 1 导致无声/变音）
+                runCatching { audioPlayer.start(48000, audioChannels.value) }
+                startStatsSamplerIfNeeded()
+            }
             text == "AUDIO_STOPPED" -> { }
-            text == "AUDIO_DISABLED" -> { statusDetail.value = "音频被服务器禁用" }
+            text == "AUDIO_DISABLED" -> {
+                statusDetail.value = "音频被服务器禁用"
+                runCatching { audioPlayer.stop() }
+            }
             text == "MICROPHONE_DISABLED" -> { runCatching { micCapture.stop() } }
             text == "WEBCAM_DISABLED" -> { runCatching { webcamCapture.stop() } }
             text == "WEBCAM_KEYFRAME" -> { webcamCapture.requestKeyframe() }
@@ -424,6 +481,12 @@ class SelkiesSession(
                             currentEncoder.value = v.content
                         }
                     }
+                    // 服务器音频声道数（官方默认 2，修复单声道硬编码导致的无声/变音）
+                    (map["audio_channels"] as? kotlinx.serialization.json.JsonObject)?.let { ch ->
+                        (ch["value"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull()?.let {
+                            if (it in 1..8) audioChannels.value = it
+                        }
+                    }
                 }
                 "server_apps" -> {
                     val arr = obj["apps"] as? kotlinx.serialization.json.JsonArray ?: return
@@ -454,12 +517,34 @@ class SelkiesSession(
                     }
                 }
                 "stream_stats" -> {
-                    val st = stats.value
-                    (obj["fps"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull()?.let { st.fps = it.toInt() }
-                    (obj["latency_ms"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull()?.let { st.latencyMs = it }
-                    (obj["bitrate_mbps"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull()?.let { st.bitrateMbps = it }
-                    (obj["video_codec"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.let { st.codec = it }
-                    stats.value = st
+                    // 官方格式：{"type":"stream_stats","displayId":"primary","stats":{...}}
+                    val st = obj["stats"] as? kotlinx.serialization.json.JsonObject ?: return
+                    val s = stats.value
+                    fun dbl(k: String): Double =
+                        (st[k] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull() ?: 0.0
+                    fun lng(k: String): Long =
+                        (st[k] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toLongOrNull() ?: 0L
+                    dbl("encoded_fps").let { if (it > 0) s.encodedFps = it }
+                    dbl("encode_ms").let { if (it > 0) s.encodeMs = it }
+                    dbl("pipeline_ms").let { if (it > 0) s.pipelineMs = it }
+                    dbl("pipeline_min_ms").let { if (it > 0) s.pipelineMinMs = it }
+                    dbl("pipeline_max_ms").let { if (it > 0) s.pipelineMaxMs = it }
+                    dbl("send_ms").let { if (it > 0) s.sendMs = it }
+                    dbl("send_min_ms").let { if (it > 0) s.sendMinMs = it }
+                    dbl("send_max_ms").let { if (it > 0) s.sendMaxMs = it }
+                    dbl("frame_max_kb").let { if (it > 0) s.frameMaxKb = it }
+                    dbl("video_mbps").let { if (it > 0) s.bitrateMbps = it }
+                    dbl("peak_mbps").let { if (it > 0) s.peakMbps = it }
+                    dbl("target_mbps").let { if (it > 0) s.targetMbps = it }
+                    dbl("rtt_ms").let { if (it > 0) s.latencyMs = it.toInt() }
+                    dbl("cpu_percent").let { if (it > 0) s.cpuPercent = it }
+                    dbl("gpu_percent").let { if (it > 0) s.gpuPercent = it }
+                    lng("mem_total").let { if (it > 0) s.memTotal = it }
+                    lng("mem_used").let { if (it > 0) s.memUsed = it }
+                    lng("gpu_mem_total").let { if (it > 0) s.gpuMemTotal = it }
+                    lng("gpu_mem_used").let { if (it > 0) s.gpuMemUsed = it }
+                    s.throttled = (st["throttled"] as? kotlinx.serialization.json.JsonPrimitive)?.content == "true"
+                    stats.value = s
                 }
                 "print_document" -> {
                     val name = (obj["name"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: return
@@ -524,37 +609,107 @@ class SelkiesSession(
         val s = settings()
         if (subject == "webcam" || subject.contains("webcam")) {
             if (wanted) {
-                if (webcamCapture.active) return
+                if (webcamActive.value) return
                 startWebcamUplink()
             } else {
-                runCatching { webcamCapture.stop() }
+                stopWebcamUplink()
             }
         } else if (subject == "microphone" || subject.contains("microphone")) {
-            if (wanted && s.micEnabled && !micCapture.active) {
+            if (wanted && s.micEnabled && !micActive.value) {
                 startMicUplink()
             } else if (!wanted) {
-                runCatching { micCapture.stop() }
+                stopMicUplink()
+            }
+        }
+    }
+
+    // =====================================================================
+    // 打印队列（v2.4.0：下载校验 + 本地备份 + 系统打印 + 状态跟踪）
+    // =====================================================================
+
+    private fun updatePrintJob(name: String, transform: (PrintJobEntry) -> PrintJobEntry) {
+        val list = printJobs.value.toMutableList()
+        val idx = list.indexOfFirst { it.name == name }
+        if (idx >= 0) {
+            list[idx] = transform(list[idx])
+        } else {
+            list.add(0, transform(PrintJobEntry(name = name, sizeBytes = 0)))
+        }
+        printJobs.value = list
+    }
+
+    fun retryPrintJob(name: String) {
+        val job = printJobs.value.firstOrNull { it.name == name } ?: return
+        if (job.status == "printing" || job.status == "downloading") return
+        downloadAndPrint(job.name, job.sizeBytes)
+    }
+
+    fun savePrintJob(name: String, onDone: (Boolean, String?) -> Unit) {
+        val job = printJobs.value.firstOrNull { it.name == name } ?: return
+        val local = job.localPath
+        if (local != null && java.io.File(local).exists()) {
+            onDone(true, local)
+            return
+        }
+        ioScope.launch {
+            val (code, bytes) = runCatching {
+                connection.apiGetBytes("/api/print/" + java.net.URLEncoder.encode(name, "UTF-8").replace("+", "%20"))
+            }.getOrNull() ?: (-1 to ByteArray(0))
+            if (code == 200 && bytes.size > 4 && bytes[0] == '%'.code.toByte()) {
+                val saved = runCatching { platform.savePrintPdf(name, bytes) }.getOrNull()
+                updatePrintJob(name) { it.copy(status = if (saved != null) "printing" else "error", localPath = saved, message = if (saved == null) "保存失败" else "") }
+                onDone(saved != null, saved)
+            } else {
+                updatePrintJob(name) { it.copy(status = "error", message = "获取失败（HTTP $code），文档可能已被取走或名称非法") }
+                onDone(false, null)
+            }
+        }
+    }
+
+    private fun downloadAndPrint(name: String, sizeBytes: Long) {
+        updatePrintJob(name) { it.copy(status = "downloading", message = "") }
+        ioScope.launch {
+            val (code, bytes) = runCatching {
+                connection.apiGetBytes("/api/print/" + java.net.URLEncoder.encode(name, "UTF-8").replace("+", "%20"))
+            }.getOrNull() ?: (-1 to ByteArray(0))
+            when {
+                code != 200 -> updatePrintJob(name) {
+                    it.copy(status = "error", message = "下载失败（HTTP $code）：" + when (code) {
+                        401 -> "认证失败，请检查用户名/密码或令牌"
+                        403 -> "打印被服务器禁用或当前为只读身份"
+                        404 -> "文档不存在（可能已被取走——服务器取走即删）"
+                        else -> "网络或服务器错误"
+                    })
+                }
+                bytes.size < 5 || bytes[0] != '%'.code.toByte() || bytes[1] != 'P'.code.toByte() ->
+                    updatePrintJob(name) { it.copy(status = "error", message = "文件校验失败：非有效 PDF（传输损坏或服务器输出异常）") }
+                sizeBytes > 0 && bytes.size.toLong() != sizeBytes ->
+                    updatePrintJob(name) { it.copy(status = "error", message = "文件大小不符（通知 $sizeBytes 字节，实际 ${bytes.size}），疑似传输损坏") }
+                else -> {
+                    // 本地备份（保存失败不影响打印）
+                    val saved = runCatching { platform.savePrintPdf(name, bytes) }.getOrNull()
+                    updatePrintJob(name) { it.copy(status = "printing", localPath = saved, message = "") }
+                    withContext(Dispatchers.Main) {
+                        onPrintDocument(name, bytes.size.toLong())
+                        // ⚠️ PrintManager 必须在主线程调起（旧版在 IO 线程调用导致远程打印无声失败）
+                        platform.print().printPdf(bytes, name) { ok, err ->
+                            updatePrintJob(name) {
+                                if (ok) it.copy(status = "done", message = "已交付系统打印服务")
+                                else it.copy(status = "error", message = "系统打印失败：${err ?: "未知原因"}")
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
     private fun handlePrintDocument(name: String, sizeBytes: Long) {
-        ioScope.launch {
-            runCatching {
-                val (code, bytes) = connection.apiGetBytes("/api/print/" + java.net.URLEncoder.encode(name, "UTF-8").replace("+", "%20"))
-                if (code == 200 && bytes.isNotEmpty()) {
-                    withContext(Dispatchers.Main) {
-                        onPrintDocument(name, sizeBytes)
-                        // ⚠️ PrintManager 必须在主线程调起（旧版在 IO 线程调用导致远程打印无声失败）
-                        platform.print().printPdf(bytes, name)
-                    }
-                } else {
-                    notices.value = "远程打印：获取文档 $name 失败（HTTP $code）"
-                }
-            }.onFailure {
-                notices.value = "远程打印失败：${it.message ?: it.javaClass.simpleName}"
-            }
-        }
+        // 入队（去重：同名且已完成/正在处理的不重复）
+        val existing = printJobs.value.firstOrNull { it.name == name }
+        if (existing != null && (existing.status == "done" || existing.status == "printing" || existing.status == "downloading")) return
+        updatePrintJob(name) { it.copy(sizeBytes = sizeBytes, status = "pending", message = "") }
+        downloadAndPrint(name, sizeBytes)
     }
 
     // =====================================================================
@@ -625,6 +780,16 @@ class SelkiesSession(
         }
         lastReceivedFrameAt = System.currentTimeMillis()
         disarmStartVideoWatchdog()
+        // 本地帧率测量（呈现近似）
+        val now = lastReceivedFrameAt
+        if (localFrameWindowStart == 0L) localFrameWindowStart = now
+        localFrameCount++
+        if (now - localFrameWindowStart >= 1000) {
+            val fps = localFrameCount * 1000.0 / (now - localFrameWindowStart)
+            stats.value.fps = fps.toInt()
+            localFrameCount = 0
+            localFrameWindowStart = now
+        }
     }
 
     private var lastLostFrameReportAt = 0L
@@ -729,6 +894,27 @@ class SelkiesSession(
         statsSubscriptionActive = true
         ioScope.launch {
             runCatching { connection.sendText("_stats,1") }
+        }
+        startStatsSamplerIfNeeded()
+    }
+
+    /** 每秒采样：本地 fps + 服务器统计 → 历史序列（最多 120 点，供图表）；每 5 秒上报 _f/_l */
+    private fun startStatsSamplerIfNeeded() {
+        if (statsSampler?.isActive == true) return
+        statsSampler = scope.launch {
+            var tick = 0
+            while (isActive && !userClosed) {
+                delay(1000)
+                val s = stats.value
+                s.pushSample(s.fps.toDouble(), s.encodedFps, s.bitrateMbps, s.latencyMs.toDouble())
+                stats.value = s
+                if (++tick % 5 == 0) {
+                    runCatching {
+                        if (s.fps > 0) connection.sendText("_f,${s.fps}")
+                        if (s.latencyMs > 0) connection.sendText("_l,${s.latencyMs}")
+                    }
+                }
+            }
         }
     }
 
@@ -1016,12 +1202,57 @@ class SelkiesSession(
     }
 
     // =====================================================================
-    // 麦克风 / 摄像头上行
+    // 麦克风 / 摄像头上行（v2.4.0：设备选择）
     // =====================================================================
 
+    /** 枚举硬件设备（麦克风/摄像头/扬声器）——UI 打开硬件面板时调用 */
+    fun refreshHardwareDevices() {
+        ioScope.launch {
+            runCatching {
+                micDevices.value = platform.enumerateMics()
+                cameraDevices.value = platform.enumerateCameras()
+                speakerDevices.value = platform.enumerateSpeakers()
+                // 初始化选中状态：优先服务器条目保存的偏好
+                if (selectedMicIds.value.isEmpty()) {
+                    val pref = server.preferredMicIds.split(',').filter { it.isNotBlank() }
+                        .filter { id -> micDevices.value.any { it.id == id } }
+                    selectedMicIds.value = pref.ifEmpty {
+                        micDevices.value.firstOrNull()?.let { listOf(it.id) } ?: emptyList()
+                    }
+                }
+                if (selectedCameraId.value.isBlank()) {
+                    val pref = server.preferredCameraId
+                    selectedCameraId.value = if (cameraDevices.value.any { it.id == pref }) pref else ""
+                }
+            }
+        }
+    }
+
+    /** 选择麦克风（多选混音；持久化到服务器条目；采集中则热切换） */
+    fun selectMics(ids: List<String>) {
+        selectedMicIds.value = ids
+        server.preferredMicIds = ids.joinToString(",")
+        if (micActive.value) {
+            runCatching { micCapture.stop() }
+            if (ids.isNotEmpty()) startMicUplink()
+        }
+    }
+
+    /** 选择摄像头（单选；服务器虚拟摄像头一次一路；采集中则热切换） */
+    fun selectCamera(id: String) {
+        selectedCameraId.value = id
+        server.preferredCameraId = id
+        if (webcamActive.value) {
+            runCatching { webcamCapture.stop() }
+            if (id.isNotBlank()) startWebcamUplink()
+        }
+    }
+
     fun startMicUplink() {
-        if (micCapture.active) return
+        if (micActive.value || micCapture.active) { micActive.value = true; return }
+        micActive.value = true
         micCapture.start(
+            deviceIds = selectedMicIds.value,
             onOpusFrame = { opus ->
                 ioScope.launch {
                     val frame = ByteArray(opus.size + 1)
@@ -1032,19 +1263,25 @@ class SelkiesSession(
             },
             onError = { err ->
                 notices.value = "麦克风：$err"
+                micActive.value = false
                 runCatching { micCapture.stop() }
             }
         )
     }
 
     fun stopMicUplink() {
+        micActive.value = false
         runCatching { micCapture.stop() }
     }
 
     fun startWebcamUplink() {
-        if (webcamCapture.active) return
+        if (webcamActive.value || webcamCapture.active) { webcamActive.value = true; return }
+        webcamActive.value = true
         webcamCapture.start(
-            encoder = "h264",
+            encoder = server.webcamEncoder,
+            deviceId = selectedCameraId.value,
+            targetW = server.webcamWidth,
+            targetH = server.webcamHeight,
             onFrame = { codecId, keyframe, data ->
                 ioScope.launch {
                     val frame = ByteArray(data.size + 3)
@@ -1057,12 +1294,14 @@ class SelkiesSession(
             },
             onError = { err ->
                 notices.value = "摄像头：$err"
+                webcamActive.value = false
                 runCatching { webcamCapture.stop() }
             }
         )
     }
 
     fun stopWebcamUplink() {
+        webcamActive.value = false
         runCatching { webcamCapture.stop() }
     }
 

@@ -2,10 +2,11 @@ package com.selkies.client.webcam
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
-import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
@@ -15,6 +16,7 @@ import android.media.MediaFormat
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Size
+import com.selkies.client.model.HardwareDevice
 import com.selkies.client.platform.AndroidPlatform
 import com.selkies.client.platform.WebcamCapture
 import java.io.ByteArrayOutputStream
@@ -22,6 +24,7 @@ import java.util.concurrent.Executor
 
 /**
  * Android 摄像头上行：CameraX ImageAnalysis (YUV_420_888) → NV12 → MediaCodec H.264 → 0x06 帧
+ * v2.4.0：支持按 cameraId 选择设备（前置/后置/外接多摄）、分辨率可配、编码器可配。
  */
 class AndroidWebcamCapture : WebcamCapture {
 
@@ -35,27 +38,72 @@ class AndroidWebcamCapture : WebcamCapture {
     @Volatile
     private var requestKeyframeFlag = false
     private var onFrame: ((Int, Boolean, ByteArray) -> Unit)? = null
+    @Volatile
+    private var camW = 1280
+    @Volatile
+    private var camH = 720
 
     override val active: Boolean get() = running
-    override val width: Int get() = 640
-    override val height: Int get() = 480
+    override val width: Int get() = camW
+    override val height: Int get() = camH
 
     private val pendingFrames = java.util.concurrent.LinkedBlockingQueue<Pair<ByteArray, Long>>(4)
 
+    companion object {
+        /** 枚举摄像头（Camera2 API：含前后/外接与朝向/等级信息） */
+        fun devices(): List<HardwareDevice> {
+            val ctx = runCatching { AndroidPlatform.appCtx() }.getOrNull() ?: return emptyList()
+            val cm = ctx.getSystemService(android.content.Context.CAMERA_SERVICE) as? CameraManager ?: return emptyList()
+            return runCatching {
+                cm.cameraIdList.mapIndexedNotNull { idx, id ->
+                    val ch = runCatching { cm.getCameraCharacteristics(id) }.getOrNull() ?: return@mapIndexedNotNull null
+                    val facing = when (ch.get(CameraCharacteristics.LENS_FACING)) {
+                        CameraCharacteristics.LENS_FACING_FRONT -> "前置"
+                        CameraCharacteristics.LENS_FACING_BACK -> "后置"
+                        CameraCharacteristics.LENS_FACING_EXTERNAL -> "外接"
+                        else -> "未知朝向"
+                    }
+                    val level = when (ch.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)) {
+                        CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY -> "Legacy"
+                        CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED -> "Limited"
+                        CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_FULL -> "Full"
+                        3 -> "Level-3"   // INFO_SUPPORTED_HARDWARE_LEVEL_3
+                        CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_EXTERNAL -> "External"
+                        else -> ""
+                    }
+                    // 物理多摄（logical camera）标注
+                    val physical = ch.physicalCameraIds
+                    val physNote = if (physical.isNotEmpty()) " · 逻辑多摄(${physical.size})" else ""
+                    HardwareDevice(
+                        id = id,
+                        name = "${facing}摄像头" + if (idx > 1) " ${idx + 1}" else "",
+                        type = "camera",
+                        detail = facing + (level.takeIf { it.isNotBlank() }?.let { " · $level" } ?: "") + physNote
+                    )
+                }
+            }.getOrDefault(emptyList())
+        }
+    }
+
     override fun start(
         encoder: String,
+        deviceId: String,
+        targetW: Int,
+        targetH: Int,
         onFrame: (codecId: Int, keyframe: Boolean, data: ByteArray) -> Unit,
         onError: (String) -> Unit
     ) {
         if (running) return
         this.onFrame = onFrame
+        camW = targetW.coerceIn(160, 1920)
+        camH = targetH.coerceIn(120, 1080)
 
         val ctx = runCatching { AndroidPlatform.appCtx() }.getOrNull()
         if (ctx != null &&
             ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED
         ) {
             AndroidPlatform.ensurePermissions(listOf(Manifest.permission.CAMERA)) { granted ->
-                if (granted) start(encoder, onFrame, onError) else onError("未授予摄像头权限")
+                if (granted) start(encoder, deviceId, targetW, targetH, onFrame, onError) else onError("未授予摄像头权限")
             }
             return
         }
@@ -78,7 +126,7 @@ class AndroidWebcamCapture : WebcamCapture {
                 analysisExecutor = Executor { handler.post(it) }
 
                 val analysis = ImageAnalysis.Builder()
-                    .setTargetResolution(Size(640, 480))
+                    .setTargetResolution(Size(camW, camH))
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
                 analysis.setAnalyzer(analysisExecutor!!) { image ->
@@ -86,10 +134,42 @@ class AndroidWebcamCapture : WebcamCapture {
                 }
 
                 cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(activity, CameraSelector.DEFAULT_FRONT_CAMERA, analysis)
-                startEncoderLoop(onError)
+                // 设备选择：按朝向绑定；后置不存在时回退前置
+                val selector = buildSelector(deviceId)
+                try {
+                    cameraProvider.bindToLifecycle(activity, selector, analysis)
+                } catch (e: Exception) {
+                    cameraProvider.bindToLifecycle(activity, CameraSelector.DEFAULT_FRONT_CAMERA, analysis)
+                }
+                startEncoderLoop(encoder, onError)
             }.onFailure { onError("摄像头启动失败：${it.message}") }
         }, ContextCompat.getMainExecutor(ctx ?: return))
+    }
+
+    /** deviceId → CameraSelector（按朝向选择；CameraX 不支持直接按 camera2 id 绑定） */
+    private fun buildSelector(deviceId: String): CameraSelector {
+        if (deviceId.equals("front", true)) return CameraSelector.DEFAULT_FRONT_CAMERA
+        if (deviceId.equals("external", true)) {
+            return CameraSelector.Builder().requireLensFacing(CameraSelector.LENS_FACING_EXTERNAL).build()
+        }
+        if (deviceId.isNotBlank() && deviceId.all { it.isDigit() }) {
+            // 指定 id：查其朝向后选择（同朝向多摄由 CameraX 决定具体打开哪颗）
+            if (isFacing(deviceId, CameraCharacteristics.LENS_FACING_FRONT)) {
+                return CameraSelector.DEFAULT_FRONT_CAMERA
+            }
+            if (isFacing(deviceId, CameraCharacteristics.LENS_FACING_BACK)) {
+                return CameraSelector.DEFAULT_BACK_CAMERA
+            }
+        }
+        return CameraSelector.DEFAULT_BACK_CAMERA
+    }
+
+    private fun isFacing(cameraId: String, facing: Int): Boolean {
+        val ctx = runCatching { AndroidPlatform.appCtx() }.getOrNull() ?: return false
+        val cm = ctx.getSystemService(android.content.Context.CAMERA_SERVICE) as? CameraManager ?: return false
+        return runCatching {
+            cm.getCameraCharacteristics(cameraId).get(CameraCharacteristics.LENS_FACING) == facing
+        }.getOrDefault(false)
     }
 
     override fun requestKeyframe() {
@@ -112,6 +192,8 @@ class AndroidWebcamCapture : WebcamCapture {
             if (!running) return
             val w = image.width
             val h = image.height
+            camW = w
+            camH = h
             // YUV_420_888 → NV12 (yyyyyyyy + interleaved uv)
             val ySize = w * h
             val nv12 = ByteArray(ySize + ySize / 2)
@@ -140,7 +222,6 @@ class AndroidWebcamCapture : WebcamCapture {
                         vBuf.get(row * vPlane.rowStride + col * vPlane.pixelStride)
                 }
             }
-            // 前置摄像头镜像翻转（水平翻转标志在 flags 中由上层处理，此处直接翻转数据更稳妥）
             pendingFrames.offer(nv12 to System.nanoTime() / 1000)
             if (pendingFrames.size > 3) pendingFrames.poll()
         } catch (_: Exception) {
@@ -149,25 +230,43 @@ class AndroidWebcamCapture : WebcamCapture {
         }
     }
 
-    private fun startEncoderLoop(onError: (String) -> Unit) {
+    private fun startEncoderLoop(requestedEncoder: String, onError: (String) -> Unit) {
         encoderThread = Thread({
             runCatching {
-                val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 640, 480)
-                format.setInteger(MediaFormat.KEY_BIT_RATE, 1_000_000)
+                val useMime = when {
+                    requestedEncoder.equals("mjpeg", true) || requestedEncoder.equals("jpeg", true) -> ""
+                    requestedEncoder.equals("h265", true) || requestedEncoder.equals("hevc", true) -> MediaFormat.MIMETYPE_VIDEO_HEVC
+                    requestedEncoder.equals("vp8", true) -> MediaFormat.MIMETYPE_VIDEO_VP8
+                    requestedEncoder.equals("vp9", true) -> MediaFormat.MIMETYPE_VIDEO_VP9
+                    else -> MediaFormat.MIMETYPE_VIDEO_AVC
+                }
+                if (useMime.isEmpty()) {
+                    // JPEG 软编码路径：YUV→JPEG（Bitmap 压缩）走 0x06 codec 0
+                    startJpegLoop(onError)
+                    return@runCatching
+                }
+                val format = MediaFormat.createVideoFormat(useMime, camW, camH)
+                format.setInteger(MediaFormat.KEY_BIT_RATE, 2_500_000)
                 format.setInteger(MediaFormat.KEY_FRAME_RATE, 20)
                 format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
                 format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-                val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                val enc = MediaCodec.createEncoderByType(useMime)
                 enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 enc.start()
                 encoder = enc
+                val codecId = when (useMime) {
+                    MediaFormat.MIMETYPE_VIDEO_HEVC -> 5
+                    MediaFormat.MIMETYPE_VIDEO_VP8 -> 2
+                    MediaFormat.MIMETYPE_VIDEO_VP9 -> 3
+                    else -> 1
+                }
 
                 val info = MediaCodec.BufferInfo()
                 val spsPps = ByteArrayOutputStream()
                 var sentCsd = false
                 while (running) {
                     val frame = pendingFrames.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
-                    var idx = enc.dequeueInputBuffer(10_000_000)
+                    var idx = enc.dequeueInputBuffer(50_000)
                     if (idx >= 0) {
                         val buf = enc.getInputBuffer(idx)!!
                         buf.clear()
@@ -185,7 +284,6 @@ class AndroidWebcamCapture : WebcamCapture {
                     var outIdx = enc.dequeueOutputBuffer(info, 0)
                     while (outIdx >= 0 || outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                            // csd-0 (SPS+PPS) 作为关键帧数据发送
                             val csd0 = enc.outputFormat.getByteBuffer("csd-0")
                             if (csd0 != null) {
                                 val bytes = ByteArray(csd0.remaining())
@@ -208,10 +306,10 @@ class AndroidWebcamCapture : WebcamCapture {
                                 sentCsd = false
                             } else {
                                 if (!sentCsd && spsPps.size() > 0) {
-                                    onFrame?.invoke(1, true, spsPps.toByteArray())
+                                    onFrame?.invoke(codecId, true, spsPps.toByteArray())
                                     sentCsd = true
                                 }
-                                onFrame?.invoke(1, isKey, chunk)
+                                onFrame?.invoke(codecId, isKey, chunk)
                             }
                             enc.releaseOutputBuffer(outIdx, false)
                         }
@@ -225,5 +323,35 @@ class AndroidWebcamCapture : WebcamCapture {
             runCatching { encoder?.stop(); encoder?.release() }
             encoder = null
         }, "selkies-webcam-enc").apply { isDaemon = true; start() }
+    }
+
+    /** JPEG 上行循环（服务器 MJPEG 透传：pixel_format=auto 时设备为 MJPEG） */
+    private fun startJpegLoop(onError: (String) -> Unit) {
+        var quality = 80
+        while (running) {
+            val frame = pendingFrames.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
+            runCatching {
+                val w = camW; val h = camH
+                // NV12(UV) → NV21(VU)：YuvImage 要求 NV21
+                val nv12 = frame.first
+                val ySize = w * h
+                val nv21 = nv12.copyOf()
+                var i = 0
+                while (i < ySize / 2 - 1) {
+                    val tmp = nv21[ySize + i]
+                    nv21[ySize + i] = nv21[ySize + i + 1]
+                    nv21[ySize + i + 1] = tmp
+                    i += 2
+                }
+                val yuvImage = android.graphics.YuvImage(
+                    nv21, android.graphics.ImageFormat.NV21, w, h, null
+                )
+                val out = ByteArrayOutputStream()
+                yuvImage.compressToJpeg(android.graphics.Rect(0, 0, w, h), quality, out)
+                onFrame?.invoke(0, true, out.toByteArray())
+            }.onFailure {
+                if (running) { onError("JPEG 编码失败：${it.message}"); running = false }
+            }
+        }
     }
 }

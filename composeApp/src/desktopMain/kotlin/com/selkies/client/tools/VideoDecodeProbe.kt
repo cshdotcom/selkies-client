@@ -93,7 +93,7 @@ object VideoDecodeProbe {
             override fun setListener(listener: (() -> Unit)?) {}
         }
         override fun print(): PrintBridge = object : PrintBridge {
-            override fun printPdf(pdfBytes: ByteArray, fileName: String) {}
+            override fun printPdf(pdfBytes: ByteArray, fileName: String, onResult: (Boolean, String?) -> Unit) { onResult(true, null) }
         }
         override fun vibrate(ms: Long) {}
         override fun openUrl(url: String) {}
@@ -113,12 +113,12 @@ object VideoDecodeProbe {
             override val bufferLevelMs: Int = 0
         }
         override fun makeMicCapture(): MicCapture = object : MicCapture {
-            override fun start(onOpusFrame: (ByteArray) -> Unit, onError: (String) -> Unit) {}
+            override fun start(deviceIds: List<String>, onOpusFrame: (ByteArray) -> Unit, onError: (String) -> Unit) {}
             override fun stop() {}
             override val active: Boolean = false
         }
         override fun makeWebcamCapture(): WebcamCapture = object : WebcamCapture {
-            override fun start(encoder: String, onFrame: (Int, Boolean, ByteArray) -> Unit, onError: (String) -> Unit) {}
+            override fun start(encoder: String, deviceId: String, targetW: Int, targetH: Int, onFrame: (Int, Boolean, ByteArray) -> Unit, onError: (String) -> Unit) {}
             override fun requestKeyframe() {}
             override fun stop() {}
             override val active: Boolean = false

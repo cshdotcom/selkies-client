@@ -15,6 +15,8 @@ fun main() {
             title = "Selkies 远程桌面",
             state = rememberWindowState(width = 1280.dp, height = 800.dp)
         ) {
+            // AWT 帧引用（文件选择器 / 全屏控制 / 焦点追踪）
+            DesktopPlatform.windowFrame = window
             App()
         }
     }

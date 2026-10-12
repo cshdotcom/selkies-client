@@ -20,18 +20,35 @@ data class ServerEntry(
     var resolutionH: Int = 0,
     var videoBitrate: Int = 8000,       // kbps
     var videoCrf: Int = 24,             // 0 = 使用码率模式
-    var encoder: String = "h264enc",    // h264enc / h264enc-striped / h264enc-fullcolor? / jpeg / ...
+    var encoder: String = "h264enc",    // h264enc / h264enc-striped / h265enc / vp8enc / vp9enc / av1enc / jpeg
     var audioEnabled: Boolean = true,
-    // ---- 官方前端视频高级设置（默认 0/false/空 = 不发送，走服务器默认）----
-    var jpegQuality: Int = 0,               // jpeg_quality 1-100
-    var videoFullcolor: Boolean = false,    // video_fullcolor
+    // ---- 官方前端视频高级设置（0/false = 不发送走服务器默认）----
+    var jpegQuality: Int = 0,               // jpeg_quality 1-100（服务器默认 40）
+    var videoFullcolor: Boolean = false,    // video_fullcolor：4:4:4 全色度
+    var video10bit: Boolean = false,        // video_10bit：10bit 色深
     var useCpu: Boolean = false,            // use_cpu（软编）
     var forceAlignedResolution: Boolean = false,
-    var videoStreamingMode: String = "",    // standard / paint-over
-    var paintOverCrf: Int = 0,              // video_paintover_crf
-    var paintOverBurstFrames: Int = 0,      // video_paintover_burst_frames
-    var paintOverJpegQuality: Int = 0,      // paint_over_jpeg_quality
+    /** video_streaming_mode：官方为布尔（true=Turbo 逐帧编码；false=按损坏门控） */
+    var turboMode: Boolean = true,
+    var keyframeInterval: Double = -1.0,    // keyframe_interval 秒；-1=不发（服务器默认 0=无限 GOP）
+    var videoMinQp: Int = 0,                // video_min_qp 0-51（0=编码器默认）
+    var videoMaxQp: Int = 0,                // video_max_qp 0-51（0=默认；35 可大幅改善滚动文字）
+    var paintOverCrf: Int = 0,              // video_paintover_crf（服务器默认 18）
+    var paintOverBurstFrames: Int = 0,      // video_paintover_burst_frames（服务器默认 5）
+    var paintOverJpegQuality: Int = 0,      // paint_over_jpeg_quality（服务器默认 90）
     var usePaintOverQuality: Boolean = false,
+    // ---- 音频 / 缩放 ----
+    var audioBitrate: Int = 0,              // audio_bitrate bps（0=服务器默认 128000）
+    var scalingDpi: Int = 0,                // scaling_dpi 96-288（0=不发）
+    // ---- 摄像头上行 ----
+    var webcamEncoder: String = "auto",     // webcam_encoder: auto/h264/h265/vp8/vp9/av1/mjpeg
+    var webcamWidth: Int = 1280,
+    var webcamHeight: Int = 720,
+    // ---- 硬件偏好（设备 id，空 = 自动）----
+    var preferredMicIds: String = "",       // 逗号分隔，支持多选混音
+    var preferredCameraId: String = "",     // 单选
+    // ---- 预设 ----
+    var preset: String = "balanced",
     var useTokenAuth: Boolean = false,
     var token: String = "",
     var allowUntrustedCert: Boolean = false
@@ -45,6 +62,51 @@ data class ServerEntry(
         }
         u = u.removeSuffix("/")
         return u
+    }
+}
+
+/** 视频质量预设（映射到 ServerEntry 原始字段；与官方设置键一致） */
+object VideoPresets {
+    data class Preset(val key: String, val label: String, val desc: String)
+
+    val ALL = listOf(
+        Preset("smooth", "流畅优先", "H.264 · 30fps · CRF 30：弱网/移动数据省流量"),
+        Preset("balanced", "均衡（默认）", "H.264 · 60fps · CRF 24：日常通用"),
+        Preset("quality", "画质优先", "H.265 · 60fps · CRF 20：高速网络下最佳观感"),
+        Preset("text", "文字清晰", "H.264 · 4:4:4 · 60fps · CRF 18：代码/文档文字最锐利"),
+        Preset("cinema", "影像高保真", "H.265 · 10bit · 60fps · CRF 16：照片视频色彩最准"),
+        Preset("compat", "最大兼容", "JPEG · 30fps：解码能力最差的环境也能用"),
+        Preset("custom", "自定义", "手动调整全部参数")
+    )
+
+    /** 应用预设到服务器条目（preset 字段自身由调用方维护） */
+    fun apply(e: ServerEntry, key: String) {
+        when (key) {
+            "smooth" -> {
+                e.encoder = "h264enc"; e.framerate = 30; e.videoCrf = 30; e.turboMode = true
+                e.videoFullcolor = false; e.video10bit = false
+            }
+            "balanced" -> {
+                e.encoder = "h264enc"; e.framerate = 60; e.videoCrf = 24; e.turboMode = true
+                e.videoFullcolor = false; e.video10bit = false
+            }
+            "quality" -> {
+                e.encoder = "h265enc"; e.framerate = 60; e.videoCrf = 20; e.turboMode = true
+                e.videoFullcolor = false; e.video10bit = false
+            }
+            "text" -> {
+                e.encoder = "h264enc"; e.framerate = 60; e.videoCrf = 18; e.turboMode = true
+                e.videoFullcolor = true; e.video10bit = false
+            }
+            "cinema" -> {
+                e.encoder = "h265enc"; e.framerate = 60; e.videoCrf = 16; e.turboMode = true
+                e.videoFullcolor = false; e.video10bit = true
+            }
+            "compat" -> {
+                e.encoder = "jpeg"; e.framerate = 30; e.videoCrf = 0; e.jpegQuality = 60; e.turboMode = true
+                e.videoFullcolor = false; e.video10bit = false
+            }
+        }
     }
 }
 
@@ -133,21 +195,76 @@ data class RemoteFileEntry(
     val mtime: String
 )
 
+/** 打印任务条目（服务器 print_document 通知 → 下载校验 → 系统打印 → 状态跟踪） */
+data class PrintJobEntry(
+    val name: String,
+    val sizeBytes: Long,
+    val receivedAt: Long = System.currentTimeMillis(),
+    var status: String = "pending",   // pending / downloading / printing / done / error
+    var message: String = "",
+    var localPath: String? = null
+)
+
+/** 硬件设备描述（麦克风/摄像头/扬声器） */
+data class HardwareDevice(
+    val id: String,
+    val name: String,
+    val type: String,          // mic / camera / speaker
+    val detail: String = ""    // 前置/后置/外接、厂商等
+)
+
 /**
- * 应用统计信息
+ * 应用统计信息（含 stream_stats 完整字段 + 历史采样）
  */
 data class StatsInfo(
-    var fps: Int = 0,
-    var latencyMs: Int = 0,
+    var fps: Int = 0,                 // 客户端呈现帧率（本地测量）
+    var encodedFps: Double = 0.0,     // 服务器编码帧率
+    var latencyMs: Int = 0,           // rtt（服务器 stream_stats）
     var resolution: String = "",
     var codec: String = "",
     var encoderDetail: String = "",
-    var bitrateMbps: Double = 0.0,
+    var bitrateMbps: Double = 0.0,    // video_mbps
+    var peakMbps: Double = 0.0,
+    var targetMbps: Double = 0.0,
     var connectedAt: Long = 0,
     var bytesReceived: Long = 0,
     var videoFrames: Long = 0,
-    var audioLevel: Float = 0f
-)
+    var audioLevel: Float = 0f,
+    // 服务器管线统计
+    var encodeMs: Double = 0.0,
+    var pipelineMs: Double = 0.0,
+    var pipelineMinMs: Double = 0.0,
+    var pipelineMaxMs: Double = 0.0,
+    var sendMs: Double = 0.0,
+    var sendMinMs: Double = 0.0,
+    var sendMaxMs: Double = 0.0,
+    var frameMaxKb: Double = 0.0,
+    var throttled: Boolean = false,
+    // 主机资源
+    var cpuPercent: Double = 0.0,
+    var memUsed: Long = 0,
+    var memTotal: Long = 0,
+    var gpuPercent: Double = 0.0,
+    var gpuMemUsed: Long = 0,
+    var gpuMemTotal: Long = 0,
+    // 历史采样（每秒，最多 120 点，供图表）
+    val fpsHistory: ArrayDeque<Double> = ArrayDeque(),
+    val encodedFpsHistory: ArrayDeque<Double> = ArrayDeque(),
+    val mbpsHistory: ArrayDeque<Double> = ArrayDeque(),
+    val rttHistory: ArrayDeque<Double> = ArrayDeque()
+) {
+    fun pushSample(clientFps: Double, encFps: Double, mbps: Double, rtt: Double) {
+        fun push(q: ArrayDeque<Double>, v: Double) {
+            if (v <= 0.0) return
+            q.addLast(v)
+            while (q.size > 120) q.removeFirst()
+        }
+        push(fpsHistory, clientFps)
+        push(encodedFpsHistory, encFps)
+        push(mbpsHistory, mbps)
+        push(rttHistory, rtt)
+    }
+}
 
 /**
  * 服务器光标形状（cursor,{curdata,width,height,hotx,hoty,handle} 消息）

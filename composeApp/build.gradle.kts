@@ -84,8 +84,8 @@ android {
         applicationId = "com.selkies.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 20300
-        versionName = "2.3.0"
+        versionCode = 20400
+        versionName = "2.4.0"
         ndkVersion = ""
     }
     signingConfigs {
@@ -123,7 +123,7 @@ compose.desktop {
         mainClass = "com.selkies.client.MainKt"
         nativeDistributions {
             packageName = "Selkies-Desktop"
-            packageVersion = "2.3.0"
+            packageVersion = "2.4.0"
             description = "Selkies 远程桌面原生客户端"
             vendor = "Selkies Client"
         }
@@ -140,7 +140,7 @@ val desktopFatJar = tasks.register<Jar>("desktopFatJar") {
     manifest {
         attributes["Main-Class"] = "com.selkies.client.MainKt"
         attributes["Implementation-Title"] = "Selkies Desktop Client"
-        attributes["Implementation-Version"] = "2.3.0"
+        attributes["Implementation-Version"] = "2.4.0"
     }
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
     exclude("META-INF/versions/**/module-info.class")

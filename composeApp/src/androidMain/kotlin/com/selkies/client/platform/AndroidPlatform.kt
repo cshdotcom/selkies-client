@@ -8,10 +8,10 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.pdf.PdfRenderer
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -19,7 +19,7 @@ import android.print.PrintAttributes
 import android.print.PrintDocumentAdapter
 import android.print.PrintDocumentInfo
 import android.print.PrintManager
-import android.print.pdf.PrintedPdfDocument
+import android.provider.MediaStore
 import android.view.KeyEvent
 import android.view.View
 import android.view.WindowInsets
@@ -31,6 +31,7 @@ import androidx.core.content.ContextCompat
 import androidx.compose.ui.graphics.asImageBitmap
 import com.selkies.client.audio.AndroidAudioPlayer
 import com.selkies.client.audio.AndroidMicCapture
+import com.selkies.client.model.HardwareDevice
 import com.selkies.client.video.AndroidVideoSink
 import com.selkies.client.webcam.AndroidWebcamCapture
 import io.ktor.client.HttpClient
@@ -328,6 +329,117 @@ object AndroidPlatform : PlatformServices {
     override fun setPhysicalKeyHandler(handler: ((Int, Boolean) -> Unit)?) {
         // Android 使用 Compose onPreviewKeyEvent 路径，无需 AWT 分发器
     }
+
+    // ---- v2.4.0 硬件选择 ----
+
+    override fun enumerateMics(): List<HardwareDevice> = AndroidMicCapture.devices()
+
+    override fun enumerateCameras(): List<HardwareDevice> = AndroidWebcamCapture.devices()
+
+    override fun enumerateSpeakers(): List<HardwareDevice> {
+        val ctx = appContext ?: return emptyList()
+        val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager ?: return emptyList()
+        return runCatching {
+            am.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS)
+                .filter {
+                    it.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER ||
+                            it.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                            it.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                            it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                            it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                            it.type == android.media.AudioDeviceInfo.TYPE_USB_HEADSET ||
+                            it.type == android.media.AudioDeviceInfo.TYPE_USB_DEVICE
+                }
+                .mapIndexed { idx, d ->
+                    val kind = when (d.type) {
+                        android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "扬声器"
+                        android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES, android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET -> "有线耳机"
+                        android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO, android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "蓝牙"
+                        else -> "USB"
+                    }
+                    HardwareDevice(
+                        id = d.address?.ifBlank { "speaker-$idx" } ?: "speaker-$idx",
+                        name = d.productName?.toString()?.ifBlank { kind } ?: kind,
+                        type = "speaker",
+                        detail = kind
+                    )
+                }
+        }.getOrDefault(emptyList())
+    }
+
+    override fun showOnScreenKeyboard(): Boolean {
+        // Android：系统输入法即屏幕键盘
+        showSoftInput(true)
+        return true
+    }
+
+    override fun setSpeakerDevice(deviceId: String) {
+        // Android 输出路由：蓝牙 SCO 需要专门开启；有线/扬声器由系统自动切换
+        runCatching {
+            val am = appContext?.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager ?: return
+            if (deviceId.contains("sco", true)) {
+                am.startBluetoothSco()
+                am.isBluetoothScoOn = true
+            } else if (am.isBluetoothScoOn) {
+                am.stopBluetoothSco()
+                am.isBluetoothScoOn = false
+            }
+        }
+    }
+
+    override fun savePrintPdf(fileName: String, pdfBytes: ByteArray): String? {
+        return runCatching {
+            val ctx = appContext ?: return null
+            // 1) 公共下载目录（MediaStore，用户可见）
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val values = android.content.ContentValues().apply {
+                        put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                        put(MediaStore.Downloads.MIME_TYPE, "application/pdf")
+                        put(MediaStore.Downloads.IS_PENDING, 1)
+                    }
+                    val resolver = ctx.contentResolver
+                    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    if (uri != null) {
+                        resolver.openOutputStream(uri)?.use { it.write(pdfBytes) }
+                        values.clear()
+                        values.put(MediaStore.Downloads.IS_PENDING, 0)
+                        resolver.update(uri, values, null, null)
+                    }
+                } else {
+                    @Suppress("DEPRECATION")
+                    val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                    dir.mkdirs()
+                    FileOutputStream(File(dir, fileName)).use { it.write(pdfBytes) }
+                }
+            }
+            // 2) 应用可访问副本（供打开/分享——FileProvider）
+            val appDir = File(
+                ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: ctx.filesDir,
+                "prints"
+            )
+            appDir.mkdirs()
+            val f = File(appDir, fileName)
+            FileOutputStream(f).use { it.write(pdfBytes) }
+            f.absolutePath
+        }.getOrNull()
+    }
+
+    override fun openLocalFile(path: String): Boolean {
+        return runCatching {
+            val ctx = appContext ?: return false
+            val uri = runCatching {
+                androidx.core.content.FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", File(path))
+            }.getOrNull() ?: android.net.Uri.fromFile(File(path))
+            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/pdf")
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            ctx.startActivity(intent)
+            true
+        }.getOrDefault(false)
+    }
 }
 
 /** 平台 HttpClient（OkHttp 引擎，可选信任所有证书）
@@ -532,77 +644,35 @@ object AndroidKeys {
     }
 }
 
-/** Android 打印桥接：PDF 字节 → 系统打印界面 */
+/** Android 打印桥接：PDF 字节直通系统打印（v2.4.0 重写——不再重栅格化，保留矢量文字）
+ *  旧版把 PDF 逐页渲染成位图再重新封装，导致文字模糊、大文档 OOM、部分打印机服务报错。
+ */
 private object AndroidPrintBridge : PrintBridge {
-    override fun printPdf(pdfBytes: ByteArray, fileName: String) {
-        val act = AndroidPlatform.activity() ?: return
+    override fun printPdf(pdfBytes: ByteArray, fileName: String, onResult: (Boolean, String?) -> Unit) {
+        val act = AndroidPlatform.activity() ?: run {
+            onResult(false, "无可用的 Activity（应用已退到后台）")
+            return
+        }
         runCatching {
-            val printManager = act.getSystemService(Context.PRINT_SERVICE) as? PrintManager ?: return
+            val printManager = act.getSystemService(Context.PRINT_SERVICE) as? PrintManager ?: run {
+                onResult(false, "系统打印服务不可用")
+                return
+            }
             val jobName = "Selkies: $fileName"
-            printManager.print(jobName, PdfPrintAdapter(act, pdfBytes, fileName), PrintAttributes.Builder().build())
+            printManager.print(jobName, PdfPrintAdapter(pdfBytes, fileName, onResult), PrintAttributes.Builder().build())
+        }.onFailure {
+            onResult(false, "无法调起系统打印：${it.message}")
         }
     }
 
+    /** PDF 直通适配器：onLayout 读页数元数据（不渲染内容），onWrite 原样拷贝字节 */
     private class PdfPrintAdapter(
-        private val context: Context,
         private val pdfBytes: ByteArray,
-        private val fileName: String
+        private val fileName: String,
+        private val onResult: (Boolean, String?) -> Unit
     ) : PrintDocumentAdapter() {
 
-        override fun onWrite(
-            pages: Array<out android.print.PageRange>?,
-            destination: ParcelFileDescriptor?,
-            cancellationSignal: android.os.CancellationSignal?,
-            callback: WriteResultCallback?
-        ) {
-            runCatching {
-                PdfRenderer(ParcelFileDescriptor.open(
-                    java.io.File(context.cacheDir, "print_tmp_${System.currentTimeMillis()}.pdf").apply {
-                        writeBytes(pdfBytes)
-                    }, ParcelFileDescriptor.MODE_READ_ONLY
-                )).use { renderer ->
-                    val printAttrs = PrintAttributes.Builder()
-                        .setMediaSize(PrintAttributes.MediaSize.ISO_A4)
-                        .setResolution(PrintAttributes.Resolution("pdf", "pdf", 300, 300))
-                        .setColorMode(PrintAttributes.COLOR_MODE_COLOR)
-                        .build()
-                    val document = PrintedPdfDocument(context, printAttrs)
-                    try {
-                        val pageCount = renderer.pageCount
-                        for (i in 0 until pageCount) {
-                            if (cancellationSignal?.isCanceled == true) {
-                                callback?.onWriteCancelled()
-                                return
-                            }
-                            renderer.openPage(i).use { page ->
-                                val pdfPage = document.startPage(i)
-                                val scale = minOf(
-                                    pdfPage.canvas.width.toFloat() / page.width,
-                                    pdfPage.canvas.height.toFloat() / page.height
-                                )
-                                val bitmap = Bitmap.createBitmap(
-                                    page.width, page.height, Bitmap.Config.ARGB_8888
-                                )
-                                bitmap.eraseColor(Color.WHITE)
-                                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
-                                pdfPage.canvas.save()
-                                pdfPage.canvas.scale(scale, scale)
-                                pdfPage.canvas.drawBitmap(bitmap, 0f, 0f, null)
-                                pdfPage.canvas.restore()
-                                bitmap.recycle()
-                                document.finishPage(pdfPage)
-                            }
-                        }
-                        document.writeTo(FileOutputStream(destination!!.fileDescriptor))
-                        callback?.onWriteFinished(arrayOf(android.print.PageRange.ALL_PAGES))
-                    } finally {
-                        document.close()
-                    }
-                }
-            }.onFailure {
-                callback?.onWriteFailed(it.message)
-            }
-        }
+        private var pageCount = 1
 
         override fun onLayout(
             oldAttributes: PrintAttributes?,
@@ -615,10 +685,41 @@ private object AndroidPrintBridge : PrintBridge {
                 callback?.onLayoutCancelled()
                 return
             }
-            val info = PrintDocumentInfo.Builder(fileName ?: "document.pdf")
+            // 仅读取页数元数据（不渲染内容，代价极小）
+            runCatching {
+                val tmp = File(AndroidPlatform.appCtx()?.cacheDir, "print_meta.pdf")
+                tmp.writeBytes(pdfBytes)
+                ParcelFileDescriptor.open(tmp, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                    PdfRenderer(fd).use { pageCount = it.pageCount }
+                }
+                tmp.delete()
+            }
+            val info = PrintDocumentInfo.Builder(fileName.ifBlank { "document.pdf" })
                 .setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
+                .setPageCount(pageCount)
                 .build()
             callback?.onLayoutFinished(info, true)
+        }
+
+        override fun onWrite(
+            pages: Array<out android.print.PageRange>?,
+            destination: ParcelFileDescriptor?,
+            cancellationSignal: android.os.CancellationSignal?,
+            callback: WriteResultCallback?
+        ) {
+            runCatching {
+                if (destination == null) {
+                    callback?.onWriteFailed("无效的输出目标")
+                    onResult(false, "无效的输出目标")
+                    return
+                }
+                java.io.FileOutputStream(destination.fileDescriptor).use { it.write(pdfBytes) }
+                callback?.onWriteFinished(arrayOf(android.print.PageRange.ALL_PAGES))
+                onResult(true, null)
+            }.onFailure {
+                callback?.onWriteFailed(it.message)
+                onResult(false, it.message)
+            }
         }
     }
 }
