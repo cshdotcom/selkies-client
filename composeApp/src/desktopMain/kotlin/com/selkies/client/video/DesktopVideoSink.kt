@@ -73,10 +73,41 @@ class DesktopVideoSink : VideoSink {
     private var ctxCodecId = 0
 
     // 位图三缓冲轮换
-    private val pool = ArrayDeque<Bitmap>(3)
-    private val poolBytes = ArrayDeque<ByteArray>(3)
-    private var poolW = 0
-    private var poolH = 0
+    // （v2.6.0+ 修复后已废弃位图三缓冲池——并发 realloc 竞态是渲染崩溃根因，见 publishBgra 注释）
+
+    /** 最新解码帧快照（锁保护的复用缓冲——供截图使用，消除跨线程读 Skia 池化位图的竞态）
+     *  v2.6.0+：旧版 captureVideoFrame 直接对 bitmapFlow 里的池化 Bitmap 调 readPixels，
+     *  而解码线程同时会 allocN32Pixels/installPixels 同一池对象（3 缓冲轮换）→
+     *  像素缓冲被 realloc 抽走 → 读到垃圾/崩溃/冻结（间歇性）。
+     *  新方案：解码线程每帧持锁 arraycopy 进复用缓冲（4MB≈1ms，远小于帧间隔）；
+     *  截图时持锁拷出一次——静态桌面无新帧也能拿到最后一帧。 */
+    private val snapLock = Object()
+    private var snapW = 0
+    private var snapH = 0
+    private var snapBytes = ByteArray(0)
+
+    /** 截图：最新帧 BGRA 快照 → PNG（任意线程安全；不再触碰 Skia 位图） */
+    fun captureLatestFramePng(): ByteArray? {
+        val snap: Triple<Int, Int, ByteArray> = synchronized(snapLock) {
+            if (snapW == 0 || snapH == 0 || snapBytes.isEmpty()) return null
+            Triple(snapW, snapH, snapBytes.copyOf())
+        }
+        val (w, h, bgra) = snap
+        return runCatching {
+            val img = java.awt.image.BufferedImage(w, h, java.awt.image.BufferedImage.TYPE_INT_ARGB)
+            val argb = IntArray(w * h)
+            for (i in 0 until w * h) {
+                val b = bgra[i * 4].toInt() and 0xff
+                val g = bgra[i * 4 + 1].toInt() and 0xff
+                val r = bgra[i * 4 + 2].toInt() and 0xff
+                argb[i] = (0xff shl 24) or (r shl 16) or (g shl 8) or b
+            }
+            img.setRGB(0, 0, w, h, argb, 0, w)
+            val out = java.io.ByteArrayOutputStream()
+            javax.imageio.ImageIO.write(img, "png", out)
+            out.toByteArray()
+        }.getOrNull()
+    }
 
     // JPEG 合成画布
     private var jpegCanvas: BufferedImage? = null
@@ -275,23 +306,23 @@ class DesktopVideoSink : VideoSink {
     }
 
     private fun publishBgra(bytes: ByteArray, w: Int, h: Int) {
-        if (poolW != w || poolH != h) {
-            pool.clear()
-            poolBytes.clear()
-            poolW = w
-            poolH = h
-            repeat(3) {
-                pool.addLast(Bitmap())
-                poolBytes.addLast(ByteArray(w * h * 4))
-            }
+        // 截图快照（锁内 arraycopy ≈1ms；源 bytes 是解码线程独占缓冲，持锁拷贝无竞态）
+        synchronized(snapLock) {
+            if (snapBytes.size != w * h * 4) snapBytes = ByteArray(w * h * 4)
+            System.arraycopy(bytes, 0, snapBytes, 0, w * h * 4)
+            snapW = w
+            snapH = h
         }
-        val bmp = pool.removeFirst()
-        val dst = poolBytes.removeFirst()
-        System.arraycopy(bytes, 0, dst, 0, w * h * 4)
+        // ⚠️【渲染崩溃/冻结根因修复】每帧发布全新不可变位图，彻底废弃旧版三缓冲池：
+        //  旧版池在解码线程 realloc/installPixels 同一 Bitmap，而渲染线程（EDT）每帧
+        //  Image.makeFromBitmap(bmp) 转换—— bitmap 恰好在 realloc 瞬间被读 →
+        //  “Failed to Image::makeFromBitmap” RuntimeException → 未捕获 → 应用崩溃/
+        //  窗口冻结（与 Win7/8 崩溃同一根因）。不可变位图发布后永不被改写，
+        //  渲染线程持有的引用天然安全；旧帧由 GC 回收（短期存活，年轻代代价低）。
+        val bmp = Bitmap()
         bmp.allocN32Pixels(w, h)
-        bmp.installPixels(ImageInfo.makeN32Premul(w, h), dst, w * 4)
-        pool.addLast(bmp)
-        poolBytes.addLast(dst)
+        bmp.installPixels(ImageInfo.makeN32Premul(w, h), bytes.copyOf(), w * 4)
+        bmp.setImmutable()
         bitmapFlow.value = bmp.asComposeImageBitmap()
         diagFramesPublished++
         if (!firstFrameRendered.value) firstFrameRendered.value = true

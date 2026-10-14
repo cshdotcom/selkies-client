@@ -37,13 +37,18 @@ actual fun VideoSurface(session: SelkiesSession, modifier: Modifier) {
         val dh = bmp.height * scale
         val ox = (size.width - dw) / 2f
         val oy = (size.height - dh) / 2f
-        drawImage(
-            image = bmp,
-            srcOffset = IntOffset.Zero,
-            srcSize = IntSize(bmp.width, bmp.height),
-            dstOffset = IntOffset(ox.toInt(), oy.toInt()),
-            dstSize = IntSize(dw.toInt(), dh.toInt())
-        )
+        // ⚠️【防崩防线】绘制异常（位图损坏/驱动异常）绝不沿 EDT 上抛杀死整个应用——
+        //    旧版未捕获的 RuntimeException 直接终止进程（用户见到的“点截图/看视频就闪退”）。
+        //    丢一帧远好于丢整个会话；下一帧到来自动恢复。
+        runCatching {
+            drawImage(
+                image = bmp,
+                srcOffset = IntOffset.Zero,
+                srcSize = IntSize(bmp.width, bmp.height),
+                dstOffset = IntOffset(ox.toInt(), oy.toInt()),
+                dstSize = IntSize(dw.toInt(), dh.toInt())
+            )
+        }
     }
 
     DisposableEffect(session) {

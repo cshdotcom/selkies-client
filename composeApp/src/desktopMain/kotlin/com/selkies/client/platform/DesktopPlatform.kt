@@ -383,24 +383,15 @@ object DesktopPlatform : PlatformServices {
 
     override fun captureVideoFrame(onDone: (ByteArray?) -> Unit) {
         val sink = lastDesktopSink
-        val bmp = sink?.bitmapFlow?.value
-        if (sink == null || bmp == null) {
+        if (sink == null) {
             onDone(null)
             return
         }
         Thread {
-            runCatching {
-                // Compose ImageBitmap → BufferedImage → PNG
-                val w = bmp.width
-                val h = bmp.height
-                val img = java.awt.image.BufferedImage(w, h, java.awt.image.BufferedImage.TYPE_INT_ARGB)
-                val buffer = IntArray(w * h)
-                bmp.readPixels(buffer)
-                img.setRGB(0, 0, w, h, buffer, 0, w)
-                val out = java.io.ByteArrayOutputStream()
-                javax.imageio.ImageIO.write(img, "png", out)
-                onDone(out.toByteArray())
-            }.onFailure { onDone(null) }
+            // v2.6.0+：走解码线程的防御性快照（latestFrameSnapshot），
+            // 消除旧版跨线程 readPixels 池化 Skia 位图的竞态（截图瞬间 UI 冻结的根因）
+            val png = runCatching { sink.captureLatestFramePng() }.getOrNull()
+            onDone(png)
         }.apply { isDaemon = true; name = "shot-encode" }.start()
     }
 

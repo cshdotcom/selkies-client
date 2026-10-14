@@ -112,7 +112,29 @@ class SelkiesSession(
         set(value) {
             field?.let { old -> if (value !== old) old.close() }
             field = value
+            watchSinkFirstFrame(value)
         }
+
+    /** v2.6.0+ 视频流可靠性三重加固之一：
+     *  监听解码器 firstFrameRendered —— 帧在到达但长时间解码不出（中途加入 GOP，
+     *  P 帧引用未见过的关键帧，ffmpeg 日志狂刷 non-existing PPS）时主动 REQUEST_KEYFRAME。
+     *  旧版仅看"帧停顿"（无帧到达），这类"帧到达但永不解码"的黑屏无任何自息。 */
+    private var firstDecodedFrameAt = 0L
+    private var firstFrameArrivedAt = 0L
+    private var decodeStallKeyframeAt = 0L
+    private fun watchSinkFirstFrame(sink: VideoSink?) {
+        if (sink == null) { firstDecodedFrameAt = 0; return }
+        scope.launch {
+            runCatching {
+                sink.firstFrameRendered.collect { rendered ->
+                    if (rendered && firstDecodedFrameAt == 0L) {
+                        firstDecodedFrameAt = System.currentTimeMillis()
+                        println("[Selkies][看门狗] 首帧解码成功，解码停滞检测解除")
+                    }
+                }
+            }
+        }
+    }
 
     val audioPlayer by lazy {
         platform.makeAudioPlayer().also { p ->
@@ -203,6 +225,11 @@ class SelkiesSession(
         if (::connection.isInitialized) {
             runCatching { connection.close() }
         }
+        // v2.6.0+：新连接的帧/解码追踪归零（否则旧值会让看门狗误判而永不重臂）
+        lastReceivedFrameId = -1
+        lastReceivedFrameAt = 0L
+        firstFrameArrivedAt = 0L
+        decodeStallKeyframeAt = 0L
         connection = SelkiesConnection(server, this)
         connection.start()
         startStallWatchdog()
@@ -847,6 +874,7 @@ class SelkiesSession(
     }
 
     private fun noteVideoChunk(frameId: Int) {
+        if (firstFrameArrivedAt == 0L) firstFrameArrivedAt = System.currentTimeMillis()
         if (role.value != "viewer") {
             // 官方 VideoWorker lostFrame 语义：检测到帧号跳跃（丢帧）即上报，
             // 服务器据此统计/补偿。限定每秒最多报一次避免风暴。
@@ -1044,8 +1072,16 @@ class SelkiesSession(
                     }
                     armStartVideoWatchdog()
                 } else {
-                    // 仍无视频：请求关键帧并重连
+                    // 仍无视频：请求关键帧；再等 8s 仍无帧 → 重建连接
+                    // （v2.6.0+：服务器端会话/管线可能卡在旧状态，唯一可靠的恢复方式是换新连接——
+                    //   实测同一服务器上新 WS 连接立即可取流，旧连接永远拿不到帧）
                     runCatching { connection.sendText("REQUEST_KEYFRAME") }
+                    delay(8000)
+                    if (!userClosed && modeReceived && lastReceivedFrameAt == 0L) {
+                        statusDetail.value = "视频流未启动，自动重建连接…"
+                        runCatching { connection.close() }
+                        openConnection()
+                    }
                 }
             }
         }
@@ -1155,8 +1191,9 @@ class SelkiesSession(
 
     /**
      * 帧停顿看门狗：CONNECTED 且已请求视频但 3s 无新帧 → 自动 REQUEST_KEYFRAME（限流 5s/次）。
-     * 覆盖两类用户报障：①退到后台再回前台 SurfaceView 重建后解码器丢弃增量帧→永久黑屏；
-     * ②链路丢帧导致参考帧断裂→画面冻结。触发后恢复的帧会重置 lastReceivedFrameAt。
+     * 覆盖三类用户报障：①退到后台再回前台 SurfaceView 重建后解码器丢弃增量帧→永久黑屏；
+     * ②链路丢帧导致参考帧断裂→画面冻结；③【v2.6.0+】帧到达但中途加入 GOP 解码不出
+     * （non-existing PPS）→ 帧到达后 2.5s 仍未出首帧解码则强制关键帧。
      */
     private fun startStallWatchdog() {
         stallWatchdog?.cancel()
@@ -1166,12 +1203,22 @@ class SelkiesSession(
                 if (status.value != Status.CONNECTED || !videoRequested) continue
                 if (!settings().requestKeyframeOnStall) continue
                 val last = lastReceivedFrameAt
-                if (last > 0 && System.currentTimeMillis() - last > 3000) {
-                    val now = System.currentTimeMillis()
+                val now = System.currentTimeMillis()
+                if (last > 0 && now - last > 3000) {
                     if (now - lastKeyframeRequestAt > 5000) {
                         lastKeyframeRequestAt = now
                         runCatching { connection.sendText("REQUEST_KEYFRAME") }
                     }
+                }
+                // ③帧在到达但解码器从未出首帧（中途加入 GOP）→ 立刻要关键帧（限流 2.5s）
+                if (firstFrameArrivedAt > 0 && firstDecodedFrameAt == 0L &&
+                    now - firstFrameArrivedAt > 2500 &&
+                    now - decodeStallKeyframeAt > 2500
+                ) {
+                    decodeStallKeyframeAt = now
+                    lastKeyframeRequestAt = now
+                    println("[Selkies][看门狗] 帧到达但未解码 → 请求关键帧（首帧到达于 ${now - firstFrameArrivedAt}ms 前）")
+                    runCatching { connection.sendText("REQUEST_KEYFRAME") }
                 }
             }
         }
@@ -1545,13 +1592,16 @@ class SelkiesSession(
 
     /** 截图当前视频帧（平台直取解码 Surface/位图；无系统截图权限） */
     fun captureScreenshot() {
+        println("[Selkies][截图] 开始捕获")
         platform.captureVideoFrame { png ->
+            println("[Selkies][截图] 捕获回调: ${if (png == null) "null" else "${png.size} 字节"}")
             if (png == null || png.isEmpty()) {
                 savedMediaEvent.value = SavedMediaEvent("screenshot", null, "", error = "暂无可截取的视频帧")
                 return@captureVideoFrame
             }
             val name = StreamRecorder.autoScreenshotName()
             val path = platform.mediaStore().saveScreenshot(png, name)
+            println("[Selkies][截图] 保存: name=$name path=$path")
             savedMediaEvent.value = if (path != null) {
                 SavedMediaEvent("screenshot", path, name, detail = "${png.size / 1024} KB")
             } else {
@@ -1559,6 +1609,10 @@ class SelkiesSession(
             }
         }
     }
+
+    /** 录屏关键帧重试循环：muxer 写入首帧前持续请求关键帧
+     *  （服务器限流 4 次/s 每显示，1.5s 间隔远低于限制；实测关键帧 1~5s 内到达） */
+    private var recKeyframeJob: Job? = null
 
     /** 开始录屏（WS 流直采；Android 前台服务保活→后台持续录） */
     fun startRecording(): Boolean {
@@ -1571,10 +1625,27 @@ class SelkiesSession(
             // ⚠️【v2.6.0】录制启动即强制关键帧：H.264/H.265 复用器需要参数集（SPS/PPS）写头；
             //    服务器无限 GOP（按需关键帧）下不主动请求则可能长时间无关键帧 → 录屏无法开始
             forceKeyframe()
+            // v2.6.0+：首帧未写入前每 1.5s 重试（单次请求可能被限流/竞态吞掉；实测
+            //   RecProbe 首帧写入前有 ~1s 空窗，偶发 3.5s+ 仍无关键帧 → 0 帧录制）
+            recKeyframeJob?.cancel()
+            recKeyframeJob = scope.launch {
+                var waited = 0
+                while (isActive && !userClosed &&
+                    recorder.state == StreamRecorder.State.RECORDING &&
+                    recorder.videoFramesWritten == 0L
+                ) {
+                    delay(1500)
+                    waited += 1500
+                    if (recorder.state != StreamRecorder.State.RECORDING || recorder.videoFramesWritten > 0) break
+                    if (waited > 30_000) break // 半分钟仍无帧：放弃重试（服务器可能已断流，由看门狗处理）
+                    runCatching { connection.sendText("REQUEST_KEYFRAME") }
+                }
+            }
             RecordingShutdownHook.register(recorder)
             platform.setRecordingActive(true)
             recorder.onSaved = { path, frames, error ->
                 platform.setRecordingActive(false)
+                recKeyframeJob?.cancel()
                 RecordingShutdownHook.register(null)
                 savedMediaEvent.value = SavedMediaEvent(
                     "recording", path,
@@ -1589,6 +1660,7 @@ class SelkiesSession(
 
     /** 停止录屏并保存（幂等） */
     fun stopRecording() {
+        recKeyframeJob?.cancel()
         if (recorder.state == StreamRecorder.State.RECORDING) {
             recorder.stopAndSave("manual")
         }

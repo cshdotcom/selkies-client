@@ -494,6 +494,10 @@ fun CompleteKeyboard(
 
     var fullMode by remember { mutableStateOf(savedFullMode) }
     var tab by remember(fullMode) { mutableStateOf(if (fullMode) KbTab.FULL else KbTab.MAIN) }
+    // v2.6.0+ 诊断：键盘打开瞬间的真实状态（仅首次组合打印一次，避免重组刷屏）
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        println("[Selkies][键盘] 打开: fullMode=$fullMode tab=$tab savedFullScale=$savedFullScale autoHint=${"%.2f".format(autoScaleHint)} savedScale=$savedScale")
+    }
     val latches = remember { ModLatches() }
     var numLock by remember { mutableStateOf(true) }
     var collapsed by remember { mutableStateOf(false) }

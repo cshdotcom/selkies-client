@@ -219,3 +219,15 @@ tasks.register<JavaExec>("probeV26") {
         if (project.hasProperty(k)) systemProperty(k, project.property(k).toString())
     }
 }
+
+// 录屏专项诊断（逐秒对比 收帧/写帧）
+tasks.register<JavaExec>("probeRec") {
+    group = "verification"
+    description = "录屏专项诊断：逐秒打印收帧 vs 写帧，定位 0 帧断点"
+    mainClass.set("com.selkies.client.tools.RecProbe")
+    val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
+    classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
+    for (k in listOf("probeUrl", "probeUser", "probePass")) {
+        if (project.hasProperty(k)) systemProperty(k, project.property(k).toString())
+    }
+}

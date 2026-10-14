@@ -114,7 +114,9 @@ object V26Probe {
             session.requestClipboard()
             delay(3000)
             val got = session.remoteClipboard.value?.first
-            val clipRoundTrip = clipEmissions.any { it.contains(marker) }
+            // ⚠️ StateFlow 融合：REQUEST_CLIPBOARD 响应与迟到的 cr 应答可能先后合并，
+            //    collector 未必看到中间值——以「当前值含 marker」+「任一 emission 含 marker」双判定
+            val clipRoundTrip = clipEmissions.any { it.contains(marker) } || got?.contains(marker) == true
             println("${if (clipRoundTrip) "✅" else "❌"} 发送(cw,)→读取(REQUEST_CLIPBOARD)→remoteClipboard 状态流：${got?.take(60) ?: "(空)"}（共 ${clipEmissions.size} 次接收）")
             val noticeSet = session.clipboardNotice.value != null
             println("${if (noticeSet) "✅" else "❌"} clipboardNotice 用户反馈提示：${session.clipboardNotice.value ?: "(无)"}")

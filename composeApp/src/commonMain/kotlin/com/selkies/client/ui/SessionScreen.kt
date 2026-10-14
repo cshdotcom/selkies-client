@@ -295,7 +295,12 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     }
 
     // 返回键：逐层退出（面板→悬浮键盘/快捷栏→虚拟手柄→选择器→全屏→确认断开）
-    PlatformBackHandler {
+    // v2.6.0+：桌面端 ESC = 关闭最上层（enabled 仅在有可关闭层时）——
+    //   根层 ESC 不消费，继续作为远程按键直通（游戏内 ESC 语义保持）；
+    //   Android 真返回键恒启用（根层弹出退出确认，行为与旧版一致）
+    val hasDismissibleLayer = panel != SessionPanel.NONE || showVolumePopup || showZoomControls ||
+            showVirtualPad || floatingKb || quickBar || showModeSelector || showInputPicker || fullscreen
+    PlatformBackHandler(enabled = hasDismissibleLayer || platform.isTouchDevice()) {
         when {
             panel != SessionPanel.NONE -> panel = SessionPanel.NONE
             showVolumePopup -> showVolumePopup = false
@@ -306,7 +311,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             showModeSelector -> showModeSelector = false
             showInputPicker -> showInputPicker = false
             fullscreen -> fullscreen = false
-            else -> exitConfirm = true
+            else -> if (platform.isTouchDevice()) exitConfirm = true
         }
     }
 
@@ -1624,7 +1629,7 @@ private fun ToolButton(
             .combinedClickable(
                 interactionSource = interaction,
                 indication = null,
-                onClick = onClick,
+                onClick = { println("[Selkies][工具栏] 点击: $label"); onClick() },
                 onLongClick = onLongClick
             )
             .padding(horizontal = 10.dp, vertical = 6.dp)
