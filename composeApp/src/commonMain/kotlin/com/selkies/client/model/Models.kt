@@ -47,6 +47,10 @@ data class ServerEntry(
     // ---- 硬件偏好（设备 id，空 = 自动）----
     var preferredMicIds: String = "",       // 逗号分隔，支持多选混音
     var preferredCameraId: String = "",     // 单选
+    /** v2.6.0 多扬声器多选（逗号分隔 id）；空 = 系统默认输出 */
+    var preferredSpeakerIds: String = "",
+    /** v2.6.0 每扬声器独立音量（格式 id:gain;id:gain，gain 0..1） */
+    var speakerGains: String = "",
     // ---- 预设 ----
     var preset: String = "balanced",
     var useTokenAuth: Boolean = false,
@@ -129,7 +133,8 @@ data class AppSettings(
     var physicalKeyboardPassthrough: Boolean = true,
     var gamepadEnabled: Boolean = true,
     // 键盘
-    var keyboardScale: Float = 0f,           // 完整键盘缩放（0 = 未设置，自动适配）
+    var keyboardScale: Float = 0f,           // 分类键盘缩放（0 = 未设置，自动适配）
+    var keyboardFullScale: Float = 0f,       // v2.6.0 完整键盘独立缩放（0 = 未设置，自动适配屏宽）
     var keyboardFullMode: Boolean = false,   // 键盘完整模式（否则分类模式）
     var lastInputMethod: String = "",        // 上次选择的输入方式：float / ime / quick
     // 视频
@@ -142,6 +147,14 @@ data class AppSettings(
     var audioMuted: Boolean = false,
     // 手柄
     var gamepadRumble: Boolean = true,
+    // v2.6.0 虚拟手柄（屏上手柄；无物理手柄也能玩远程游戏）
+    var virtualGamepadEnabled: Boolean = false,
+    /** 虚拟手柄模式：full = 全键布局 / simple = 精简布局 / wheel = 赛车风格 */
+    var virtualGamepadMode: String = "full",
+    /** v2.6.0 竖屏时自动旋转远端分辨率填充屏幕（可开关） */
+    var autoRotatePortraitRes: Boolean = true,
+    /** v2.6.0 工具栏按钮自定义顺序（逗号分隔功能键；空 = 默认顺序） */
+    var toolbarOrder: String = "",
     // 截图/录屏/下载 存储位置（空 = 平台默认：Android 公共 Pictures/Videos/Download 下的 Selkies 子目录；桌面 ~/Pictures/Selkies 等）
     var storageRoot: String = "",
     // 录屏

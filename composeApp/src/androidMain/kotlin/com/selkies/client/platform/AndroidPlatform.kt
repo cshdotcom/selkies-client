@@ -70,6 +70,14 @@ object AndroidPlatform : PlatformServices {
     @Volatile
     private var lastVideoSink: com.selkies.client.video.AndroidVideoSink? = null
 
+    /** v2.6.0 当前视频 TextureView（getBitmap 截图直取；SurfaceView 时代的 PixelCopy 兼容回退） */
+    @Volatile
+    private var videoTextureView: android.view.TextureView? = null
+
+    fun setVideoTextureView(tv: android.view.TextureView?) {
+        videoTextureView = tv
+    }
+
     private var pendingPick: ((List<PickedFile>) -> Unit)? = null
     private var pendingSave: ((Boolean) -> Unit)? = null
     private var pendingSaveBytes: ByteArray? = null
@@ -490,6 +498,27 @@ object AndroidPlatform : PlatformServices {
     }
 
     override fun captureVideoFrame(onDone: (ByteArray?) -> Unit) {
+        // v2.6.0：优先 TextureView.getBitmap（与解码 Surface 同源，直读 GPU 纹理，零权限零兼容问题）
+        val tv = videoTextureView
+        if (tv != null && tv.isAvailable) {
+            runCatching {
+                val bmp = tv.bitmap ?: return@runCatching
+                if (bmp.width <= 0 || bmp.height <= 0) {
+                    bmp.recycle()
+                    return@runCatching
+                }
+                Thread {
+                    runCatching {
+                        val out = java.io.ByteArrayOutputStream()
+                        bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
+                        bmp.recycle()
+                        onDone(out.toByteArray())
+                    }.onFailure { onDone(null) }
+                }.apply { isDaemon = true; name = "shot-encode" }.start()
+                return
+            }
+        }
+        // 回退：PixelCopy 解码 Surface（旧路径）
         val sink = lastVideoSink
         val surface = sink?.surface
         if (sink == null || surface == null || !surface.isValid) {

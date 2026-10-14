@@ -52,8 +52,11 @@ import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VideocamOff
+import androidx.compose.material.icons.filled.VideogameAsset
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material.icons.filled.ZoomIn
+import androidx.compose.material.icons.filled.ZoomOut
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -79,6 +82,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
@@ -86,6 +90,7 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.PointerType
+import androidx.compose.ui.input.pointer.isCtrlPressed
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
@@ -116,6 +121,7 @@ import com.selkies.client.ui.panels.QuickShortcutBar
 import com.selkies.client.ui.panels.SavedMediaPanel
 import com.selkies.client.ui.panels.SessionSettingsPanel
 import com.selkies.client.ui.panels.StatsPanel
+import com.selkies.client.ui.panels.VirtualGamepadOverlay
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -202,13 +208,67 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     val appMuted by session.appMuted.collectAsState()
     val appVolume by session.appVolume.collectAsState()
 
+    // v2.6.0：虚拟手柄（屏上手柄；无物理手柄也能玩远程游戏）
+    var showVirtualPad by remember { mutableStateOf(false) }
+    var virtualPadKbMap by remember { mutableStateOf(false) }
+    val virtualEngine = remember(session) { com.selkies.client.ui.panels.VirtualGamepadEngine(session) }
+
+    // v2.6.0：本地缩放/放大镜（只改本地显示，不动远程分辨率）
+    var localZoom by remember { mutableStateOf(1f) }
+    var zoomPan by remember { mutableStateOf(Offset.Zero) }  // 缩放后平移（视图 px）
+    var showZoomControls by remember { mutableStateOf(false) }
+
+    // v2.6.0：工具栏自定义顺序
+    val toolbarOrder = remember(state.store.settings.value.toolbarOrder) {
+        val order = state.store.settings.value.toolbarOrder
+            .split(',').filter { it.isNotBlank() }
+        ToolbarDefaults.ALL.filter { it in order } + ToolbarDefaults.ALL.filter { it !in order }
+    }
+
     // 视口几何
     var viewSize by remember { mutableStateOf(IntSize.Zero) }
     var streamSize by remember { mutableStateOf(realizedRes ?: Pair(1280, 720)) }
+
+    /** 在视图焦点 f 处缩放到新倍率（保持焦点下的内容不动） */
+    fun zoomAt(f: Offset, newZoom: Float) {
+        val nz = newZoom.coerceIn(1f, 5f)
+        if (nz == localZoom) return
+        val cx = viewSize.width / 2f
+        val cy = viewSize.height / 2f
+        // 内容点 q = c + (f - c - pan)/z 保持位于 f：pan' = f - c - (f - c - pan)*(z'/z)
+        zoomPan = Offset(
+            (f.x - cx - (f.x - cx - zoomPan.x) * (nz / localZoom)),
+            (f.y - cy - (f.y - cy - zoomPan.y) * (nz / localZoom))
+        )
+        if (nz == 1f) zoomPan = Offset.Zero
+        localZoom = nz
+    }
     LaunchedEffect(realizedRes) {
         realizedRes?.let {
             streamSize = it
             println("[Selkies] 流分辨率: ${it.first}x${it.second}")
+        }
+    }
+
+    // v2.6.0：竖屏/横屏自动旋转远端分辨率（可开关；仅自适应模式；手动分辨率不干预）
+    var lastPortraitView by remember { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(viewSize.width, viewSize.height) {
+        if (viewSize.width <= 0 || viewSize.height <= 0) return@LaunchedEffect
+        if (!state.store.settings.value.autoRotatePortraitRes) return@LaunchedEffect
+        if (server.resolutionW > 0 || server.resolutionH > 0) return@LaunchedEffect
+        if (status != SelkiesSession.Status.CONNECTED) return@LaunchedEffect
+        val portrait = viewSize.height > viewSize.width
+        if (lastPortraitView == null) {
+            lastPortraitView = portrait
+            return@LaunchedEffect  // 初始连接的分辨率已由 desiredResolution 处理
+        }
+        if (portrait != lastPortraitView) {
+            lastPortraitView = portrait
+            val (w, h) = streamSize
+            if (w > 0 && h > 0 && w != h) {
+                session.sendResolution(h, w)
+                toast = if (portrait) "已切换竖屏分辨率 ${h}×${w}" else "已切换横屏分辨率 ${h}×${w}"
+            }
         }
     }
 
@@ -234,11 +294,13 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         }
     }
 
-    // 返回键：逐层退出（面板→悬浮键盘/快捷栏→选择器→全屏→确认断开）
+    // 返回键：逐层退出（面板→悬浮键盘/快捷栏→虚拟手柄→选择器→全屏→确认断开）
     PlatformBackHandler {
         when {
             panel != SessionPanel.NONE -> panel = SessionPanel.NONE
             showVolumePopup -> showVolumePopup = false
+            showZoomControls -> showZoomControls = false
+            showVirtualPad -> showVirtualPad = false
             floatingKb -> floatingKb = false
             quickBar -> quickBar = false
             showModeSelector -> showModeSelector = false
@@ -288,11 +350,21 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         // 【剪贴板修复】多监听器：面板/UI 共存，不再互相顶掉
         val clip = platform.clipboard()
         var lastText: String? = clip.getText()
+        var lastImageSig = clip.hasImage()
         val clipListener: () -> Unit = {
             val t = clip.getText()
             if (t != null && t != lastText) {
                 lastText = t
                 session.pushLocalClipboard(t)
+            } else if (t == null) {
+                // 文本为空但出现图像 → 图片剪贴板同步（本地截图/复制图片 → 远程）
+                val img = clip.hasImage()
+                if (img != lastImageSig) {
+                    lastImageSig = img
+                    if (img) {
+                        clip.getImagePng()?.let { png -> session.pushLocalImage(png) }
+                    }
+                }
             }
         }
         clip.addListener(clipListener)
@@ -312,12 +384,19 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         }
 
         // 桌面（AWT 分发器）物理键直通；无本地面板打开时才转发，避免在文本框输入时打到远程
+        // v2.6.0：虚拟手柄键盘映射优先拦截（桌面无触屏的替代操作方案）
         platform.setPhysicalKeyHandler { code, down ->
             if (!viewOnly && panel == SessionPanel.NONE && !floatingKb &&
                 state.store.settings.value.physicalKeyboardPassthrough
             ) {
                 val ks = platform.nativeKeyCodeToKeysym(code, 0)
                 if (ks != null && ks > 0) {
+                    // 虚拟手柄键盘映射：消费则不再发送远程
+                    if (virtualEngine.isConnected && virtualPadKbMap &&
+                        virtualEngine.handleKeysym(ks.toLong(), down)
+                    ) {
+                        return@setPhysicalKeyHandler
+                    }
                     session.sendKey(ks.toLong(), down)
                 }
             }
@@ -354,8 +433,23 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     }
     val onKeyboardButtonLong: () -> Unit = { showInputPicker = true }
 
-    // ---------- 坐标映射（视频等比容器内，画面与坐标严格一致）----------
+    // ---------- 坐标映射（视频等比容器内，画面与坐标严格一致；v2.6.0 本地缩放感知）----------
+    // 视图点 p → 内容点 q：q = c + (p - c - pan) / zoom（c = 视图中心）
+    // 内容点 q → 视图点 p：p = c + (q - c) * zoom + pan
+    fun viewToContent(p: Offset): Offset {
+        val cx = viewSize.width / 2f
+        val cy = viewSize.height / 2f
+        return Offset(cx + (p.x - cx - zoomPan.x) / localZoom, cy + (p.y - cy - zoomPan.y) / localZoom)
+    }
+
+    fun contentView(q: Offset): Offset {
+        val cx = viewSize.width / 2f
+        val cy = viewSize.height / 2f
+        return Offset(cx + (q.x - cx) * localZoom + zoomPan.x, cy + (q.y - cy) * localZoom + zoomPan.y)
+    }
+
     fun mapToStream(pos: Offset): Pair<Int, Int> {
+        val q = viewToContent(pos)
         val vw = viewSize.width.toFloat()
         val vh = viewSize.height.toFloat()
         if (vw <= 0 || vh <= 0) return 0 to 0
@@ -364,12 +458,12 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         val scale = min(vw / sw, vh / sh)
         val dx = (vw - sw * scale) / 2f
         val dy = (vh - sh * scale) / 2f
-        val x = ((pos.x - dx) / scale).toInt().coerceIn(0, streamSize.first - 1)
-        val y = ((pos.y - dy) / scale).toInt().coerceIn(0, streamSize.second - 1)
+        val x = ((q.x - dx) / scale).toInt().coerceIn(0, streamSize.first - 1)
+        val y = ((q.y - dy) / scale).toInt().coerceIn(0, streamSize.second - 1)
         return x to y
     }
 
-    /** 流坐标 → 视图坐标（光标覆盖层用） */
+    /** 流坐标 → 视图坐标（光标覆盖层用；含本地缩放变换） */
     fun mapFromStream(sx: Float, sy: Float): Offset {
         val vw = viewSize.width.toFloat()
         val vh = viewSize.height.toFloat()
@@ -379,17 +473,17 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         val scale = min(vw / sw, vh / sh)
         val dx = (vw - sw * scale) / 2f
         val dy = (vh - sh * scale) / 2f
-        return Offset(sx * scale + dx, sy * scale + dy)
+        return contentView(Offset(sx * scale + dx, sy * scale + dy))
     }
 
-    /** 视图像素位移 → 流坐标位移（触摸板相对移动用） */
+    /** 视图像素位移 → 流坐标位移（触摸板相对移动用；缩放感知） */
     fun deltaToStream(d: Offset): Offset {
         val vw = viewSize.width.toFloat()
         val vh = viewSize.height.toFloat()
         if (vw <= 0 || vh <= 0) return d
         val scale = min(vw / streamSize.first.toFloat(), vh / streamSize.second.toFloat())
         if (scale <= 0f) return d
-        return Offset(d.x / scale, d.y / scale)
+        return Offset(d.x / scale / localZoom, d.y / scale / localZoom)
     }
 
     // ---------- 点击原语 ----------
@@ -519,15 +613,22 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                     PointerEventType.Scroll -> {
                                         val sd = changes.fold(Offset.Zero) { a, c -> a + c.scrollDelta }
                                         if (sd != Offset.Zero) {
-                                            if (abs(sd.y) > 1e-4f) {
-                                                acc.wheelY += -sd.y * 3f
-                                                val n = acc.wheelY.toInt()
-                                                if (n != 0) { acc.wheelY -= n; scrollNotches(true, n) }
-                                            }
-                                            if (abs(sd.x) > 1e-4f) {
-                                                acc.wheelX += sd.x * 3f
-                                                val n = acc.wheelX.toInt()
-                                                if (n != 0) { acc.wheelX -= n; scrollNotches(false, n) }
+                                            val ctrl = event.keyboardModifiers.isCtrlPressed
+                                            if (ctrl) {
+                                                // v2.6.0：Ctrl+滚轮 = 本地缩放/放大镜（鼠标位置为焦点，只调本地）
+                                                val f = changes.first().position
+                                                zoomAt(f, localZoom * (1f - sd.y * 0.25f))
+                                            } else {
+                                                if (abs(sd.y) > 1e-4f) {
+                                                    acc.wheelY += -sd.y * 3f
+                                                    val n = acc.wheelY.toInt()
+                                                    if (n != 0) { acc.wheelY -= n; scrollNotches(true, n) }
+                                                }
+                                                if (abs(sd.x) > 1e-4f) {
+                                                    acc.wheelX += sd.x * 3f
+                                                    val n = acc.wheelX.toInt()
+                                                    if (n != 0) { acc.wheelX -= n; scrollNotches(false, n) }
+                                                }
                                             }
                                             changes.forEach { it.consume() }
                                         }
@@ -607,26 +708,26 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                 PointerEventType.Move -> {
                                     touchChanges.forEach { c -> touches[c.id] = c.position }
                                     if (touches.size >= 2 && !viewOnly) {
-                                        // 双指：滚动 + 捏合缩放
+                                        // 双指：捏合 = 本地缩放/放大镜（v2.6.0，以双指中点为焦点，只调本地显示）；
+                                        // 放大后稳定距离拖动 = 本地平移；未放大时拖动 = 远程滚动（原行为）
                                         val ps = touches.values.toList()
                                         val d = hypot(ps[0].x - ps[1].x, ps[0].y - ps[1].y)
+                                        val mid = Offset((ps[0].x + ps[1].x) / 2f, (ps[0].y + ps[1].y) / 2f)
                                         val pan = touchChanges.fold(Offset.Zero) { a, c -> a + c.positionChange() }
-                                        if (abs(pan.y) > 0.5f) {
+                                        if (twoFingerDist > 10f && d > 10f && abs(d - twoFingerDist) > 0.5f) {
+                                            twoFingerMoved = true
+                                            zoomAt(mid, localZoom * (d / twoFingerDist))
+                                        } else if (localZoom > 1.01f && (abs(pan.x) > 0.5f || abs(pan.y) > 0.5f)) {
+                                            // 放大状态：双指稳定距离拖动 = 平移画面（本地）
+                                            twoFingerMoved = true
+                                            zoomPan = zoomPan + pan
+                                        } else if (abs(pan.y) > 0.5f) {
                                             twoFingerMoved = true
                                             acc.scrollY += -pan.y / 2f
                                             val notches = (acc.scrollY / TOUCH_SCROLL_NOTCH_PX).toInt()
                                             if (notches != 0) {
                                                 acc.scrollY -= notches * TOUCH_SCROLL_NOTCH_PX
                                                 scrollNotches(true, notches)
-                                            }
-                                        }
-                                        if (twoFingerDist > 10f && d > 10f && abs(d - twoFingerDist) > 0.5f) {
-                                            twoFingerMoved = true
-                                            acc.zoom *= d / twoFingerDist
-                                            val n = (log10(acc.zoom.toDouble()) / log10(PINCH_NOTCH_RATIO)).toInt()
-                                            if (n != 0) {
-                                                acc.zoom /= PINCH_NOTCH_RATIO.pow(n.toDouble()).toFloat()
-                                                pinchNotches(n)
                                             }
                                         }
                                         twoFingerDist = d
@@ -698,8 +799,20 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                 }
         ) {
             // 等比自适应视频容器：画面按流宽高比居中缩放（不拉伸变形）
+            // v2.6.0：本地缩放/放大镜变换（graphicsLayer 只影响显示；坐标映射已同步缩放感知）
             val ratio = streamSize.second.takeIf { it > 0 }?.let { streamSize.first.toFloat() / it } ?: (16f / 9f)
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        scaleX = localZoom
+                        scaleY = localZoom
+                        translationX = zoomPan.x
+                        translationY = zoomPan.y
+                        transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0.5f, 0.5f)
+                    },
+                contentAlignment = Alignment.Center
+            ) {
                 VideoSurface(session, Modifier.aspectRatio(ratio).fillMaxSize())
             }
 
@@ -882,74 +995,88 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     horizontalArrangement = Arrangement.spacedBy(4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    ToolButton(
-                        Icons.Filled.Keyboard, "键盘",
-                        tint = if (floatingKb || panel == SessionPanel.KEYBOARD || quickBar) Color(0xFF60A5FA) else Color.White,
-                        onLongClick = onKeyboardButtonLong,
-                        onClick = onKeyboardButton
-                    )
-                    ToolButton(Icons.Filled.Bolt, "快捷键") { panel = if (panel == SessionPanel.HOTKEYS) SessionPanel.NONE else SessionPanel.HOTKEYS }
-                    ToolButton(Icons.Filled.ContentPaste, "剪贴板") { panel = if (panel == SessionPanel.CLIPBOARD) SessionPanel.NONE else SessionPanel.CLIPBOARD }
-                    ToolButton(Icons.Filled.Folder, "文件") { panel = if (panel == SessionPanel.FILES) SessionPanel.NONE else SessionPanel.FILES }
-                    // v2.4.0：打印任务（带数量角标，出错变红）
-                    ToolButton(
-                        Icons.Filled.Print,
-                        "打印" + if (printJobs.isNotEmpty()) "(${printJobs.size})" else "",
-                        tint = if (printJobs.any { it.status == "error" }) MaterialTheme.colorScheme.error else Color.White
-                    ) { panel = if (panel == SessionPanel.PRINT) SessionPanel.NONE else SessionPanel.PRINT }
-                    ToolButton(
-                        if (micSessionOn) Icons.Filled.Mic else Icons.Filled.MicOff, "麦克风",
-                        tint = if (micSessionOn) Color(0xFF4ADE80) else Color.White
-                    ) {
-                        if (micSessionOn) session.stopMicUplink() else session.startMicUplink()
-                    }
-                    ToolButton(
-                        if (camSessionOn) Icons.Filled.Videocam else Icons.Filled.VideocamOff, "摄像头",
-                        tint = if (camSessionOn) Color(0xFF4ADE80) else Color.White
-                    ) {
-                        if (camSessionOn) session.stopWebcamUplink() else session.startWebcamUplink()
-                    }
-                    // v2.4.0：硬件设备选择（麦克风多选混音/摄像头切换/扬声器，带搜索）
-                    ToolButton(Icons.Filled.DevicesOther, "硬件") { panel = if (panel == SessionPanel.HARDWARE) SessionPanel.NONE else SessionPanel.HARDWARE }
-                    // v2.4.0：画质与性能（预设+全部官方参数热更新）
-                    ToolButton(Icons.Filled.Tune, "画质") { panel = if (panel == SessionPanel.SETTINGS) SessionPanel.NONE else SessionPanel.SETTINGS }
-                    if (platform.isTouchDevice()) {
-                        ToolButton(
-                            if (inputMode == InputMode.TRACKPAD) Icons.Filled.Mouse else Icons.Filled.TouchApp,
-                            if (inputMode == InputMode.TRACKPAD) "触摸板" else "触屏",
-                            tint = if (inputMode == InputMode.TRACKPAD) Color(0xFF60A5FA) else Color.White
-                        ) { showModeSelector = true }
-                    }
-                    ToolButton(Icons.Filled.Apps, "应用") { panel = if (panel == SessionPanel.APPS) SessionPanel.NONE else SessionPanel.APPS }
-                    ToolButton(Icons.Filled.QueryStats, "统计") { panel = if (panel == SessionPanel.STATS) SessionPanel.NONE else SessionPanel.STATS }
-                    // v2.5.0：截图 / 录屏 / 音量 / 手柄 / 媒体库
-                    ToolButton(Icons.Filled.PhotoCamera, "截图") {
-                        session.captureScreenshot()
-                    }
-                    ToolButton(
-                        if (recording) Icons.Filled.StopCircle else Icons.Filled.Videocam,
-                        if (recording) "停止(${recordingSec}s)" else "录屏",
-                        tint = if (recording) Color(0xFFEF4444) else Color.White
-                    ) {
-                        if (recording) {
-                            session.stopRecording()
-                            recording = false
-                        } else {
-                            if (session.startRecording()) recording = true
-                            else toast = "无法开始录制（存储不可用）"
+                    // v2.6.0：按用户自定义顺序渲染（设置→功能栏排序；默认 ToolbarDefaults.ALL）
+                    toolbarOrder.forEach { key ->
+                        when (key) {
+                            "keyboard" -> ToolButton(
+                                Icons.Filled.Keyboard, "键盘",
+                                tint = if (floatingKb || panel == SessionPanel.KEYBOARD || quickBar) Color(0xFF60A5FA) else Color.White,
+                                onLongClick = onKeyboardButtonLong,
+                                onClick = onKeyboardButton
+                            )
+                            "hotkeys" -> ToolButton(Icons.Filled.Bolt, "快捷键") { panel = if (panel == SessionPanel.HOTKEYS) SessionPanel.NONE else SessionPanel.HOTKEYS }
+                            "clipboard" -> ToolButton(Icons.Filled.ContentPaste, "剪贴板") { panel = if (panel == SessionPanel.CLIPBOARD) SessionPanel.NONE else SessionPanel.CLIPBOARD }
+                            "files" -> ToolButton(Icons.Filled.Folder, "文件") { panel = if (panel == SessionPanel.FILES) SessionPanel.NONE else SessionPanel.FILES }
+                            "print" -> ToolButton(
+                                Icons.Filled.Print,
+                                "打印" + if (printJobs.isNotEmpty()) "(${printJobs.size})" else "",
+                                tint = if (printJobs.any { it.status == "error" }) MaterialTheme.colorScheme.error else Color.White
+                            ) { panel = if (panel == SessionPanel.PRINT) SessionPanel.NONE else SessionPanel.PRINT }
+                            "mic" -> ToolButton(
+                                if (micSessionOn) Icons.Filled.Mic else Icons.Filled.MicOff, "麦克风",
+                                tint = if (micSessionOn) Color(0xFF4ADE80) else Color.White
+                            ) {
+                                if (micSessionOn) session.stopMicUplink() else session.startMicUplink()
+                            }
+                            "camera" -> ToolButton(
+                                if (camSessionOn) Icons.Filled.Videocam else Icons.Filled.VideocamOff, "摄像头",
+                                tint = if (camSessionOn) Color(0xFF4ADE80) else Color.White
+                            ) {
+                                if (camSessionOn) session.stopWebcamUplink() else session.startWebcamUplink()
+                            }
+                            "hardware" -> ToolButton(Icons.Filled.DevicesOther, "硬件") { panel = if (panel == SessionPanel.HARDWARE) SessionPanel.NONE else SessionPanel.HARDWARE }
+                            "quality" -> ToolButton(Icons.Filled.Tune, "画质") { panel = if (panel == SessionPanel.SETTINGS) SessionPanel.NONE else SessionPanel.SETTINGS }
+                            "touchmode" -> if (platform.isTouchDevice()) {
+                                ToolButton(
+                                    if (inputMode == InputMode.TRACKPAD) Icons.Filled.Mouse else Icons.Filled.TouchApp,
+                                    if (inputMode == InputMode.TRACKPAD) "触摸板" else "触屏",
+                                    tint = if (inputMode == InputMode.TRACKPAD) Color(0xFF60A5FA) else Color.White
+                                ) { showModeSelector = true }
+                            }
+                            "apps" -> ToolButton(Icons.Filled.Apps, "应用") { panel = if (panel == SessionPanel.APPS) SessionPanel.NONE else SessionPanel.APPS }
+                            "stats" -> ToolButton(Icons.Filled.QueryStats, "统计") { panel = if (panel == SessionPanel.STATS) SessionPanel.NONE else SessionPanel.STATS }
+                            "screenshot" -> ToolButton(Icons.Filled.PhotoCamera, "截图") { session.captureScreenshot() }
+                            "record" -> ToolButton(
+                                if (recording) Icons.Filled.StopCircle else Icons.Filled.Videocam,
+                                if (recording) "停止(${recordingSec}s)" else "录屏",
+                                tint = if (recording) Color(0xFFEF4444) else Color.White
+                            ) {
+                                if (recording) {
+                                    session.stopRecording()
+                                    recording = false
+                                } else {
+                                    if (session.startRecording()) recording = true
+                                    else toast = "无法开始录制（存储不可用）"
+                                }
+                            }
+                            "volume" -> ToolButton(
+                                if (appMuted) Icons.Filled.VolumeOff else Icons.Filled.VolumeUp,
+                                if (appMuted) "取消静音" else "音量",
+                                tint = if (appMuted || appVolume <= 0f) Color(0xFFF59E0B) else Color.White
+                            ) { showVolumePopup = !showVolumePopup }
+                            "gamepad" -> ToolButton(Icons.Filled.SportsEsports, "手柄") { panel = if (panel == SessionPanel.GAMEPAD) SessionPanel.NONE else SessionPanel.GAMEPAD }
+                            "virtualpad" -> ToolButton(
+                                Icons.Filled.VideogameAsset, if (showVirtualPad) "关闭手柄" else "虚拟手柄",
+                                tint = if (showVirtualPad) Color(0xFF4ADE80) else Color.White
+                            ) { showVirtualPad = !showVirtualPad }
+                            "zoom" -> ToolButton(
+                                Icons.Filled.ZoomIn, if (localZoom > 1.01f) "${(localZoom * 100).toInt()}%" else "放大镜",
+                                tint = if (localZoom > 1.01f) Color(0xFF60A5FA) else Color.White
+                            ) {
+                                if (localZoom > 1.01f && !showZoomControls) {
+                                    // 已放大：一键重置；未放大：打开控制面板
+                                    localZoom = 1f; zoomPan = Offset.Zero
+                                } else {
+                                    showZoomControls = !showZoomControls
+                                }
+                            }
+                            "media" -> ToolButton(Icons.Filled.PhotoLibrary, "媒体库") { panel = if (panel == SessionPanel.MEDIA) SessionPanel.NONE else SessionPanel.MEDIA }
+                            "fullscreen" -> ToolButton(
+                                if (fullscreen) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen, "全屏",
+                                tint = if (fullscreen) Color(0xFF60A5FA) else Color.White
+                            ) { fullscreen = !fullscreen }
                         }
                     }
-                    ToolButton(
-                        if (appMuted) Icons.Filled.VolumeOff else Icons.Filled.VolumeUp,
-                        if (appMuted) "取消静音" else "音量",
-                        tint = if (appMuted || appVolume <= 0f) Color(0xFFF59E0B) else Color.White
-                    ) { showVolumePopup = !showVolumePopup }
-                    ToolButton(Icons.Filled.SportsEsports, "手柄") { panel = if (panel == SessionPanel.GAMEPAD) SessionPanel.NONE else SessionPanel.GAMEPAD }
-                    ToolButton(Icons.Filled.PhotoLibrary, "媒体库") { panel = if (panel == SessionPanel.MEDIA) SessionPanel.NONE else SessionPanel.MEDIA }
-                    ToolButton(
-                        if (fullscreen) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen, "全屏",
-                        tint = if (fullscreen) Color(0xFF60A5FA) else Color.White
-                    ) { fullscreen = !fullscreen }
                 }
             }
         }
@@ -1001,7 +1128,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                         SessionPanel.HARDWARE -> HardwarePanel(session)
                         SessionPanel.PRINT -> PrintJobsPanel(session)
                         SessionPanel.SETTINGS -> SessionSettingsPanel(state, session)
-                        SessionPanel.GAMEPAD -> GamepadPanel(session)
+                        SessionPanel.GAMEPAD -> GamepadPanel(session) { showVirtualPad = true }
                         SessionPanel.MEDIA -> SavedMediaPanel(state)
                         SessionPanel.NONE -> {}
                     }
@@ -1011,12 +1138,23 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
 
         // ============ 悬浮窗可拖动完整键盘（分类模式 / 完整模式 151 键）============
         if (!viewOnly && status == SelkiesSession.Status.CONNECTED) {
+            // 完整键盘默认缩放：屏宽恰好容纳 23 单位（v2.6.0：不再依赖固定 1f）
+            val kbDensity = androidx.compose.ui.platform.LocalDensity.current
+            val fullKbFit = with(kbDensity) {
+                (viewSize.width.takeIf { it > 0 } ?: 1280).toDp().value / (23f * 34f + 8f)
+            }
             CompleteKeyboard(
                 session = session,
                 visible = floatingKb,
+                autoScaleHint = fullKbFit,
                 savedScale = state.store.settings.value.keyboardScale,
+                savedFullScale = state.store.settings.value.keyboardFullScale,
                 savedFullMode = state.store.settings.value.keyboardFullMode,
-                onScaleChange = { s -> state.store.updateSettings { it.keyboardScale = s } },
+                onScaleChange = { s ->
+                    state.store.updateSettings {
+                        if (it.keyboardFullMode) it.keyboardFullScale = s else it.keyboardScale = s
+                    }
+                },
                 onFullModeChange = { f -> state.store.updateSettings { it.keyboardFullMode = f } },
                 onDismiss = { floatingKb = false }
             )
@@ -1077,6 +1215,100 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     )
                     TextButton(onClick = { showVolumePopup = false }) { Text("关闭") }
                 }
+            }
+        }
+
+        // ============ v2.6.0 本地缩放控制（放大镜：滑条 + 加减/重置 + 百分比；只调本地显示） ============
+        if (status == SelkiesSession.Status.CONNECTED) {
+            // 放大中常驻指示（点按重置）
+            if (localZoom > 1.01f && !showZoomControls) {
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .statusBarsPadding()
+                        .padding(top = 52.dp, end = 6.dp)
+                        .clickable { localZoom = 1f; zoomPan = Offset.Zero },
+                    shape = RoundedCornerShape(8.dp),
+                    color = Color.Black.copy(alpha = 0.6f)
+                ) {
+                    Text(
+                        "${(localZoom * 100).toInt()}% ✕",
+                        color = Color(0xFF7DD3FC),
+                        style = MaterialTheme.typography.labelMedium,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+            }
+            if (showZoomControls) {
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .padding(bottom = 96.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    color = Color.Black.copy(alpha = 0.75f),
+                    shadowElevation = 8.dp
+                ) {
+                    Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                "本地缩放（放大镜）",
+                                color = Color.White,
+                                style = MaterialTheme.typography.titleSmall,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                "${(localZoom * 100).toInt()}%",
+                                color = Color(0xFF7DD3FC),
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        androidx.compose.material3.Slider(
+                            value = localZoom,
+                            onValueChange = { zoomAt(Offset(viewSize.width / 2f, viewSize.height / 2f), it) },
+                            valueRange = 1f..5f,
+                            colors = androidx.compose.material3.SliderDefaults.colors(
+                                thumbColor = Color.White,
+                                activeTrackColor = Color(0xFF60A5FA),
+                                inactiveTrackColor = Color.White.copy(alpha = 0.3f)
+                            )
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            androidx.compose.material3.OutlinedButton(onClick = {
+                                zoomAt(Offset(viewSize.width / 2f, viewSize.height / 2f), localZoom / 1.25f)
+                            }) { Icon(Icons.Filled.ZoomOut, null, tint = Color.White); Text(" 缩小") }
+                            androidx.compose.material3.OutlinedButton(onClick = {
+                                zoomAt(Offset(viewSize.width / 2f, viewSize.height / 2f), localZoom * 1.25f)
+                            }) { Icon(Icons.Filled.ZoomIn, null, tint = Color.White); Text(" 放大") }
+                            androidx.compose.material3.OutlinedButton(onClick = {
+                                localZoom = 1f; zoomPan = Offset.Zero
+                            }) { Text("重置 100%") }
+                            TextButton(onClick = { showZoomControls = false }) { Text("关闭") }
+                        }
+                        Text(
+                            "只缩放本机画面，不改变远程分辨率 · 触屏：双指捏合缩放/放大后双指拖动平移 · 桌面：Ctrl+滚轮缩放",
+                            color = Color.White.copy(alpha = 0.6f),
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                }
+            }
+        }
+
+        // ============ v2.6.0 虚拟手柄悬浮面板（屏上手柄：完整/精简/赛车模式 + 只读 + 键盘映射） ============
+        if (!viewOnly && status == SelkiesSession.Status.CONNECTED) {
+            Box(Modifier.align(Alignment.BottomCenter).padding(bottom = 70.dp)) {
+                VirtualGamepadOverlay(
+                    engine = virtualEngine,
+                    session = session,
+                    visible = showVirtualPad,
+                    initialMode = state.store.settings.value.virtualGamepadMode,
+                    keyboardMapping = virtualPadKbMap,
+                    onModeChange = { m -> state.store.updateSettings { it.virtualGamepadMode = m } },
+                    onKeyboardMappingChange = { virtualPadKbMap = it },
+                    onDismiss = { showVirtualPad = false }
+                )
             }
         }
 
@@ -1400,4 +1632,23 @@ private fun ToolButton(
         Icon(icon, label, tint = tint, modifier = Modifier.size(22.dp))
         Text(label, color = tint, fontSize = 9.sp, maxLines = 1)
     }
+}
+
+/** v2.6.0 工具栏功能键定义（设置→功能栏排序自定义顺序） */
+object ToolbarDefaults {
+    val ALL = listOf(
+        "keyboard", "hotkeys", "clipboard", "files", "print", "mic", "camera",
+        "hardware", "quality", "touchmode", "apps", "stats",
+        "screenshot", "record", "volume", "gamepad", "virtualpad", "zoom",
+        "media", "fullscreen"
+    )
+
+    /** 功能键 → 中文名（设置界面显示） */
+    val LABELS = mapOf(
+        "keyboard" to "键盘", "hotkeys" to "快捷键", "clipboard" to "剪贴板", "files" to "文件",
+        "print" to "打印", "mic" to "麦克风", "camera" to "摄像头", "hardware" to "硬件",
+        "quality" to "画质", "touchmode" to "触屏/触摸板", "apps" to "应用", "stats" to "统计",
+        "screenshot" to "截图", "record" to "录屏", "volume" to "音量", "gamepad" to "手柄",
+        "virtualpad" to "虚拟手柄", "zoom" to "放大镜", "media" to "媒体库", "fullscreen" to "全屏"
+    )
 }

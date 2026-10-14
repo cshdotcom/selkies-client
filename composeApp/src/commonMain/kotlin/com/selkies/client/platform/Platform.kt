@@ -47,9 +47,17 @@ interface VideoSink {
 interface AudioPlayer {
     fun start(sampleRate: Int = 48000, channels: Int = 2)
     fun playOpus(opus: ByteArray)
-    /** 静音标记（服务器告知音频暂停） */
+    /** 静默标记（服务器告知音频暂停） */
     fun onQuiet()
     fun setVolume(volume: Float)
+    /** v2.6.0 多输出设备 + 独立音量：deviceId → 增益(0..1)。
+     *  空映射 = 系统默认设备。平台实现：桌面 = 多条 SourceDataLine（各自混音器）；
+     *  Android = 多条 AudioTrack（各自 setPreferredDevice）。设备不可用时静默跳过。 */
+    fun setOutputDevices(outputs: Map<String, Float>) {}
+    /** v2.6.0 播放器错误回调（设备打开失败等；UI 呈现） */
+    var onError: ((String) -> Unit)?
+        get() = null
+        set(_) { /* 默认无操作；平台实现覆写 */ }
     fun stop()
     val bufferLevelMs: Int
 }

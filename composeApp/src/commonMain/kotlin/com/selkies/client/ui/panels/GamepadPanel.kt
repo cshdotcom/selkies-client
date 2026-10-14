@@ -39,13 +39,14 @@ import com.selkies.client.core.SelkiesSession
 import kotlinx.coroutines.delay
 
 /**
- * 手柄面板（v2.5.0，对齐官方 GamepadVisualizer）：
+ * 手柄面板（v2.5.0，对齐官方 GamepadVisualizer + v2.6.0 虚拟手柄入口）：
  * - 已连接手柄列表（最多 4 槽位，同服务器）
  * - 按钮实时高亮（W3C 17 键）+ 双摇杆 XY 可视化 + 扳机条
  * - 「测试振动」按钮（本地直测 rumble 通路）
+ * - 【v2.6.0】「打开虚拟手柄」：无物理手柄也能玩（屏上手柄 + 桌面键盘映射）
  */
 @Composable
-fun GamepadPanel(session: SelkiesSession) {
+fun GamepadPanel(session: SelkiesSession, onOpenVirtualPad: (() -> Unit)? = null) {
     var pads by remember { mutableStateOf<List<GamepadInfo>>(emptyList()) }
     var tick by remember { mutableStateOf(0) }
 
@@ -65,8 +66,22 @@ fun GamepadPanel(session: SelkiesSession) {
             .padding(horizontal = 12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
+        // v2.6.0：虚拟手柄入口（无物理手柄也能玩远程游戏）
+        SectionCard("虚拟手柄（屏上手柄）") {
+            Text(
+                "没有物理手柄？打开屏上虚拟手柄：完整/精简/赛车三种布局，\n" +
+                        "支持只读模式与桌面键盘映射（WASD/方向键/IJKL 等），\n" +
+                        "振动直达本机手柄马达（远程游戏 rumble）。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(6.dp))
+            OutlinedButton(onClick = { onOpenVirtualPad?.invoke() }) {
+                Text("打开虚拟手柄")
+            }
+        }
         if (pads.isEmpty()) {
-            SectionCard("未检测到手柄") {
+            SectionCard("未检测到物理手柄") {
                 Text(
                     "将手柄通过 USB 或蓝牙连接到本设备后，此处会自动出现。\n" +
                             "· Android：按手柄上任意键唤醒\n" +

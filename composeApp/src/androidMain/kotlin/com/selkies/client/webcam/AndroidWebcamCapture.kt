@@ -125,6 +125,18 @@ class AndroidWebcamCapture : WebcamCapture {
                 val handler = Handler(analysisThread.looper)
                 analysisExecutor = Executor { handler.post(it) }
 
+                // 【v2.6.0】多摄像头：并发相机（ConcurrentCamera，上限 2 路）各路独立 ImageAnalysis → Bitmap 级拼接 → MJPEG 上行
+                // CameraX 1.3.4 无公开的能力探测 API：直接尝试绑定，UnsupportedOperationException = 设备不支持 → 回退单摄
+                val deviceIds = deviceId.split(',').map { it.trim() }.filter { it.isNotBlank() }
+                if (deviceIds.size >= 2 && android.os.Build.VERSION.SDK_INT >= 30) {
+                    val bound = runCatching {
+                        startConcurrentCameras(activity, cameraProvider, deviceIds.take(2), onFrame, onError)
+                        true
+                    }.getOrDefault(false)
+                    if (bound) return@runCatching
+                    onError("此设备不支持同时开启多摄像头，已使用第一个所选摄像头")
+                }
+
                 val analysis = ImageAnalysis.Builder()
                     .setTargetResolution(Size(camW, camH))
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -135,7 +147,7 @@ class AndroidWebcamCapture : WebcamCapture {
 
                 cameraProvider.unbindAll()
                 // 设备选择：按朝向绑定；后置不存在时回退前置
-                val selector = buildSelector(deviceId)
+                val selector = buildSelector(deviceIds.firstOrNull() ?: "")
                 try {
                     cameraProvider.bindToLifecycle(activity, selector, analysis)
                 } catch (e: Exception) {
@@ -144,6 +156,147 @@ class AndroidWebcamCapture : WebcamCapture {
                 startEncoderLoop(encoder, onError)
             }.onFailure { onError("摄像头启动失败：${it.message}") }
         }, ContextCompat.getMainExecutor(ctx ?: return))
+    }
+
+    /** v2.6.0 并发相机多路合成：每路 ImageAnalysis → 最新 NV12 → Bitmap 拼接 → JPEG 上行（0x06 codec 0）
+     *  服务器虚拟摄像头只有一路，多选必须在客户端合成（与麦克风多路混音同思路）。 */
+    private fun startConcurrentCameras(
+        activity: LifecycleOwner,
+        cameraProvider: ProcessCameraProvider,
+        deviceIds: List<String>,
+        onFrame: (Int, Boolean, ByteArray) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        class CamSlot {
+            @Volatile var nv12: ByteArray? = null
+            @Volatile var w = 0
+            @Volatile var h = 0
+        }
+        val slots = deviceIds.map { CamSlot() }
+
+        cameraProvider.unbindAll()
+        val configs = ArrayList<androidx.camera.core.ConcurrentCamera.SingleCameraConfig>()
+        for ((i, id) in deviceIds.withIndex()) {
+            val analysis = ImageAnalysis.Builder()
+                .setTargetResolution(Size(camW, camH))
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+            val slot = slots[i]
+            analysis.setAnalyzer(analysisExecutor!!) { image ->
+                try {
+                    if (running) {
+                        val nv12 = toNv12(image)
+                        if (nv12 != null) {
+                            slot.nv12 = nv12
+                            slot.w = image.width
+                            slot.h = image.height
+                        }
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    image.close()
+                }
+            }
+            val selector = try {
+                buildSelector(id)
+            } catch (_: Exception) {
+                if (i == 0) CameraSelector.DEFAULT_BACK_CAMERA else CameraSelector.DEFAULT_FRONT_CAMERA
+            }
+            val useCaseGroup = androidx.camera.core.UseCaseGroup.Builder().addUseCase(analysis).build()
+            configs.add(
+                androidx.camera.core.ConcurrentCamera.SingleCameraConfig(selector, useCaseGroup, activity)
+            )
+        }
+        // 不支持并发相机的设备在此抛 UnsupportedOperationException / IllegalArgumentException
+        cameraProvider.bindToLifecycle(configs)
+
+        // 合成线程：Bitmap 级横向拼接 → JPEG
+        encoderThread = Thread({
+            runCatching {
+                val quality = 80
+                while (running) {
+                    val frames = slots.mapNotNull { s -> s.nv12?.let { Triple(it, s.w, s.h) } }
+                    if (frames.isEmpty()) {
+                        Thread.sleep(66)
+                        continue
+                    }
+                    val bitmaps = frames.mapNotNull { (nv12, w, h) -> nv12ToBitmap(nv12, w, h) }
+                    if (bitmaps.isNotEmpty()) {
+                        val h = bitmaps.maxOf { it.height }
+                        val widths = bitmaps.map { (it.width.toFloat() / it.height * h).toInt().coerceAtLeast(16) }
+                        val composite = android.graphics.Bitmap.createBitmap(widths.sum(), h, android.graphics.Bitmap.Config.ARGB_8888)
+                        val canvas = android.graphics.Canvas(composite)
+                        var x = 0
+                        for ((i, bmp) in bitmaps.withIndex()) {
+                            canvas.drawBitmap(bmp, null, android.graphics.Rect(x, 0, x + widths[i], h), null)
+                            x += widths[i]
+                            bmp.recycle()
+                        }
+                        camW = composite.width
+                        camH = composite.height
+                        val out = ByteArrayOutputStream()
+                        composite.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, out)
+                        composite.recycle()
+                        onFrame(0, true, out.toByteArray())
+                    }
+                    Thread.sleep(80) // ~12fps
+                }
+            }.onFailure {
+                if (running) onError("多摄像头合成失败：${it.message}")
+            }
+            running = false
+        }, "selkies-webcam-composite").apply { isDaemon = true; start() }
+    }
+
+    /** ImageProxy → NV12（并发多摄用；返回 null 表示无效帧） */
+    private fun toNv12(image: ImageProxy): ByteArray? {
+        val w = image.width
+        val h = image.height
+        if (w <= 0 || h <= 0) return null
+        val ySize = w * h
+        val nv12 = ByteArray(ySize + ySize / 2)
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+        var pos = 0
+        val yBuf = yPlane.buffer
+        for (row in 0 until h) {
+            yBuf.position(row * yPlane.rowStride)
+            yBuf.get(nv12, pos, w)
+            pos += w
+        }
+        val uBuf = uPlane.buffer
+        val vBuf = vPlane.buffer
+        val uvH = h / 2
+        val uvW = w / 2
+        for (row in 0 until uvH) {
+            for (col in 0 until uvW) {
+                nv12[ySize + row * uvW * 2 + col * 2] =
+                    uBuf.get(row * uPlane.rowStride + col * uPlane.pixelStride)
+                nv12[ySize + row * uvW * 2 + col * 2 + 1] =
+                    vBuf.get(row * vPlane.rowStride + col * vPlane.pixelStride)
+            }
+        }
+        return nv12
+    }
+
+    /** NV12 → Bitmap（NV21 → YuvImage → JPEG → decode） */
+    private fun nv12ToBitmap(nv12: ByteArray, w: Int, h: Int): android.graphics.Bitmap? {
+        return runCatching {
+            val ySize = w * h
+            val nv21 = nv12.copyOf()
+            var i = 0
+            while (i < ySize / 2 - 1) {
+                val tmp = nv21[ySize + i]
+                nv21[ySize + i] = nv21[ySize + i + 1]
+                nv21[ySize + i + 1] = tmp
+                i += 2
+            }
+            val yuv = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, w, h, null)
+            val out = ByteArrayOutputStream()
+            yuv.compressToJpeg(android.graphics.Rect(0, 0, w, h), 82, out)
+            android.graphics.BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size())
+        }.getOrNull()
     }
 
     /** deviceId → CameraSelector（按朝向选择；CameraX 不支持直接按 camera2 id 绑定） */

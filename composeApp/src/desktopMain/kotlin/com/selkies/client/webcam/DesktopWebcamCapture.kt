@@ -10,6 +10,9 @@ import javax.imageio.ImageIO
 /**
  * 桌面摄像头上行：FFmpegFrameGrabber（v4l2/dshow/avfoundation）→ JPEG (MJPEG codec 0) → 0x06 帧
  * v2.4.0：支持指定设备与目标分辨率。
+ * 【v2.6.0】多摄像头合成：deviceId 为逗号分隔列表时，每设备独立抓帧线程 +
+ *   合成线程把多路画面横向拼接（等高缩放）为一路虚拟摄像头画面上行——
+ *   服务器虚拟摄像头只有一路，多选因此必须在客户端合成（与麦克风多路混音同思路）。
  */
 class DesktopWebcamCapture : WebcamCapture {
 
@@ -27,6 +30,14 @@ class DesktopWebcamCapture : WebcamCapture {
     override val width: Int get() = camW
     override val height: Int get() = camH
 
+    /** 一路设备的最新帧（合成线程读取） */
+    private class CamSlot(val deviceId: String) {
+        @Volatile
+        var latest: BufferedImage? = null
+        @Volatile
+        var alive = false
+    }
+
     override fun start(
         encoder: String,
         deviceId: String,
@@ -40,22 +51,24 @@ class DesktopWebcamCapture : WebcamCapture {
         camH = targetH.coerceIn(120, 1080)
         running = true
         thread = Thread({
-            var grabber: FFmpegFrameGrabber? = null
-            val converter = Java2DFrameConverter()
-            try {
-                val os = System.getProperty("os.name").lowercase()
-                // 指定设备 → 单设备列表；否则按平台枚举候选
-                val deviceList = if (deviceId.isNotBlank()) {
-                    listOf(deviceId)
-                } else when {
-                    os.contains("win") -> dshowDevices()
-                    os.contains("mac") -> listOf("0")
-                    else -> v4l2Devices()
-                }
-                var lastError = "未找到摄像头设备"
-                for (device in deviceList) {
-                    runCatching {
-                        val g = if (device.startsWith("video=")) FFmpegFrameGrabber(device) else FFmpegFrameGrabber(device)
+            val os = System.getProperty("os.name").lowercase()
+            val deviceList = if (deviceId.isNotBlank()) {
+                deviceId.split(',').filter { it.isNotBlank() }
+            } else when {
+                os.contains("win") -> dshowDevices()
+                os.contains("mac") -> listOf("0")
+                else -> v4l2Devices()
+            }
+            val slots = deviceList.map { CamSlot(it.trim()) }
+            val grabThreads = ArrayList<Thread>()
+
+            // ---- 每设备独立抓帧线程：持续更新 latest ----
+            for (slot in slots) {
+                val t = Thread({
+                    var grabber: FFmpegFrameGrabber? = null
+                    val converter = Java2DFrameConverter()
+                    try {
+                        val g = FFmpegFrameGrabber(slot.deviceId)
                         when {
                             os.contains("win") -> { g.format = "dshow" }
                             os.contains("mac") -> { g.format = "avfoundation" }
@@ -66,21 +79,65 @@ class DesktopWebcamCapture : WebcamCapture {
                         g.frameRate = 15.0
                         g.start()
                         grabber = g
-                    }.onFailure { lastError = it.message ?: it.toString() }
-                    if (grabber != null) break
+                        slot.alive = true
+                        while (running) {
+                            val frame = g.grab() ?: break
+                            if (frame.image == null) continue
+                            val img = converter.convert(frame) ?: continue
+                            slot.latest = img
+                        }
+                    } catch (_: Throwable) {
+                        // 该设备打开失败：合成线程自动跳过
+                    } finally {
+                        slot.alive = false
+                        runCatching { grabber?.stop(); grabber?.release() }
+                        runCatching { converter.close() }
+                    }
+                }, "selkies-webcam-${slot.deviceId.takeLast(12)}").apply {
+                    isDaemon = true
+                    start()
                 }
-                if (grabber == null) {
-                    throw IllegalStateException(lastError)
+                grabThreads.add(t)
+            }
+
+            // ---- 等待至少一路出帧 ----
+            try {
+                val deadline = System.currentTimeMillis() + 8000
+                while (running && slots.none { it.latest != null }) {
+                    if (System.currentTimeMillis() > deadline) {
+                        throw IllegalStateException("未找到可用摄像头设备（${slots.size} 路均无输出）")
+                    }
+                    Thread.sleep(100)
                 }
-                val g = grabber!!
-                if (g.imageWidth > 0) camW = g.imageWidth
-                if (g.imageHeight > 0) camH = g.imageHeight
+
+                // ---- 合成线程主循环：多路拼接 → JPEG ----
                 while (running) {
-                    val frame = g.grab() ?: break
-                    if (frame.image == null) continue
-                    val img: BufferedImage = converter.convert(frame) ?: continue
+                    val frames = slots.mapNotNull { it.latest }
+                    if (frames.isEmpty()) {
+                        Thread.sleep(66)
+                        continue
+                    }
+                    val composite: BufferedImage = if (frames.size == 1) {
+                        frames[0]
+                    } else {
+                        // 横向拼接：等高缩放（高度取目标 camH）
+                        val h = camH
+                        val widths = frames.map { (it.width.toDouble() / it.height * h).toInt().coerceAtLeast(16) }
+                        val totalW = widths.sum()
+                        val img = BufferedImage(totalW, h, BufferedImage.TYPE_3BYTE_BGR)
+                        val g2 = img.createGraphics()
+                        var x = 0
+                        for ((i, f) in frames.withIndex()) {
+                            g2.drawImage(f, x, 0, widths[i], h, null)
+                            x += widths[i]
+                        }
+                        g2.dispose()
+                        img
+                    }
+                    camW = composite.width
+                    camH = composite.height
                     val out = ByteArrayOutputStream()
-                    ImageIO.write(img, "jpg", out)
+                    ImageIO.write(composite, "jpg", out)
                     val jpg = out.toByteArray()
                     // MJPEG：每帧都是关键帧
                     onFrame(0, true, jpg)
@@ -91,8 +148,7 @@ class DesktopWebcamCapture : WebcamCapture {
                 if (running) onError("摄像头错误：${e.message ?: e.toString()}")
             } finally {
                 running = false
-                runCatching { grabber?.stop(); grabber?.release() }
-                runCatching { converter.close() }
+                grabThreads.forEach { it.interrupt() }
             }
         }, "selkies-webcam").apply { isDaemon = true; start() }
     }

@@ -24,6 +24,11 @@ actual fun VideoSurface(session: SelkiesSession, modifier: Modifier) {
     }
     val bitmap by sink.bitmapFlow.collectAsState()
 
+    // v2.6.0 修复：注册 sink 供平台截图使用（旧版从未注册 = 截图恒失败的根因）
+    androidx.compose.runtime.SideEffect {
+        com.selkies.client.platform.DesktopPlatform.registerVideoSink(sink)
+    }
+
     Canvas(modifier = modifier) {
         drawRect(Color.Black)
         val bmp = bitmap ?: return@Canvas
@@ -43,6 +48,7 @@ actual fun VideoSurface(session: SelkiesSession, modifier: Modifier) {
 
     DisposableEffect(session) {
         onDispose {
+            com.selkies.client.platform.DesktopPlatform.registerVideoSink(null)
             session.videoSink?.let { runCatching { it.close() } }
             session.videoSink = null
         }

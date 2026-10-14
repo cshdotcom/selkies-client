@@ -92,8 +92,8 @@ android {
         applicationId = "com.selkies.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 20500
-        versionName = "2.5.0"
+        versionCode = 20600
+        versionName = "2.6.0"
         ndkVersion = ""
     }
     signingConfigs {
@@ -131,7 +131,7 @@ compose.desktop {
         mainClass = "com.selkies.client.MainKt"
         nativeDistributions {
             packageName = "Selkies-Desktop"
-            packageVersion = "2.4.0"
+            packageVersion = "2.6.0"
             description = "Selkies 远程桌面原生客户端"
             vendor = "Selkies Client"
         }
@@ -148,7 +148,7 @@ val desktopFatJar = tasks.register<Jar>("desktopFatJar") {
     manifest {
         attributes["Main-Class"] = "com.selkies.client.MainKt"
         attributes["Implementation-Title"] = "Selkies Desktop Client"
-        attributes["Implementation-Version"] = "2.4.0"
+        attributes["Implementation-Version"] = "2.6.0"
     }
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
     exclude("META-INF/versions/**/module-info.class")
@@ -206,4 +206,16 @@ tasks.register<JavaExec>("guiProbe") {
     classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
     systemProperty("java.awt.headless", "false")
     if (project.hasProperty("script")) systemProperty("script", project.property("script").toString())
+}
+
+// v2.6.0 综合端到端验证（剪贴板回环/音频/多编码器/录屏/虚拟手柄/竖屏分辨率）
+tasks.register<JavaExec>("probeV26") {
+    group = "verification"
+    description = "v2.6.0 无头综合验证：剪贴板回环 + 音频 + 多编码器解码 + 录屏 + 虚拟手柄 + 竖屏"
+    mainClass.set("com.selkies.client.tools.V26Probe")
+    val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
+    classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
+    for (k in listOf("probeUrl", "probeUser", "probePass")) {
+        if (project.hasProperty(k)) systemProperty(k, project.property(k).toString())
+    }
 }

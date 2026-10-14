@@ -21,7 +21,11 @@ import javax.sound.sampled.SourceDataLine
 import javax.sound.sampled.TargetDataLine
 
 /**
- * 桌面音频播放：FFmpeg Opus 解码 → 软件 float→s16 → SourceDataLine
+ * 桌面音频播放：FFmpeg Opus 解码 → 软件 float→s16 → 多路 SourceDataLine
+ * 【v2.6.0】
+ *  - 多输出设备（多选）：每设备一条 SourceDataLine（各自 Mixer），独立音量（PCM 增益）
+ *  - 设备打开失败：回退默认设备 + onError 反馈（旧版静默失败 = "远程音频不播放"的候选根因之一）
+ *  - 写入异常：剔除该路并通知；全部失败时定时重试重建
  */
 class DesktopAudioPlayer : AudioPlayer {
 
@@ -30,11 +34,22 @@ class DesktopAudioPlayer : AudioPlayer {
     private var thread: Thread? = null
     private val pending = ConcurrentLinkedQueue<ByteArray>()
 
+    override var onError: ((String) -> Unit)? = null
+
+    /** 期望输出（deviceId → 0..1 增益）；空 = 默认设备 */
+    @Volatile
+    private var wantedOutputs: Map<String, Float> = emptyMap()
+
     // 解码线程独占
     private var codecCtx: AVCodecContext? = null
     private var packet: AVPacket? = null
     private var frame: AVFrame? = null
-    private var line: SourceDataLine? = null
+
+    private class Out(val deviceId: String, val line: SourceDataLine, @Volatile var gain: Float)
+
+    /** 当前活动输出（解码线程独占；wantedOutputs 变化时重建） */
+    private val outs = ArrayList<Out>()
+    private var outsSig = ""
 
     override val bufferLevelMs: Int get() = pending.size * 20
 
@@ -62,6 +77,10 @@ class DesktopAudioPlayer : AudioPlayer {
         this.volume = volume
     }
 
+    override fun setOutputDevices(outputs: Map<String, Float>) {
+        wantedOutputs = outputs
+    }
+
     override fun stop() {
         running = false
         thread?.interrupt()
@@ -71,17 +90,64 @@ class DesktopAudioPlayer : AudioPlayer {
     }
 
     private fun releaseAll() {
-        runCatching { line?.stop(); line?.close() }
+        runCatching { outs.forEach { runCatching { it.line.stop(); it.line.close() } } }
+        outs.clear()
         // ⚠️【double-free 修复】JavaCPP 分配的对象（avcodec_alloc_context3 / AVPacket() / AVFrame()）
         //    都已自动挂接释放器：手动调 C 释放函数 + GC 释放器 = 双重释放 → "free(): invalid pointer" 崩溃。
         //    必须用 Pointer.deallocate()（幂等，只释放一次）。
         runCatching { codecCtx?.deallocate() }
         runCatching { packet?.deallocate() }
         runCatching { frame?.deallocate() }
-        line = null
         codecCtx = null
         packet = null
         frame = null
+    }
+
+    /** 打开一路输出：mixer:N → 第 N 个 Mixer；null/其他 → 系统默认 */
+    private fun openLine(deviceId: String?, format: AudioFormat, info: DataLine.Info): SourceDataLine? {
+        return runCatching {
+            val l: SourceDataLine = if (deviceId == null || !deviceId.startsWith("mixer:")) {
+                AudioSystem.getSourceDataLine(format)
+            } else {
+                val idx = deviceId.removePrefix("mixer:").toIntOrNull()
+                val mixerInfo = idx?.let { AudioSystem.getMixerInfo().getOrNull(it) }
+                val mixer = mixerInfo?.let { AudioSystem.getMixer(it) }
+                if (mixer?.isLineSupported(info) == true) mixer.getLine(info) as SourceDataLine
+                else AudioSystem.getSourceDataLine(format)
+            }
+            l.open(format, (format.sampleRate / 10).toInt() * 4)
+            l.start()
+            l
+        }.getOrNull()
+    }
+
+    /** 按期望输出重建活动线路；返回是否有可用路 */
+    private fun rebuildOuts(sampleRate: Int, channels: Int): Boolean {
+        outs.forEach { runCatching { it.line.stop(); it.line.close() } }
+        outs.clear()
+        val format = AudioFormat(sampleRate.toFloat(), 16, channels, true, false)
+        val info = DataLine.Info(SourceDataLine::class.java, format)
+        val wanted = wantedOutputs
+        if (wanted.isEmpty()) {
+            val l = openLine(null, format, info)
+            if (l != null) outs.add(Out("", l, 1f))
+            else onError?.invoke("无法打开默认音频输出设备（${format.sampleRate}Hz ${channels}ch）——将自动重试")
+        } else {
+            for ((id, gain) in wanted) {
+                val l = openLine(id, format, info)
+                if (l != null) {
+                    outs.add(Out(id, l, gain))
+                } else {
+                    onError?.invoke("音频输出设备不可用：$id（已跳过该设备）")
+                }
+            }
+            // 全部失败 → 回退默认
+            if (outs.isEmpty()) {
+                val l = openLine(null, format, info)
+                if (l != null) outs.add(Out("", l, 1f))
+            }
+        }
+        return outs.isNotEmpty()
     }
 
     private fun loop(sampleRate: Int) {
@@ -101,6 +167,7 @@ class DesktopAudioPlayer : AudioPlayer {
 
             val pkt = packet!!
             val fr = frame!!
+            var reopenAt = 0L
 
             while (running) {
                 val opus = pending.poll()
@@ -117,11 +184,42 @@ class DesktopAudioPlayer : AudioPlayer {
                     val n = fr.nb_samples()
                     val ch = fr.ch_layout().nb_channels()
                     if (n > 0 && ch > 0) {
-                        val l = ensureLine(fr.sample_rate(), ch)
+                        val sr = fr.sample_rate()
+                        // 输出配置签名变化（设备/音量）→ 重建线路
+                        val sig = sr.toString() + "x" + ch + "|" +
+                                wantedOutputs.entries.sortedBy { it.key }.joinToString("|") { (k, v) -> "$k=${"%.2f".format(v)}" }
+                        if (sig != outsSig || outs.isEmpty()) {
+                            if (outs.isEmpty() && reopenAt > System.currentTimeMillis()) {
+                                // 全失败后的节流重试（1s 一次）
+                            } else {
+                                rebuildOuts(sr, ch)
+                                outsSig = if (outs.isNotEmpty()) sig else ""
+                                reopenAt = System.currentTimeMillis() + 1000
+                            }
+                        }
+                        if (outs.isEmpty()) {
+                            avutil.av_frame_unref(fr)
+                            continue
+                        }
                         val pcm = decodeToS16(fr, n, ch)
-                        var written = 0
-                        while (written < pcm.size && running) {
-                            written += l.write(pcm, written, pcm.size - written)
+                        val it = outs.iterator()
+                        while (it.hasNext()) {
+                            val o = it.next()
+                            try {
+                                val bytes = if (o.gain >= 0.999f) pcm else scalePcm(pcm, o.gain)
+                                var written = 0
+                                while (written < bytes.size && running) {
+                                    written += o.line.write(bytes, written, bytes.size - written)
+                                }
+                            } catch (e: Exception) {
+                                runCatching { o.line.stop(); o.line.close() }
+                                it.remove()
+                                onError?.invoke("音频输出 ${o.deviceId.ifBlank { "默认设备" }} 写入失败（${e.javaClass.simpleName}），已移除")
+                            }
+                        }
+                        if (outs.isEmpty()) {
+                            outsSig = ""
+                            reopenAt = System.currentTimeMillis() + 1000
                         }
                     }
                     avutil.av_frame_unref(fr)
@@ -130,26 +228,23 @@ class DesktopAudioPlayer : AudioPlayer {
             }
         }.onFailure {
             running = false
+            onError?.invoke("音频播放器错误：${it.message ?: it.javaClass.simpleName}")
         }
         releaseAll()
     }
 
-    private fun ensureLine(sampleRate: Int, channels: Int): SourceDataLine {
-        val cur = line
-        if (cur != null && cur.format.sampleRate == sampleRate.toFloat() && cur.format.channels == channels) {
-            return cur
+    /** s16 PCM 按增益缩放（每路输出独立音量） */
+    private fun scalePcm(pcm: ByteArray, gain: Float): ByteArray {
+        val out = pcm.copyOf()
+        val bb = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN)
+        val sb = bb.asShortBuffer()
+        for (i in 0 until sb.limit()) {
+            sb.put(i, (sb.get(i) * gain).toInt().toShort())
         }
-        runCatching { cur?.stop(); cur?.close() }
-        val format = AudioFormat(sampleRate.toFloat(), 16, channels, true, false)
-        val info = DataLine.Info(SourceDataLine::class.java, format)
-        val l = AudioSystem.getLine(info) as SourceDataLine
-        l.open(format, sampleRate / 10 * 4)
-        l.start()
-        line = l
-        return l
+        return out
     }
 
-    /** 解码帧（float packed/planar 或 s16）→ s16le 字节
+    /** 解码帧（float packed/planar 或 s16）→ s16le 字节（主音量内联）
      *  ⚠️ 所有 BytePointer 读取前必须显式 limit(n)：getter 返回的指针容量未知，
      *    asByteBuffer() 视图容量为 0，不设 limit 会 BufferUnderflow */
     private fun decodeToS16(fr: AVFrame, n: Int, ch: Int): ByteArray {

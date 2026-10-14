@@ -483,6 +483,7 @@ fun CompleteKeyboard(
     visible: Boolean,
     autoScaleHint: Float = 1f,
     savedScale: Float = 0f,
+    savedFullScale: Float = 0f,
     savedFullMode: Boolean = false,
     onScaleChange: (Float) -> Unit = {},
     onFullModeChange: (Boolean) -> Unit = {},
@@ -498,9 +499,18 @@ fun CompleteKeyboard(
     var collapsed by remember { mutableStateOf(false) }
     var textBarVisible by remember { mutableStateOf(false) }
     var composeText by remember { mutableStateOf("") }
-    // 缩放：分类模式 0.6–1.6（作用于自动键高），完整模式 0.3–2.0（作用于单位宽度）
-    var scale by remember(savedScale, fullMode) {
-        mutableStateOf(if (savedScale > 0f) savedScale else if (fullMode) autoScaleHint.coerceIn(0.3f, 1f) else 1f)
+    // 缩放：分类模式 0.55–1.6（作用于自动键高），完整模式 0.3–2.0（作用于单位宽度）
+    // 【v2.6.0 修复】两种模式各自持久化（keyboardScale / keyboardFullScale）：
+    //   旧版共用一个值——在完整模式缩小后切回分类模式键盘变微型，反之亦然；
+    //   完整模式默认按屏宽自适应（23 单位恰好可见），不再依赖外部 autoScaleHint。
+    var scale by remember(savedScale, savedFullScale, fullMode) {
+        mutableStateOf(
+            if (fullMode) {
+                if (savedFullScale > 0f) savedFullScale else autoScaleHint.coerceIn(0.3f, 1f)
+            } else {
+                if (savedScale > 0f) savedScale else 1f
+            }
+        )
     }
     var repaint by remember { mutableStateOf(0) }   // 触发修饰键高亮重绘
 

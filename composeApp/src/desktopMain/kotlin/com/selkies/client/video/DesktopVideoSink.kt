@@ -8,6 +8,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.bytedeco.ffmpeg.global.avcodec
 import org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_H264
+import org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_HEVC
+import org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_VP8
+import org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_VP9
+import org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_AV1
 import org.bytedeco.ffmpeg.global.avutil
 import org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_BGRA
 import org.bytedeco.ffmpeg.global.swscale
@@ -25,8 +29,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 import javax.imageio.ImageIO
 
 /**
- * 桌面视频解码：FFmpeg avcodec H.264 → swscale BGRA → Skia Bitmap → Compose
+ * 桌面视频解码：FFmpeg avcodec（H.264/H.265/VP8/VP9/AV1）→ swscale BGRA → Skia Bitmap → Compose
  * JPEG 条带模式：ImageIO 解码 → 合成 → 发布
+ * 【v2.6.0】多编码器支持：旧版仅 H.264（codecId!=1 直接丢帧），切到 H.265/VP8/VP9 后
+ * 黑屏且截图无帧 —— 与画质面板提供的编码器选项严重不一致。
  */
 class DesktopVideoSink : VideoSink {
 
@@ -64,6 +70,7 @@ class DesktopVideoSink : VideoSink {
     private var sws: SwsContext? = null
     private var ctxW = 0
     private var ctxH = 0
+    private var ctxCodecId = 0
 
     // 位图三缓冲轮换
     private val pool = ArrayDeque<Bitmap>(3)
@@ -123,6 +130,7 @@ class DesktopVideoSink : VideoSink {
         // 下一关键帧会重新配置
         ctxW = 0
         ctxH = 0
+        ctxCodecId = 0
     }
 
     override fun close() {
@@ -152,13 +160,28 @@ class DesktopVideoSink : VideoSink {
         sws = null
         ctxW = 0
         ctxH = 0
+        ctxCodecId = 0
     }
 
-    private fun ensureDecoder(w: Int, h: Int) {
-        if (codecCtx != null && ctxW == w && ctxH == h) return
+    /** codecId → FFmpeg 解码器（1=h264 2=vp8 3=vp9 4=av1 5=h265） */
+    private fun ffCodecId(codecId: Int): Int = when (codecId) {
+        2 -> AV_CODEC_ID_VP8
+        3 -> AV_CODEC_ID_VP9
+        4 -> AV_CODEC_ID_AV1
+        5 -> AV_CODEC_ID_HEVC
+        else -> AV_CODEC_ID_H264
+    }
+
+    private fun codecLabel(codecId: Int): String = when (codecId) {
+        2 -> "VP8"; 3 -> "VP9"; 4 -> "AV1"; 5 -> "H.265"; else -> "H.264"
+    }
+
+    private fun ensureDecoder(w: Int, h: Int, codecId: Int) {
+        if (codecCtx != null && ctxW == w && ctxH == h && ctxCodecId == codecId) return
         releaseCodec()
-        val codec = avcodec.avcodec_find_decoder(AV_CODEC_ID_H264)
-            ?: throw IllegalStateException("未找到 H.264 解码器")
+        val ffId = ffCodecId(codecId)
+        val codec = avcodec.avcodec_find_decoder(ffId)
+            ?: throw IllegalStateException("未找到 ${codecLabel(codecId)} 解码器")
         // ⚠️【SIGSEGV 修复】AVCodecContext(codec) 匹配的是 Pointer 包装构造器（不分配内存），
         //    把 AVCodec 结构当 AVCodecContext 用会越界写直接段错误——必须用 avcodec_alloc_context3 分配。
         //    此前从未触发：无头探针用 no-op 桩，真机走 Android MediaCodec。
@@ -167,7 +190,7 @@ class DesktopVideoSink : VideoSink {
         ctx.height(h)
         ctx.flags2(ctx.flags2() or avcodec.AV_CODEC_FLAG2_FAST)
         if (avcodec.avcodec_open2(ctx, codec, null as org.bytedeco.ffmpeg.avutil.AVDictionary?) < 0) {
-            throw IllegalStateException("H.264 解码器初始化失败")
+            throw IllegalStateException("${codecLabel(codecId)} 解码器初始化失败")
         }
         codecCtx = ctx
         packet = AVPacket()
@@ -181,6 +204,7 @@ class DesktopVideoSink : VideoSink {
         f.linesize(0, w * 4)
         ctxW = w
         ctxH = h
+        ctxCodecId = codecId
     }
 
     private fun decoderLoop() {
@@ -190,10 +214,10 @@ class DesktopVideoSink : VideoSink {
             } catch (e: InterruptedException) {
                 break
             }
-            if (fb.header.codecId != 1) continue // 仅 H.264；其他编码由设置层切换
+            if (fb.header.codecId !in 1..5) continue
             val decodeStartNs = System.nanoTime()
             runCatching {
-                ensureDecoder(fb.header.width.coerceAtLeast(16), fb.header.height.coerceAtLeast(16))
+                ensureDecoder(fb.header.width.coerceAtLeast(16), fb.header.height.coerceAtLeast(16), fb.header.codecId)
                 val ctx = codecCtx!!
                 val pkt = packet!!
                 avcodec.av_packet_unref(pkt)

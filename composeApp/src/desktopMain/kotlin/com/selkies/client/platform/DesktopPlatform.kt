@@ -334,6 +334,12 @@ object DesktopPlatform : PlatformServices {
 
     @Volatile
     private var lastDesktopSink: com.selkies.client.video.DesktopVideoSink? = null
+
+    /** v2.6.0 修复：VideoSurface 直接构造 sink（不经 makeVideoSink），必须在此注册供截图使用
+     *  （旧版 lastDesktopSink 恒 null = 桌面截图「暂无可截取的视频帧」根因） */
+    fun registerVideoSink(sink: com.selkies.client.video.DesktopVideoSink?) {
+        lastDesktopSink = sink
+    }
     @Volatile
     private var desktopFocus = true
     private var shutdownHookRegistered = false
@@ -562,15 +568,23 @@ private object AwtClipboardBridge : ClipboardBridge {
         }
     }
 
-    @Volatile
-    private var listener: (() -> Unit)? = null
-    private val owner = object : java.awt.datatransfer.ClipboardOwner {
-        override fun lostOwnership(clipboard: java.awt.datatransfer.Clipboard, contents: java.awt.datatransfer.Transferable) {}
-    }
+    // ---- v2.6.0 多监听器（修复：旧版只覆写 setListener，addListener/removeListener 落到
+    //      接口空默认实现 → 会话层注册的监听是空操作，本地复制永远检测不到 = 发送方向失效根因） ----
+    private val listeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
 
     override fun setListener(listener: (() -> Unit)?) {
-        this.listener = listener
-        if (listener != null) ensurePollThread()
+        if (listener != null) addListener(listener) else {
+            listeners.toSet().forEach { removeListener(it) }
+        }
+    }
+
+    override fun addListener(listener: () -> Unit) {
+        if (!listeners.contains(listener)) listeners.add(listener)
+        ensurePollThread()
+    }
+
+    override fun removeListener(listener: () -> Unit) {
+        listeners.remove(listener)
     }
 
     @Volatile private var pollThreadStarted = false
@@ -580,13 +594,22 @@ private object AwtClipboardBridge : ClipboardBridge {
             if (pollThreadStarted) return
             pollThreadStarted = true
             Thread {
+                // 500ms 轮询系统剪贴板文本（AWT 在桌面平台无变更通知，只能轮询）
                 var last = getText()
+                var lastImageSig = hasImage()
                 while (true) {
-                    Thread.sleep(500)
+                    Thread.sleep(400)
                     val cur = runCatching { getText() }.getOrNull()
                     if (cur != last) {
                         last = cur
-                        listener?.invoke()
+                        listeners.forEach { runCatching { it() } }
+                    } else if (cur == null) {
+                        // 文本为空时看图像是否出现/消失（图片复制场景）
+                        val img = runCatching { hasImage() }.getOrDefault(false)
+                        if (img != lastImageSig) {
+                            lastImageSig = img
+                            listeners.forEach { runCatching { it() } }
+                        }
                     }
                 }
             }.apply { isDaemon = true; name = "clip-poll" }.start()

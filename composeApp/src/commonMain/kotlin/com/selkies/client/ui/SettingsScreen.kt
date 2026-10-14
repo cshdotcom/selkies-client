@@ -12,6 +12,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.foundation.layout.width
@@ -201,6 +203,61 @@ fun SettingsScreen(state: AppState) {
                 }
                 SettingSwitch("会话中保持屏幕常亮", settings.keepScreenOn) {
                     toggle { it.keepScreenOn = !it.keepScreenOn }
+                }
+                // v2.6.0：竖屏自动旋转远端分辨率
+                SettingSwitch("竖屏自动旋转远程分辨率（填满屏幕）", settings.autoRotatePortraitRes) {
+                    toggle { it.autoRotatePortraitRes = !it.autoRotatePortraitRes }
+                }
+                Text(
+                    "手机竖屏时自动把远程分辨率旋转为竖屏填满屏幕（仅自适应模式；手动分辨率不受影响）。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            // v2.6.0：功能栏排序（自定义工具栏按钮顺序）
+            SectionCard("功能栏排序（会话工具栏按钮顺序）") {
+                var order by remember(settings.toolbarOrder) {
+                    mutableStateOf(
+                        run {
+                            val saved = settings.toolbarOrder.split(',').filter { it.isNotBlank() }
+                            com.selkies.client.ui.ToolbarDefaults.ALL.filter { it in saved } +
+                                    com.selkies.client.ui.ToolbarDefaults.ALL.filter { it !in saved }
+                        }
+                    )
+                }
+                fun persist(newOrder: List<String>) {
+                    order = newOrder
+                    state.store.updateSettings { it.toolbarOrder = newOrder.joinToString(",") }
+                }
+                order.forEachIndexed { idx, key ->
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 1.dp)
+                    ) {
+                        Text(
+                            "${idx + 1}.",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.width(26.dp)
+                        )
+                        Text(
+                            com.selkies.client.ui.ToolbarDefaults.LABELS[key] ?: key,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.weight(1f)
+                        )
+                        androidx.compose.material3.IconButton(
+                            onClick = { if (idx > 0) persist(order.toMutableList().apply { add(idx - 1, removeAt(idx)) }) },
+                            enabled = idx > 0
+                        ) { Icon(Icons.Filled.KeyboardArrowUp, "上移") }
+                        androidx.compose.material3.IconButton(
+                            onClick = { if (idx < order.size - 1) persist(order.toMutableList().apply { add(idx + 1, removeAt(idx)) }) },
+                            enabled = idx < order.size - 1
+                        ) { Icon(Icons.Filled.KeyboardArrowDown, "下移") }
+                    }
+                }
+                androidx.compose.material3.TextButton(onClick = { persist(com.selkies.client.ui.ToolbarDefaults.ALL) }) {
+                    Text("恢复默认顺序")
                 }
             }
 

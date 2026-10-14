@@ -80,8 +80,13 @@ class SelkiesSession(
     /** 当前选中的麦克风设备 id 列表（多选混音） */
     val selectedMicIds = MutableStateFlow<List<String>>(emptyList())
 
-    /** 当前选中的摄像头设备 id（单选；服务器虚拟摄像头一次一路） */
+    /** 当前选中的摄像头设备 id（多选：多路合成上行；空 = 默认） */
     val selectedCameraId = MutableStateFlow("")
+
+    /** v2.6.0 当前选中的扬声器 id 列表（多选；空 = 系统默认输出） */
+    val selectedSpeakerIds = MutableStateFlow<List<String>>(emptyList())
+    /** v2.6.0 每扬声器独立音量（id → 0..1） */
+    val speakerGains = MutableStateFlow<Map<String, Float>>(emptyMap())
 
     /** 麦克风/摄像头上行开关（UI 观察） */
     val micActive = MutableStateFlow(false)
@@ -109,7 +114,11 @@ class SelkiesSession(
             field = value
         }
 
-    val audioPlayer by lazy { platform.makeAudioPlayer() }
+    val audioPlayer by lazy {
+        platform.makeAudioPlayer().also { p ->
+            p.onError = { msg -> notices.value = "音频：$msg" }
+        }
+    }
     val micCapture by lazy { platform.makeMicCapture() }
     val webcamCapture by lazy { platform.makeWebcamCapture() }
     val filesClient by lazy { FilesClient(this) }
@@ -126,8 +135,13 @@ class SelkiesSession(
     private var lastReceivedFrameAt = 0L
     private val audioParseState = Protocol.AudioParseState()
     private var gzRxEnabled = false
-    private var suppressClipboardEcho = false
+    private var suppressClipboardEcho = false // v2.6.0: 跨线程读写（ioScope 写 / 监听器线程读），用锁保护
+    private val clipboardEchoLock = Any()
     private var lastRemoteClipboardText: String? = null
+    /** v2.6.0 远程剪贴板内容（text?, mime）——UI（剪贴板面板等）直接观察，修复旧版回调未接线导致面板永远不更新 */
+    val remoteClipboard = MutableStateFlow<Pair<String?, String>?>(null)
+    /** v2.6.0 剪贴板同步事件提示（用户反馈：发送/接收成功或失败） */
+    val clipboardNotice = MutableStateFlow<String?>(null)
     private var clipboardMultipart: StringBuilder? = null
     private var clipboardMultipartMime = "text/plain"
     private var clipboardMultipartExpected = 0L
@@ -199,10 +213,15 @@ class SelkiesSession(
         if (server.resolutionW > 0 && server.resolutionH > 0) {
             return alignRes(server.resolutionW) to alignRes(server.resolutionH)
         }
-        // 自适应：跟随客户端屏幕物理像素（竖屏时以短边为宽保证横向桌面）
+        // 自适应：跟随客户端屏幕物理像素
+        // v2.6.0：竖屏时若开启「竖屏自动旋转分辨率」，直接请求竖屏尺寸填满屏幕（旧版恒横向桌面 = 小画面）
         val sw = screenWidthPx
         val sh = screenHeightPx
         if (sw > 0 && sh > 0) {
+            val portraitView = sh > sw
+            if (portraitView && settings().autoRotatePortraitRes) {
+                return alignRes(sw) to alignRes(sh)
+            }
             return if (sw >= sh) alignRes(sw) to alignRes(sh) else alignRes(sh) to alignRes(sw)
         }
         return 1280 to 720
@@ -1202,7 +1221,8 @@ class SelkiesSession(
 
     /** 本地剪贴板变化 → 发送到远程（由 UI 层的监听调用） */
     fun pushLocalClipboard(text: String?) {
-        if (suppressClipboardEcho) return
+        val suppressed = synchronized(clipboardEchoLock) { suppressClipboardEcho }
+        if (suppressed) return
         val s = settings()
         if (!s.clipboardAutoSend) return
         if (text == null) return
@@ -1212,12 +1232,16 @@ class SelkiesSession(
             runCatching {
                 val bytes = text.toByteArray(Charsets.UTF_8)
                 sendClipboardChunked(bytes, "text/plain")
+                clipboardNotice.value = "本地复制已发送到远程（${text.length} 字符）"
+            }.onFailure {
+                clipboardNotice.value = "发送到远程剪贴板失败：${it.message ?: it.javaClass.simpleName}"
             }
         }
     }
 
     fun pushLocalImage(png: ByteArray) {
-        if (suppressClipboardEcho) return
+        val suppressed = synchronized(clipboardEchoLock) { suppressClipboardEcho }
+        if (suppressed) return
         val s = settings()
         if (!s.clipboardAutoSend || !s.clipboardBinaryEnabled) return
         ioScope.launch {
@@ -1258,7 +1282,14 @@ class SelkiesSession(
             if (mime == "text/plain" || mime.startsWith("text/")) {
                 val text = bytes.toString(Charsets.UTF_8)
                 lastRemoteClipboardText = text
+                // v2.6.0：迟到的 cr 空快照（reply）不覆盖已收到的真实内容
+                //   （服务器连接期读剪贴板可能数秒后才回空，此时更早的真实同步不应被清空显示）
+                val skipOverwrite = isReply && text.isEmpty() && !remoteClipboard.value?.first.isNullOrEmpty()
+                if (!skipOverwrite) {
+                    remoteClipboard.value = text to mime
+                }
                 onClipboardFromRemote(text, mime)
+                clipboardNotice.value = if (isReply) "已获取远程剪贴板（${text.length} 字符）" else "远程剪贴板已同步到本地（${text.length} 字符）"
                 if (!isReply && settings().clipboardAutoReceive && text.isNotEmpty()) {
                     applyRemoteClipboardLocally {
                         // 后台（无焦点）时 Android 禁止写剪贴板 → 挂起，回焦点补写
@@ -1271,7 +1302,9 @@ class SelkiesSession(
                     }
                 }
             } else {
+                remoteClipboard.value = null to mime
                 onClipboardFromRemote(null, mime)
+                clipboardNotice.value = "远程剪贴板收到 $mime 内容（${bytes.size / 1024} KB）"
                 if (!isReply && settings().clipboardAutoReceive && settings().clipboardBinaryEnabled) {
                     if (mime == "image/png") {
                         applyRemoteClipboardLocally {
@@ -1292,15 +1325,20 @@ class SelkiesSession(
     @Volatile
     internal var hasWindowFocus: () -> Boolean = { true }
 
-    /** 应用远程剪贴板到本地（抑制回声） */
+    /** 应用远程剪贴板到本地（抑制回声；无 Main dispatcher 的无头环境回退当前线程） */
     private fun applyRemoteClipboardLocally(apply: () -> Unit) {
         ioScope.launch {
-            suppressClipboardEcho = true
+            synchronized(clipboardEchoLock) { suppressClipboardEcho = true }
             try {
-                withContext(Dispatchers.Main) { apply() }
+                try {
+                    withContext(Dispatchers.Main) { apply() }
+                } catch (_: IllegalStateException) {
+                    // 无 Main dispatcher（无头探针）：直接执行（桌面 AWT 剪贴板可后台写）
+                    apply()
+                }
                 delay(1500)
             } finally {
-                suppressClipboardEcho = false
+                synchronized(clipboardEchoLock) { suppressClipboardEcho = false }
             }
         }
     }
@@ -1335,6 +1373,13 @@ class SelkiesSession(
                     val pref = server.preferredCameraId
                     selectedCameraId.value = if (cameraDevices.value.any { it.id == pref }) pref else ""
                 }
+                // v2.6.0 扬声器偏好（多选 + 独立音量）
+                if (selectedSpeakerIds.value.isEmpty()) {
+                    val pref = server.preferredSpeakerIds.split(',').filter { it.isNotBlank() }
+                        .filter { id -> speakerDevices.value.any { it.id == id } }
+                    selectedSpeakerIds.value = pref
+                    applySpeakerOutputs(pref)
+                }
             }
         }
     }
@@ -1349,13 +1394,54 @@ class SelkiesSession(
         }
     }
 
-    /** 选择摄像头（单选；服务器虚拟摄像头一次一路；采集中则热切换） */
+    /** 选择摄像头（多选：多路合成上行；采集中则热切换） */
     fun selectCamera(id: String) {
-        selectedCameraId.value = id
-        server.preferredCameraId = id
+        val cur = selectedCameraId.value.split(',').filter { it.isNotBlank() }
+        val next = if (id in cur) cur - id else cur + id
+        selectedCameraId.value = next.joinToString(",")
+        server.preferredCameraId = selectedCameraId.value
         if (webcamActive.value) {
             runCatching { webcamCapture.stop() }
-            if (id.isNotBlank()) startWebcamUplink()
+            if (next.isNotEmpty()) startWebcamUplink()
+        }
+    }
+
+    // ---- v2.6.0 扬声器多选 + 独立音量 ----
+
+    /** 选择输出扬声器（多选；空 = 系统默认）；立即生效 */
+    fun selectSpeakers(ids: List<String>) {
+        selectedSpeakerIds.value = ids
+        server.preferredSpeakerIds = ids.joinToString(",")
+        applySpeakerOutputs(ids)
+    }
+
+    /** 设置单个扬声器音量（0..1；独立于应用主音量） */
+    fun setSpeakerGain(deviceId: String, gain: Float) {
+        val g = gain.coerceIn(0f, 1f)
+        speakerGains.value = speakerGains.value + (deviceId to g)
+        server.speakerGains = speakerGains.value.entries.joinToString(";") { (k, v) -> "$k:${"%.2f".format(v)}" }
+        applySpeakerOutputs(selectedSpeakerIds.value)
+    }
+
+    private fun applySpeakerOutputs(ids: List<String>) {
+        // 解析持久化的增益（id:gain;id:gain）
+        val persisted = HashMap<String, Float>()
+        for (part in server.speakerGains.split(';')) {
+            val kv = part.split(':')
+            val k = kv.getOrNull(0)?.takeIf { it.isNotBlank() } ?: continue
+            kv.getOrNull(1)?.toFloatOrNull()?.let { persisted[k] = it.coerceIn(0f, 1f) }
+        }
+        // 合并当前内存值
+        for ((k, v) in speakerGains.value) persisted[k] = v
+        speakerGains.value = persisted
+        val outputs = ids.mapNotNull { id ->
+            val dev = speakerDevices.value.firstOrNull { it.id == id } ?: return@mapNotNull null
+            id to (persisted[id] ?: 1f)
+        }.toMap()
+        runCatching { audioPlayer.setOutputDevices(outputs) }
+        // Android SCO 特殊路由（蓝牙耳机语音通道）
+        if (outputs.isNotEmpty()) {
+            platform.setSpeakerDevice(ids.first())
         }
     }
 
@@ -1482,6 +1568,9 @@ class SelkiesSession(
         val target = platform.mediaStore().createRecordingFile(name) ?: return false
         val ok = recorder.start(target)
         if (ok) {
+            // ⚠️【v2.6.0】录制启动即强制关键帧：H.264/H.265 复用器需要参数集（SPS/PPS）写头；
+            //    服务器无限 GOP（按需关键帧）下不主动请求则可能长时间无关键帧 → 录屏无法开始
+            forceKeyframe()
             RecordingShutdownHook.register(recorder)
             platform.setRecordingActive(true)
             recorder.onSaved = { path, frames, error ->

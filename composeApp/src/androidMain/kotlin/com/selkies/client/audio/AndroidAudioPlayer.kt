@@ -1,6 +1,8 @@
 package com.selkies.client.audio
 
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
@@ -10,26 +12,44 @@ import com.selkies.client.platform.AudioPlayer
 import java.util.concurrent.ConcurrentLinkedQueue
 
 /**
- * Android 音频播放：MediaCodec Opus 解码 → AudioTrack
+ * Android 音频播放：MediaCodec Opus 解码 → 多路 AudioTrack
  *
  * v2.4.0 修复：
  * 1. 合成 OpusHead 作为 csd-0 —— 无该头时多数设备的 c2.android.opus.decoder 静默无输出（音频无声主因）
  * 2. 声道数来自服务器 audio_channels（默认 2 立体声），并在 INFO_OUTPUT_FORMAT_CHANGED 时重配 AudioTrack
  * 3. 输出缓冲抖动控制：先积 4 帧再开播，防 starvation 卡顿
+ *
+ * v2.6.0：
+ * 4. 多输出设备（多选）：每设备一条 AudioTrack + setPreferredDevice 路由，独立音量（track.setVolume）
+ * 5. 设备热插拔（AudioDeviceCallback）自动剔除失效设备
+ * 6. onError 反馈（解码器/设备错误不再静默）
  */
 class AndroidAudioPlayer : AudioPlayer {
 
     private var codec: MediaCodec? = null
-    private var track: AudioTrack? = null
     private var thread: Thread? = null
     @Volatile
     private var running = false
     @Volatile
     private var volume = 1.0f
 
+    override var onError: ((String) -> Unit)? = null
+
+    /** 期望输出 deviceId → 增益；空 = 系统默认 */
+    @Volatile
+    private var wantedOutputs: Map<String, Float> = emptyMap()
+
     private val pending = ConcurrentLinkedQueue<ByteArray>()
     private var sampleRate = 48000
     private var channels = 2
+
+    /** 一路输出：AudioTrack + 设备 + 增益 */
+    private class Out(val deviceId: String, val track: AudioTrack, @Volatile var gain: Float)
+
+    private val outs = ArrayList<Out>()
+    private var outsSig = ""
+    private var audioManager: AudioManager? = null
+    private var deviceCallback: AudioDeviceCallback? = null
 
     override val bufferLevelMs: Int
         get() = pending.size * 10
@@ -57,7 +77,11 @@ class AndroidAudioPlayer : AudioPlayer {
 
     override fun setVolume(volume: Float) {
         this.volume = volume
-        runCatching { track?.setVolume(volume) }
+        synchronized(outs) { outs.forEach { runCatching { it.track.setVolume(volume * it.gain) } } }
+    }
+
+    override fun setOutputDevices(outputs: Map<String, Float>) {
+        wantedOutputs = outputs
     }
 
     override fun stop() {
@@ -66,8 +90,14 @@ class AndroidAudioPlayer : AudioPlayer {
         thread = null
         runCatching { codec?.stop(); codec?.release() }
         codec = null
-        runCatching { track?.stop(); track?.release() }
-        track = null
+        synchronized(outs) {
+            outs.forEach { runCatching { it.track.stop(); it.track.release() } }
+            outs.clear()
+        }
+        runCatching {
+            deviceCallback?.let { audioManager?.unregisterAudioDeviceCallback(it) }
+        }
+        deviceCallback = null
         pending.clear()
     }
 
@@ -87,35 +117,128 @@ class AndroidAudioPlayer : AudioPlayer {
         return head
     }
 
-    private fun makeTrack(sr: Int, ch: Int): AudioTrack {
-        val minBuf = AudioTrack.getMinBufferSize(
-            sr,
-            if (ch == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO,
-            AudioFormat.ENCODING_PCM_16BIT
-        )
-        val t = AudioTrack(
-            AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                .build(),
-            AudioFormat.Builder()
-                .setSampleRate(sr)
-                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setChannelMask(if (ch == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO)
-                .build(),
-            maxOf(minBuf, 4096) * 4,
-            AudioTrack.MODE_STREAM,
-            AudioManager.AUDIO_SESSION_ID_GENERATE
-        )
-        t.play()
-        t.setVolume(volume)
-        return t
+    private fun makeTrack(sr: Int, ch: Int, preferredDev: AudioDeviceInfo?): AudioTrack? {
+        return runCatching {
+            val minBuf = AudioTrack.getMinBufferSize(
+                sr,
+                if (ch == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+            val t = AudioTrack(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                    .build(),
+                AudioFormat.Builder()
+                    .setSampleRate(sr)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setChannelMask(if (ch == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO)
+                    .build(),
+                maxOf(minBuf, 4096) * 4,
+                AudioTrack.MODE_STREAM,
+                AudioManager.AUDIO_SESSION_ID_GENERATE
+            )
+            if (preferredDev != null) {
+                if (!t.preferredDevice!!.equals(preferredDev)) {
+                    t.preferredDevice = preferredDev
+                }
+            }
+            t.play()
+            t
+        }.getOrNull()
+    }
+
+    /** 通过 AudioManager 解析 deviceId（address 或 speaker-N）→ AudioDeviceInfo */
+    private fun resolveDevice(deviceId: String): AudioDeviceInfo? {
+        val am = audioManager ?: return null
+        val devices = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS) ?: return null
+        // 1) address 精确匹配
+        devices.firstOrNull { it.address?.equals(deviceId, true) == true }?.let { return it }
+        // 2) speaker-N 索引匹配（枚举顺序）
+        if (deviceId.startsWith("speaker-")) {
+            val idx = deviceId.removePrefix("speaker-").toIntOrNull() ?: return null
+            val outputs = devices.filter { d ->
+                when (d.type) {
+                    AudioDeviceInfo.TYPE_BUILTIN_SPEAKER,
+                    AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+                    AudioDeviceInfo.TYPE_WIRED_HEADSET,
+                    AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+                    AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+                    AudioDeviceInfo.TYPE_USB_HEADSET,
+                    AudioDeviceInfo.TYPE_USB_DEVICE -> true
+                    else -> false
+                }
+            }
+            outputs.getOrNull(idx)?.let { return it }
+        }
+        return null
+    }
+
+    /** 按期望输出重建 AudioTrack 集合 */
+    private fun rebuildOuts(sr: Int, ch: Int) {
+        synchronized(outs) {
+            outs.forEach { runCatching { it.track.stop(); it.track.release() } }
+            outs.clear()
+            val wanted = wantedOutputs
+            if (wanted.isEmpty()) {
+                val t = makeTrack(sr, ch, null)
+                if (t != null) {
+                    t.setVolume(volume)
+                    outs.add(Out("", t, 1f))
+                } else {
+                    onError?.invoke("无法打开默认音频输出（${sr}Hz ${ch}ch）")
+                }
+            } else {
+                for ((id, gain) in wanted) {
+                    val dev = resolveDevice(id)
+                    if (id.contains("sco", true)) {
+                        // 蓝牙 SCO 输出需要系统级开启
+                        runCatching {
+                            audioManager?.startBluetoothSco()
+                            audioManager?.isBluetoothScoOn = true
+                        }
+                    }
+                    val t = makeTrack(sr, ch, dev)
+                    if (t != null) {
+                        t.setVolume(volume * gain)
+                        outs.add(Out(id, t, gain))
+                    } else {
+                        onError?.invoke("音频输出设备不可用：$id（已跳过）")
+                    }
+                }
+                if (outs.isEmpty()) {
+                    val t = makeTrack(sr, ch, null)
+                    if (t != null) {
+                        t.setVolume(volume)
+                        outs.add(Out("", t, 1f))
+                    }
+                } else if (wanted.keys.none { it.contains("sco", true) }) {
+                    // 非 SCO 选择时关闭 SCO
+                    runCatching {
+                        if (audioManager?.isBluetoothScoOn == true) {
+                            audioManager?.stopBluetoothSco()
+                            audioManager?.isBluetoothScoOn = false
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun loop() {
         runCatching {
-            var t = makeTrack(sampleRate, channels)
-            track = t
+            // AudioManager + 设备热插拔监听
+            val ctx = com.selkies.client.platform.AndroidPlatform.appCtx()
+            audioManager = ctx?.getSystemService(android.content.Context.AUDIO_SERVICE) as? AudioManager
+            deviceCallback = object : AudioDeviceCallback() {
+                override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                    // 输出设备拔出 → 重建（剔除失效路）
+                    outsSig = ""
+                }
+            }
+            audioManager?.registerAudioDeviceCallback(deviceCallback, android.os.Handler(android.os.Looper.getMainLooper()))
+
+            var t: AudioTrack? = null
 
             val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, sampleRate, channels)
             // csd-0：OpusHead —— 没有它多数设备的 Opus 解码器完全无输出
@@ -155,11 +278,9 @@ class AndroidAudioPlayer : AudioPlayer {
                         val realCh = out.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
                         val realSr = out.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                         if (realCh != channels || realSr != sampleRate) {
-                            runCatching { t.stop(); t.release() }
                             channels = realCh.coerceIn(1, 2)
                             sampleRate = realSr
-                            t = makeTrack(realSr, channels)
-                            track = t
+                            outsSig = ""
                         }
                     } else if (outIdx >= 0 && info.size > 0) {
                         val outBuf = c.getOutputBuffer(outIdx)
@@ -168,7 +289,31 @@ class AndroidAudioPlayer : AudioPlayer {
                             outBuf.position(info.offset)
                             outBuf.limit(info.offset + info.size)
                             outBuf.get(pcm)
-                            t.write(pcm, 0, pcm.size)
+                            // 输出集合维护（解码线程独占；wantedOutputs 变化时重建）
+                            val sig = "$sampleRate x $channels | " +
+                                    wantedOutputs.entries.sortedBy { it.key }.joinToString("|") { (k, v) -> "$k=${"%.2f".format(v)}" }
+                            if (sig != outsSig) {
+                                rebuildOuts(sampleRate, channels)
+                                outsSig = if (outs.isNotEmpty()) sig else ""
+                            }
+                            if (outs.isEmpty()) {
+                                c.releaseOutputBuffer(outIdx, false)
+                                continue
+                            }
+                            var wrote = 0
+                            val step = channels * 2
+                            var failed = false
+                            for (o in outs.toList()) {
+                                try {
+                                    o.track.write(pcm, 0, pcm.size)
+                                } catch (e: Exception) {
+                                    failed = true
+                                    runCatching { o.track.stop(); o.track.release() }
+                                    synchronized(outs) { outs.remove(o) }
+                                    onError?.invoke("音频输出 ${o.deviceId.ifBlank { "默认设备" }} 异常（${e.javaClass.simpleName}），已移除")
+                                }
+                            }
+                            if (outs.isEmpty()) outsSig = ""
                         }
                         c.releaseOutputBuffer(outIdx, false)
                     }
@@ -178,6 +323,7 @@ class AndroidAudioPlayer : AudioPlayer {
             }
         }.onFailure {
             running = false
+            onError?.invoke("音频播放器错误：${it.message ?: it.javaClass.simpleName}")
         }
     }
 }

@@ -6,6 +6,7 @@ import org.bytedeco.ffmpeg.global.avformat
 import org.bytedeco.ffmpeg.global.avutil
 import org.bytedeco.ffmpeg.avcodec.AVPacket
 import org.bytedeco.ffmpeg.avformat.AVFormatContext
+import org.bytedeco.ffmpeg.avformat.AVIOContext
 import org.bytedeco.ffmpeg.avformat.AVStream
 import org.bytedeco.ffmpeg.avutil.AVDictionary
 import org.bytedeco.javacpp.BytePointer
@@ -108,11 +109,19 @@ class DesktopStreamMuxer(override val outputPath: String) : StreamMuxer {
     private var videoStream: AVStream? = null
     private var audioStream: AVStream? = null
     private var headerWritten = false
+    /** ⚠️ write_header 失败后置位：半初始化的 muxer 重入 write_header 会段错误，绝不再试 */
+    private var headerFailed = false
     private var videoCodec = 1 // 1=h264 2=vp8 3=vp9 5=h265；0→MJPEG
     private var lastVideoPts = -1L
     private var lastAudioPts = -1L
     private var closed = false
     private val lock = Object()
+
+    /** H.264/H.265 需要 extradata（参数集）才能写头；等待携带参数集的关键帧 */
+    private fun videoHeaderReady(): Boolean {
+        if (videoCodec != 1 && videoCodec != 5) return true
+        return (videoStream?.codecpar()?.extradata_size() ?: 0) > 0
+    }
 
     override fun addVideoTrack(codecId: Int, width: Int, height: Int): Boolean {
         synchronized(lock) {
@@ -150,8 +159,24 @@ class DesktopStreamMuxer(override val outputPath: String) : StreamMuxer {
 
     override fun writeVideoFrame(data: ByteArray, keyframe: Boolean, ptsUs: Long): Boolean {
         synchronized(lock) {
-            if (closed || fmtCtx == null) return false
-            if (!headerWritten && !writeHeader()) return false
+            if (closed || fmtCtx == null || headerFailed) return false
+            if (!headerWritten) {
+                // ⚠️【录屏 SIGSEGV 根因链】
+                //  ① Matroska 的 H.264/H.265 无参数集 extradata 时 avformat_write_header 返回 INVALIDDATA；
+                //  ② 非关键帧先到（无 SPS/PPS）→ 失败；等关键帧到来后二次 write_header →
+                //     半初始化 muxer 重入 → __libc_free 段错误（hs_err 实录）。
+                //  对策：等待携带参数集的帧才写头；失败后绝不再试。
+                if (videoCodec == 1 || videoCodec == 5) {
+                    ensureExtradataFromKeyframe(data)
+                    if (!videoHeaderReady()) {
+                        return false // GOP 内帧丢弃（等待关键帧参数集），不计入已写帧数
+                    }
+                }
+                if (!writeHeader()) {
+                    headerFailed = true
+                    return false
+                }
+            }
             if (ptsUs <= lastVideoPts) return true
             val ok = writePacket(videoStream!!, data, keyframe, ptsUs)
             if (ok) lastVideoPts = ptsUs
@@ -161,8 +186,15 @@ class DesktopStreamMuxer(override val outputPath: String) : StreamMuxer {
 
     override fun writeAudioFrame(data: ByteArray, ptsUs: Long): Boolean {
         synchronized(lock) {
-            if (closed || fmtCtx == null || audioStream == null) return false
-            if (!headerWritten && !writeHeader()) return false
+            if (closed || fmtCtx == null || audioStream == null || headerFailed) return false
+            if (!headerWritten) {
+                // 视频头未就绪（等待参数集）期间丢弃音频，绝不提前写头（防二次 write_header 重入）
+                if (!videoHeaderReady()) return false
+                if (!writeHeader()) {
+                    headerFailed = true
+                    return false
+                }
+            }
             if (ptsUs <= lastAudioPts) return true
             val ok = writePacket(audioStream!!, data, false, ptsUs)
             if (ok) lastAudioPts = ptsUs
@@ -231,11 +263,14 @@ class DesktopStreamMuxer(override val outputPath: String) : StreamMuxer {
                     avformat.av_write_trailer(ctx)
                     ok = true
                 }
-                if (ctx.pb() != null && !ctx.pb().isNull) {
-                    avformat.avio_closep(ctx.pb())
+                // ⚠️ 同 avio_open：先取值关闭，再显式置空字段（防 avformat_free_context 二次关闭）
+                val pb = ctx.pb()
+                if (pb != null && !pb.isNull) {
+                    avformat.avio_close(pb)
+                    ctx.pb(AVIOContext(null))
                 }
                 avformat.avformat_free_context(ctx)
-            }
+            }.onFailure { it.printStackTrace() }
             if (!headerWritten) {
                 // 空内容：删除文件
                 runCatching { File(outputPath).delete() }
@@ -276,7 +311,15 @@ class DesktopStreamMuxer(override val outputPath: String) : StreamMuxer {
     private fun writeHeader(): Boolean {
         val ctx = fmtCtx ?: return false
         return try {
-            if (avformat.avio_open(ctx.pb(), outputPath, avformat.AVIO_FLAG_WRITE) < 0) return false
+            // ⚠️【SIGSEGV 修复】avio_open 是 @ByPtrPtr：必须用局部包装接收回写、再显式赋回字段。
+            //    旧版直接传 ctx.pb()（getter 返回临时包装）——回写落在临时对象上，ctx->pb 恒 NULL，
+            //    后续写入段错误（hs_err 实录：SIGSEGV in libavformat = 桌面录屏崩溃根因之一）。
+            val ofmt = ctx.oformat()
+            if (ofmt != null && !ofmt.isNull && (ofmt.flags() and avformat.AVFMT_NOFILE) == 0) {
+                val pb = AVIOContext(null)
+                if (avformat.avio_open(pb, outputPath, avformat.AVIO_FLAG_WRITE) < 0) return false
+                ctx.pb(pb)
+            }
             if (avformat.avformat_write_header(ctx, null as AVDictionary?) < 0) return false
             headerWritten = true
             true
@@ -284,14 +327,62 @@ class DesktopStreamMuxer(override val outputPath: String) : StreamMuxer {
             false
         }
     }
+
+    /** 从首帧 Annex-B 流提取参数集作 extradata（H.264: SPS+PPS；H.265: VPS+SPS+PPS）
+     *  无参数集时退化为直接使用整帧（容错——至少不崩溃） */
+    private fun ensureExtradataFromKeyframe(data: ByteArray) {
+        val st = videoStream ?: return
+        if (st.codecpar().extradata_size() > 0) return
+        val wanted: Set<Int> = if (videoCodec == 5) setOf(32, 33, 34) else setOf(7, 8)
+        val annexb = extractParameterSets(data, wanted) ?: return
+        val ed = BytePointer(avutil.av_malloc(annexb.size.toLong())).capacity(annexb.size.toLong())
+        ed.position(0).put(annexb, 0, annexb.size)
+        st.codecpar().extradata(ed)
+        st.codecpar().extradata_size(annexb.size)
+    }
+
+    /** Annex-B 扫描指定 NAL 类型的参数集序列（含起始码） */
+    private fun extractParameterSets(data: ByteArray, wanted: Set<Int>): ByteArray? {
+        val nals = ArrayList<Pair<Int, Int>>() // (start, end)
+        var i = 0
+        while (i + 3 < data.size) {
+            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte() && data[i + 2] == 1.toByte()) {
+                val start = i + 3
+                var j = start
+                while (j + 3 < data.size) {
+                    if (data[j] == 0.toByte() && data[j + 1] == 0.toByte() && data[j + 2] == 1.toByte()) break
+                    j++
+                }
+                nals.add(start to j)
+                i = j
+            } else i++
+        }
+        val picked = nals.filter { (s, _) ->
+            val t = if (wanted.first() >= 32) {
+                (data[s].toInt() and 0xff) shr 1 and 0x3f   // HEVC：2 字节头
+            } else {
+                data[s].toInt() and 0x1f                      // H.264：1 字节头
+            }
+            t in wanted
+        }
+        if (picked.isEmpty()) return null
+        val from = picked.first().first - 4
+        val to = picked.last().second
+        return data.copyOfRange(from.coerceAtLeast(0), to.coerceAtMost(data.size))
+    }
     private fun writePacket(st: AVStream, sample: ByteArray, keyframe: Boolean, ptsUs: Long): Boolean {
         return try {
             val pkt = AVPacket()
             avcodec.av_new_packet(pkt, sample.size)
             pkt.data().position(0).put(sample, 0, sample.size)
             pkt.stream_index(st.index())
-            pkt.pts(ptsUs)
-            pkt.dts(ptsUs)
+            // ⚠️【时长修复】avformat_write_header 后 muxer 会改写 stream time_base（mkv=1/1000 毫秒精度）——
+            //    必须把微秒 pts 换算到实际 time_base，否则回放时长膨胀 1000 倍
+            val num = st.time_base().num().toLong()
+            val den = st.time_base().den().toLong()
+            val pts = if (den > 0 && num > 0) ptsUs * den / (1_000_000L * num) else ptsUs
+            pkt.pts(pts)
+            pkt.dts(pts)
             pkt.duration(0)
             if (keyframe) pkt.flags(pkt.flags() or avcodec.AV_PKT_FLAG_KEY)
             avformat.av_interleaved_write_frame(fmtCtx, pkt) >= 0

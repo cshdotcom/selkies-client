@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -51,9 +52,9 @@ import com.selkies.client.model.HardwareDevice
 
 /**
  * 硬件面板：远程硬件透传的设备选择（全平台一致）
- * - 摄像头：单选（服务器虚拟摄像头一次一路），可搜索，切换即热重启上行
+ * - 摄像头：多选（v2.6.0：多路合成上行——客户端把多摄像头拼成一路虚拟画面），可搜索
  * - 麦克风：多选混音（多个麦克风同时上行，客户端 PCM 平均），可搜索、全选
- * - 扬声器：输出设备选择
+ * - 扬声器：多选（v2.6.0）+ 每设备独立音量滑条
  * - 顶行开关：麦克风/摄像头上行总开关
  */
 @Composable
@@ -65,6 +66,8 @@ fun HardwarePanel(session: SelkiesSession) {
     val selectedCamera by session.selectedCameraId.collectAsState()
     val micOn by session.micActive.collectAsState()
     val camOn by session.webcamActive.collectAsState()
+    val selectedSpeakers by session.selectedSpeakerIds.collectAsState()
+    val speakerGains by session.speakerGains.collectAsState()
 
     var search by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(true) }
@@ -82,6 +85,7 @@ fun HardwarePanel(session: SelkiesSession) {
     val filteredCameras = cameraDevices.filter {
         search.isBlank() || it.name.contains(search, true) || it.detail.contains(search, true)
     }
+    val selectedCameraIds = selectedCamera.split(',').filter { it.isNotBlank() }
 
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
         // 搜索 + 刷新
@@ -159,11 +163,28 @@ fun HardwarePanel(session: SelkiesSession) {
             item {
                 DeviceHeader(
                     icon = Icons.Filled.PhotoCamera,
-                    title = "摄像头（单选 · 远程虚拟摄像头一次一路）",
+                    title = "摄像头（可多选 · 多路自动拼接合成上行）",
                     right = {
-                        Switch(checked = camOn, onCheckedChange = {
-                            if (it) session.startWebcamUplink() else session.stopWebcamUplink()
-                        })
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (filteredCameras.isNotEmpty()) {
+                                FilterChip(
+                                    selected = filteredCameras.isNotEmpty() && filteredCameras.all { it.id in selectedCameraIds },
+                                    onClick = {
+                                        val allSelected = filteredCameras.isNotEmpty() && filteredCameras.all { it.id in selectedCameraIds }
+                                        if (allSelected) {
+                                            filteredCameras.forEach { session.selectCamera(it.id) }
+                                        } else {
+                                            (filteredCameras.map { it.id } - selectedCameraIds.toSet()).forEach { session.selectCamera(it) }
+                                        }
+                                    },
+                                    label = { Text(if (selectedCameraIds.size > 1) "已选(${selectedCameraIds.size})" else "全选") }
+                                )
+                                Spacer(Modifier.size(6.dp))
+                            }
+                            Switch(checked = camOn, onCheckedChange = {
+                                if (it) session.startWebcamUplink() else session.stopWebcamUplink()
+                            })
+                        }
                     }
                 )
             }
@@ -174,32 +195,65 @@ fun HardwarePanel(session: SelkiesSession) {
                 DeviceRow(
                     icon = Icons.Filled.Videocam,
                     device = dev,
-                    selected = dev.id == selectedCamera,
-                    multiSelect = false,
+                    selected = dev.id in selectedCameraIds,
+                    multiSelect = true,
                     onClick = { session.selectCamera(dev.id) }
                 )
             }
 
-            // ---- 扬声器（输出） ----
+            // ---- 扬声器（输出；v2.6.0 多选 + 独立音量） ----
             if (speakerDevices.isNotEmpty()) {
                 item {
                     DeviceHeader(
                         icon = Icons.Filled.Speaker,
-                        title = "音频输出（本机播放设备）",
-                        right = {}
-                    )
-                }
-                items(speakerDevices, key = { "spk-" + it.id }) { dev ->
-                    DeviceRow(
-                        icon = Icons.Filled.Speaker,
-                        device = dev,
-                        selected = false,
-                        multiSelect = false,
-                        onClick = {
-                            com.selkies.client.platform.getPlatformServices().setSpeakerDevice(dev.id)
+                        title = "音频输出（可多选 · 独立音量）",
+                        right = {
+                            if (selectedSpeakers.isNotEmpty()) {
+                                FilterChip(
+                                    selected = false,
+                                    onClick = { session.selectSpeakers(emptyList()) },
+                                    label = { Text("恢复默认") }
+                                )
+                            }
                         }
                     )
                 }
+                items(speakerDevices, key = { "spk-" + it.id }) { dev ->
+                    val selected = dev.id in selectedSpeakers
+                    Column {
+                        DeviceRow(
+                            icon = Icons.Filled.Speaker,
+                            device = dev,
+                            selected = selected,
+                            multiSelect = true,
+                            onClick = {
+                                val next = if (selected) selectedSpeakers - dev.id else selectedSpeakers + dev.id
+                                session.selectSpeakers(next)
+                            }
+                        )
+                        if (selected) {
+                            // 每设备独立音量滑条
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth().padding(start = 42.dp, end = 12.dp, top = 0.dp, bottom = 6.dp)
+                            ) {
+                                Text(
+                                    "音量 ${(speakerGains[dev.id] ?: 1f).let { g -> (g * 100).toInt() }}%",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    modifier = Modifier.width(84.dp)
+                                )
+                                androidx.compose.material3.Slider(
+                                    value = speakerGains[dev.id] ?: 1f,
+                                    onValueChange = { session.setSpeakerGain(dev.id, it) },
+                                    valueRange = 0f..1f,
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        }
+                    }
+                }
+            } else {
+                item { EmptyDeviceRow("未检测到扬声器/耳机设备") }
             }
         }
     }
