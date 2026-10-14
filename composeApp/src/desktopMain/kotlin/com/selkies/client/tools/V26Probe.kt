@@ -122,9 +122,13 @@ object V26Probe {
             println("${if (noticeSet) "✅" else "❌"} clipboardNotice 用户反馈提示：${session.clipboardNotice.value ?: "(无)"}")
 
             // 自动发送路径（pushLocalClipboard → 真实 chunked 发送）
+            // ⚠️ 先越过回声抑制窗口（applyRemoteClipboardLocally 的 suppressClipboardEcho
+            //    持续 1.5s：远程同步后立即"本地复制"会被当作回声正确丢弃——
+            //    探针若紧接着调用会被抑制 → 偶发假阴性）
+            delay(2500)
             val marker2 = "V26-AUTOSEND-${System.currentTimeMillis()}"
             session.pushLocalClipboard(marker2)
-            delay(9000)  // 避开服务器 REQUEST_CLIPBOARD 防抖窗口
+            delay(9000)  // 避开服务器 REQUEST_CLIPBOARD 防抖窗口（0.25s）+ 网络余量
             session.requestClipboard()
             delay(3000)
             val autoSendOk = clipEmissions.any { it.contains(marker2) }

@@ -1,5 +1,9 @@
 package com.selkies.client
 
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
@@ -13,6 +17,11 @@ fun main() {
     System.setProperty("skiko.settings.fps", "60")
     applyLegacyWindowsRenderFix()
     installCrashLogger()
+    // GL 自检模式（launch.sh 便携启动器调用）：真实渲染一帧验证 GPU 路径可用性
+    if (System.getProperty("selkies.glselftest") != null) {
+        glSelfTest()
+        return
+    }
     application {
         DesktopPlatform.init()
         Window(
@@ -23,6 +32,48 @@ fun main() {
             // AWT 帧引用（文件选择器 / 全屏控制 / 焦点追踪）
             DesktopPlatform.windowFrame = window
             App()
+        }
+    }
+}
+
+/**
+ * 【v2.6.0+ · 无 GL 环境自检】
+ * Linux 无 GPU/VM/Xvfb 场景：Skiko 默认 OPENGL → "Cannot create Linux GL context" →
+ * 窗口空白（异常被 Skiko 内部吞掉，应用不退出，用户只见白屏/黑屏）。
+ * launch.sh 先以本模式跑一次：真实渲染 + Robot 截屏做像素级验证——
+ * 窗口中心出现绘制色 = 渲染管线端到端可用 → exit(0)；拿不到像素（超时被杀）→
+ * 启动器改用 -Dskiko.renderApi=SOFTWARE 启动。
+ * ⚠️ 不能只看 draw lambda 是否执行：绘制指令被录制后由 redrawer 提交，GL 失败
+ *    发生在提交层——lambda 跑完不等于像素上屏（实测教训）。
+ */
+private fun glSelfTest() {
+    application {
+        Window(onCloseRequest = ::exitApplication, title = "GL self-test") {
+            Canvas(Modifier.fillMaxSize()) {
+                drawRect(Color(0xFFDC143C)) // crimson 特征色，避免与常见桌面色混淆
+            }
+            androidx.compose.runtime.LaunchedEffect(Unit) {
+                kotlinx.coroutines.delay(1200) // 等窗口上屏
+                val ok = runCatching {
+                    val robot = java.awt.Robot()
+                    val gc = java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment().defaultScreenDevice
+                    val bounds = gc.defaultConfiguration.bounds
+                    val shot = robot.createScreenCapture(bounds)
+                    // 全屏扫描特征色（窗口位置由 WM/平台决定，不可假设居中）
+                    var hit = false
+                    outer@ for (y in 0 until bounds.height step 4) {
+                        for (x in 0 until bounds.width step 4) {
+                            val p = shot.getRGB(x, y)
+                            val r = (p shr 16) and 0xff; val g = (p shr 8) and 0xff; val b = p and 0xff
+                            if (r in 190..255 && g in 10..70 && b in 40..100) {
+                                hit = true; break@outer
+                            }
+                        }
+                    }
+                    hit
+                }.getOrDefault(false)
+                kotlin.system.exitProcess(if (ok) 0 else 1)
+            }
         }
     }
 }
