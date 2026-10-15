@@ -134,6 +134,12 @@ fun HotkeyRow(hotkey: HotkeyDef, onRun: () -> Unit, onDelete: (() -> Unit)?, onP
 
 /**
  * 快捷键管理页（独立屏幕）：全量管理 + 新建录制（物理键盘 / 软键盘修饰键）
+ * 【v2.7.0 重构】修复「按下多个热键或单个键时键盘突然退出、内容无法录入」：
+ *  - 软键盘选择：不再成组即自动关闭——每次主键按下更新捕获区，键盘保持打开，
+ *    由「保存」按钮显式落库（名字可随时录入，内容不再丢）
+ *  - 物理键盘录制：桌面端 keysymOrNull 修复后可真实捕获（旧版恒 null = 桌面物理键完全无效）；
+ *    捕获完成后录制盒保持打开，可反复重按覆盖，ESC 也可作为热键成分录制
+ *  - 返回键（Android）/ESC（桌面）：录制中不退出页面（ESC 进热键），选择中关键盘，其余才返回
  */
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
@@ -144,13 +150,37 @@ fun HotkeyManagerScreen(state: AppState) {
     var newHotkeyName by remember { mutableStateOf("") }
     val recorder = remember { HotkeyRecorder() }
     var recordedKeys by remember { mutableStateOf<List<Long>>(emptyList()) }
+    // v2.7.0：已捕获完成的组合（录制盒/选择器共用显示与保存）
+    var capturedChord by remember { mutableStateOf<List<Long>>(emptyList()) }
 
-    com.selkies.client.ui.PlatformBackHandler {
+    // v2.7.0：录制中禁用返回键消费（ESC 作为热键成分被捕获盒吃掉；用「取消录制」退出）
+    com.selkies.client.ui.PlatformBackHandler(enabled = !recording) {
         when {
             picking -> picking = false
             recording -> recording = false
             else -> state.navigate(com.selkies.client.Screen.ServerList)
         }
+    }
+
+    /** 保存当前捕获的组合 */
+    fun saveCaptured() {
+        if (capturedChord.isEmpty()) return
+        if (newHotkeyName.isBlank()) {
+            newHotkeyName = capturedChord.joinToString("+") { Keysyms.name(it) }
+        }
+        state.store.upsertHotkey(
+            HotkeyDef(
+                id = UUID.randomUUID().toString(),
+                name = newHotkeyName,
+                keysyms = capturedChord,
+                builtin = false,
+                category = "custom"
+            )
+        )
+        newHotkeyName = ""
+        recordedKeys = emptyList()
+        capturedChord = emptyList()
+        recorder.reset()
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -176,7 +206,7 @@ fun HotkeyManagerScreen(state: AppState) {
                     androidx.compose.material3.OutlinedTextField(
                         value = newHotkeyName,
                         onValueChange = { newHotkeyName = it },
-                        label = { Text("新快捷键名称") },
+                        label = { Text("新快捷键名称（留空自动命名）") },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true
                     )
@@ -187,25 +217,61 @@ fun HotkeyManagerScreen(state: AppState) {
                                 recording = true
                                 recorder.reset()
                                 recordedKeys = emptyList()
+                                capturedChord = emptyList()
                             }) { Text("录制（物理键盘）") }
                             androidx.compose.material3.OutlinedButton(onClick = {
                                 picking = true
                                 recorder.reset()
                                 recordedKeys = emptyList()
+                                capturedChord = emptyList()
                             }) {
                                 Icon(Icons.Filled.Keyboard, null, modifier = Modifier.padding(end = 4.dp).size(16.dp))
                                 Text("用完整键盘选择")
                             }
                         }
                     }
+                    // v2.7.0：捕获区（键盘不再自动退出；显式保存/清空/收起）
+                    if (capturedChord.isNotEmpty()) {
+                        Spacer(Modifier.height(6.dp))
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.secondaryContainer
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "已捕获：${capturedChord.joinToString(" + ") { Keysyms.name(it) }}",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Medium,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                androidx.compose.material3.TextButton(onClick = {
+                                    capturedChord = emptyList()
+                                    recordedKeys = emptyList()
+                                    recorder.reset()
+                                }) { Text("清空") }
+                            }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            androidx.compose.material3.Button(onClick = { saveCaptured() }) { Text("保存快捷键") }
+                            androidx.compose.material3.OutlinedButton(onClick = {
+                                picking = false
+                                recording = false
+                                capturedChord = emptyList()
+                                recordedKeys = emptyList()
+                            }) { Text("收起键盘/录制盒") }
+                        }
+                    }
                     if (picking) {
                         Text(
-                            if (recordedKeys.isEmpty()) "先点修饰键（Ctrl/Alt/Shift/AltGr…），再点主键完成"
-                            else "已选：${recordedKeys.joinToString(" + ") { Keysyms.name(it) }} — 再点主键完成",
+                            "先点修饰键（Ctrl/Alt/Shift/AltGr…）再点主键——每按一次主键更新下方捕获；点「保存快捷键」完成，键盘不会自动退出",
                             style = MaterialTheme.typography.bodySmall
                         )
                         Spacer(Modifier.height(6.dp))
-                        // 世界最完整键盘选择器：修饰键粘滞 + 主键点选 → 直接成组
+                        // 世界最完整键盘选择器：修饰键粘滞 + 主键点选 → 捕获区更新（不自动关闭）
                         Box(modifier = Modifier.fillMaxWidth().height(300.dp)) {
                             CompleteKeyboard(
                                 session = null,
@@ -213,32 +279,14 @@ fun HotkeyManagerScreen(state: AppState) {
                                 autoScaleHint = 0.42f,
                                 onDismiss = { picking = false },
                                 onChord = { chord ->
-                                    if (chord.size >= 2) {
-                                        if (newHotkeyName.isBlank()) {
-                                            newHotkeyName = chord.joinToString("+") { Keysyms.name(it) }
-                                        }
-                                        state.store.upsertHotkey(
-                                            HotkeyDef(
-                                                id = UUID.randomUUID().toString(),
-                                                name = newHotkeyName,
-                                                keysyms = chord,
-                                                builtin = false,
-                                                category = "custom"
-                                            )
-                                        )
-                                        newHotkeyName = ""
-                                        recordedKeys = emptyList()
-                                        picking = false
-                                    } else {
-                                        recordedKeys = chord
-                                    }
+                                    // v2.7.0：主键按下 → 更新捕获组合（替换）；键盘保持打开
+                                    capturedChord = chord
                                 }
                             )
                         }
                     } else if (recording) {
                         Text(
-                            if (recordedKeys.isEmpty()) "请先按下修饰键（Ctrl/Alt/Shift/Super）…"
-                            else "已按：${recordedKeys.joinToString(" + ") { Keysyms.name(it) }} — 现在按主键完成录制",
+                            "请按修饰键（Ctrl/Alt/Shift/Super），再按主键完成捕获；可反复重按覆盖；ESC 也可作为热键成分（录制中返回键不退出）",
                             style = MaterialTheme.typography.bodySmall
                         )
                         Spacer(Modifier.height(8.dp))
@@ -247,21 +295,10 @@ fun HotkeyManagerScreen(state: AppState) {
                                 recorder.offer(keysym)
                                 recordedKeys = recorder.current()
                             } else {
-                                val keys = recorder.finish(keysym)
-                                recording = false
-                                if (keys.size >= 2 && newHotkeyName.isNotBlank()) {
-                                    state.store.upsertHotkey(
-                                        HotkeyDef(
-                                            id = UUID.randomUUID().toString(),
-                                            name = newHotkeyName,
-                                            keysyms = keys,
-                                            builtin = false,
-                                            category = "custom"
-                                        )
-                                    )
-                                    newHotkeyName = ""
-                                    recordedKeys = emptyList()
-                                }
+                                // v2.7.0：主键 → 捕获组合，但录制盒保持打开（不自动退出）
+                                capturedChord = recorder.finish(keysym)
+                                recorder.reset()
+                                recordedKeys = emptyList()
                             }
                         }
                         Spacer(Modifier.height(4.dp))
@@ -269,6 +306,7 @@ fun HotkeyManagerScreen(state: AppState) {
                             recording = false
                             recorder.reset()
                             recordedKeys = emptyList()
+                            capturedChord = emptyList()
                         }) { Text("取消录制") }
                     }
                 }
@@ -290,7 +328,7 @@ fun HotkeyManagerScreen(state: AppState) {
     }
 }
 
-/** 物理按键捕获盒 */
+/** 物理按键捕获盒（v2.7.0：桌面端 keysymOrNull 已修复，物理键可真实捕获；ESC 也可录制） */
 @Composable
 private fun KeyCaptureBox(state: AppState, onKeysym: (Long) -> Unit) {
     val focusRequester = remember { FocusRequester() }
@@ -312,7 +350,7 @@ private fun KeyCaptureBox(state: AppState, onKeysym: (Long) -> Unit) {
             },
         contentAlignment = Alignment.Center
     ) {
-        Text("点击此处后按键（物理键盘或软键盘均可）", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("点击此处后按键（物理键盘或软键盘均可；按错可重按覆盖）", color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
     LaunchedEffect(Unit) { focusRequester.requestFocus() }
 }

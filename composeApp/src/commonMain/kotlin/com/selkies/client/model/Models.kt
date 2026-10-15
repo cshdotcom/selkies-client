@@ -126,6 +126,7 @@ data class AppSettings(
     var clipboardAutoReceive: Boolean = true,// 远程剪贴板自动应用到本地
     var clipboardBinaryEnabled: Boolean = true,
     var clipboardHistorySize: Int = 50,
+    var clipboardPollSync: Boolean = true,   // v2.7.0 剪贴板轮询同步（服务器推送失效时兜底；前台每 5s 拉取，内容未变静默跳过）
     // 输入
     var autoShowIme: Boolean = true,         // 进入会话自动唤起输入法（Android）
     var touchMouseMode: Boolean = false,     // 触屏鼠标模式（显示指针）

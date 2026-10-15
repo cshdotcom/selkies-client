@@ -359,7 +359,7 @@ object AndroidPlatform : PlatformServices {
         return AndroidKeys.keyCodeToKeysym(nativeKeyCode)
     }
 
-    override fun setPhysicalKeyHandler(handler: ((Int, Boolean) -> Unit)?) {
+    override fun setPhysicalKeyHandler(handler: ((Int, Boolean) -> Boolean)?) {
         // Android 使用 Compose onPreviewKeyEvent 路径，无需 AWT 分发器
     }
 

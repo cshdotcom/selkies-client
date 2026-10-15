@@ -14,6 +14,11 @@ import java.io.PrintWriter
 import java.io.StringWriter
 
 fun main() {
+    // v2.7.0：stdout 行缓冲（重定向到文件时 JVM 默认块缓冲，诊断日志积压丢失）
+    runCatching {
+        System.setOut(java.io.PrintStream(java.io.FileOutputStream(java.io.FileDescriptor.out), true))
+        System.setErr(java.io.PrintStream(java.io.FileOutputStream(java.io.FileDescriptor.err), true))
+    }
     System.setProperty("skiko.settings.fps", "60")
     applyLegacyWindowsRenderFix()
     installCrashLogger()

@@ -234,7 +234,7 @@ fun VirtualGamepadOverlay(
             .padding(horizontal = 8.dp),
         shape = RoundedCornerShape(16.dp),
         color = Color(0xE61A1F26),
-        shadowElevation = 8.dp
+        // v2.7.0: shadowElevation 移除——SOFTWARE 渲染内容丢失 bug
     ) {
         Column(Modifier.padding(10.dp)) {
             // ---------- 顶栏：模式 / 槽位 / 只读 / 键盘映射 / 折叠 ----------

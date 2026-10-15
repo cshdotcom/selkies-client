@@ -222,9 +222,10 @@ class AndroidVideoSink : VideoSink {
                     emaPresentMs = emaPresentMs * 0.9 + presentMs * 0.1
                     emaDecodeMs = emaDecodeMs * 0.9 + decodeMs * 0.1
                 }
-            } catch (e: Exception) {
-                // 解码错误：重建（下一个关键帧恢复）
-                releaseCodec()
+            } catch (_: Throwable) {
+                // v2.7.0：解码错误防线收严到 Throwable（MediaCodec native 层可抛 Error 而非 Exception，
+                // 旧版仅捕 Exception → 解码线程直接死亡 = 后续视频永久黑屏/闪退风险）
+                runCatching { releaseCodec() }
             }
         }
     }

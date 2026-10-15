@@ -250,6 +250,8 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
     // 缓冲（等首关键帧 csd）
     private val pendingVideo = ArrayList<Pair<ByteArray, Long>>()
     private val pendingAudio = ArrayList<Pair<ByteArray, Long>>()
+    // v2.7.0：缓冲字节累计（防 OOM）
+    private var pendingBytes = 0L
     private var sps: ByteArray? = null
     private var pps: ByteArray? = null
     private var vps: ByteArray? = null
@@ -291,7 +293,12 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
                     if (!keyframe) return true // 丢弃前导增量帧
                     if (sps == null || (videoCodec == 5 && vps == null) || (videoCodec == 1 && pps == null)) {
                         // 关键帧未带参数集：缓冲等下一个
-                        if (pendingVideo.size < 240) pendingVideo.add(converted.sample to ptsUs)
+                        // v2.7.0：帧数与字节双上限（防 OOM 闪退——旧版仅限 240 帧，高码率关键帧可累积 >100MB）
+                        val frameBytes = converted.sample.size
+                        if (pendingVideo.size < 48 && pendingBytes + frameBytes < 48L * 1024 * 1024) {
+                            pendingVideo.add(converted.sample to ptsUs)
+                            pendingBytes += frameBytes
+                        }
                         return true
                     }
                     gotKeyframe = true
@@ -299,6 +306,7 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
                     // 冲刷缓冲
                     for ((s, p) in pendingVideo) writeSample(s, false, p)
                     pendingVideo.clear()
+                    pendingBytes = 0L
                 }
                 return writeSample(converted.sample, keyframe, ptsUs)
             } else {
@@ -316,7 +324,11 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
         synchronized(lock) {
             if (closed) return false
             if (!muxerStarted) {
-                if (pendingAudio.size < 1200) pendingAudio.add(data to ptsUs)
+                // v2.7.0：帧数与字节双上限（防 OOM）
+                if (pendingAudio.size < 600 && pendingBytes + data.size < 48L * 1024 * 1024) {
+                    pendingAudio.add(data to ptsUs)
+                    pendingBytes += data.size
+                }
                 return true
             }
             if (audioTrackIdx < 0) return false // 启动时无音频数据 → 不再补轨
@@ -470,6 +482,7 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
             audioSamplesWritten += pendingAudio.size
         }
         pendingAudio.clear()
+        pendingBytes = 0L
     }
 
     private fun writeSample(sample: ByteArray, keyframe: Boolean, ptsUs: Long): Boolean {

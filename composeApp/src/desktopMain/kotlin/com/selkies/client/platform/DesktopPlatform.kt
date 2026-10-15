@@ -187,12 +187,15 @@ object DesktopPlatform : PlatformServices {
         return AwtKeys.keyCodeToKeysym(nativeKeyCode)
     }
 
-    /** AWT 键盘分发器：桌面物理键直通 */
+    /** AWT 键盘分发器：桌面物理键直通
+     *  v2.7.0：处理器返回 true（已发往远程）时消费事件（返回 true 给 AWT）——
+     *  防止 Compose 根级 onPreviewKeyEvent 二次发送同一键（双发根因）；
+     *  面板/键盘打开时处理器不转发也不消费 → Compose 文本框正常接收键盘 */
     @Volatile
-    private var physicalKeyHandler: ((Int, Boolean) -> Unit)? = null
+    private var physicalKeyHandler: ((Int, Boolean) -> Boolean)? = null
     private var keyDispatcherInstalled = false
 
-    override fun setPhysicalKeyHandler(handler: ((Int, Boolean) -> Unit)?) {
+    override fun setPhysicalKeyHandler(handler: ((Int, Boolean) -> Boolean)?) {
         physicalKeyHandler = handler
         if (handler != null && !keyDispatcherInstalled) {
             keyDispatcherInstalled = true
@@ -201,15 +204,8 @@ object DesktopPlatform : PlatformServices {
                     .addKeyEventDispatcher { e ->
                         val h = physicalKeyHandler ?: return@addKeyEventDispatcher false
                         when (e.id) {
-                            java.awt.event.KeyEvent.KEY_PRESSED -> {
-                                h(e.keyCode, true)
-                                // 不消费：让本地 UI（如文本框）也能收到——仅当无会话时
-                                false
-                            }
-                            java.awt.event.KeyEvent.KEY_RELEASED -> {
-                                h(e.keyCode, false)
-                                false
-                            }
+                            java.awt.event.KeyEvent.KEY_PRESSED -> h(e.keyCode, true)
+                            java.awt.event.KeyEvent.KEY_RELEASED -> h(e.keyCode, false)
                             else -> false
                         }
                     }
@@ -674,8 +670,38 @@ actual fun createHttpClient(allowUntrustedCert: Boolean): HttpClient {
     }
 }
 
-/** 桌面键事件 → keysym：物理键盘由 AWT 分发器直通，Compose 路径返回 null 不拦截 */
-actual fun androidx.compose.ui.input.key.KeyEvent.keysymOrNull(): Int? = null
+/** 桌面键事件 → keysym：Skiko Compose 的 nativeKeyCode 即 AWT 键码 → X11 keysym。
+ *  v2.7.0 修复：旧版恒返回 null = 快捷键录制盒（KeyCaptureBox）在桌面完全捕不到物理键
+ *  （「物理键盘无法使用」根因）。与 AWT 直通分路不冲突：AWT 分发器转发时已消费，
+ *  Compose 路径仅在面板/文本框场景收到事件。 */
+actual fun androidx.compose.ui.input.key.KeyEvent.keysymOrNull(): Int? {
+    val native = runCatching { this.nativeKeyEvent }.getOrNull() ?: return null
+    if (native is java.awt.event.KeyEvent) return AwtKeys.keyCodeToKeysym(native.keyCode)
+    // v2.7.0 正式修复：Compose Desktop 的 nativeKeyEvent 实为 Skiko InternalKeyEvent（internal class），
+    // 旧版 as? java.awt.event.KeyEvent 恒 null = 物理键盘捕获完全失效（快捷键录制盒「无法录入」根因）。
+    // InternalKeyEvent.nativeEvent = 底层 AWT KeyEvent；另有 key（AWT keyCode，getter 名被混淆）
+    // 与 codePoint（字符码点，修饰键为 0）。双路径反射提取，任一命中即可。
+    return runCatching {
+        // 路径 1：nativeEvent（最完整：含 AWT keyCode）
+        val ne = native.javaClass.methods.firstOrNull { it.name == "getNativeEvent" }?.invoke(native)
+        if (ne is java.awt.event.KeyEvent) {
+            AwtKeys.keyCodeToKeysym(ne.keyCode)?.let { return@runCatching it }
+        }
+        // 路径 2：key（Int getter，名字含混淆后缀如 getKey-XXXX）
+        val km = native.javaClass.methods.firstOrNull { it.name.startsWith("getKey") && it.parameterCount == 0 }
+        val keyCode = km?.invoke(native) as? Int
+        if (keyCode != null && keyCode > 0) {
+            AwtKeys.keyCodeToKeysym(keyCode)?.let { return@runCatching it }
+        }
+        // 路径 3：codePoint（字符键兜底；修饰键 codePoint=0 不可用）
+        val cp = native.javaClass.methods.firstOrNull { it.name == "getCodePoint" }?.invoke(native) as? Int
+        if (cp != null && cp > 0) {
+            // 字符 → X11 latin1 keysym
+            return@runCatching (cp and 0xFF)
+        }
+        null
+    }.getOrNull()
+}
 
 /** 桌面鼠标按钮状态（skiko PointerButtons 值类扩展） */
 private fun androidx.compose.ui.input.pointer.PointerEvent.buttonsMask(): Int {

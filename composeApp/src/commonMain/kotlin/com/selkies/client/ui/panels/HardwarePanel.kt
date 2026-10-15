@@ -68,6 +68,10 @@ fun HardwarePanel(session: SelkiesSession) {
     val camOn by session.webcamActive.collectAsState()
     val selectedSpeakers by session.selectedSpeakerIds.collectAsState()
     val speakerGains by session.speakerGains.collectAsState()
+    // v2.7.0：服务器能力开关（禁用时明确提示，不再静默失败）
+    val serverMicEnabled by session.serverMicEnabled.collectAsState()
+    val serverWebcamEnabled by session.serverWebcamEnabled.collectAsState()
+    val serverAudioEnabled by session.serverAudioEnabled.collectAsState()
 
     var search by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(true) }
@@ -88,6 +92,26 @@ fun HardwarePanel(session: SelkiesSession) {
     val selectedCameraIds = selectedCamera.split(',').filter { it.isNotBlank() }
 
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
+        // v2.7.0：服务器能力提示（被禁用的功能一目了然）
+        if (!serverMicEnabled || !serverWebcamEnabled || !serverAudioEnabled) {
+            Surface(
+                shape = RoundedCornerShape(8.dp),
+                color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.6f),
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+            ) {
+                Text(
+                    buildString {
+                        append("服务器已禁用：")
+                        if (!serverMicEnabled) append(" 麦克风")
+                        if (!serverWebcamEnabled) append(" 摄像头")
+                        if (!serverAudioEnabled) append(" 远程声音")
+                        append("（对应功能不可用，这是服务器端配置而非客户端故障）")
+                    },
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                )
+            }
+        }
         // 搜索 + 刷新
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             OutlinedTextField(

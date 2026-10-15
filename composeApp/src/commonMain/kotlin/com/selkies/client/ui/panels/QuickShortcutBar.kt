@@ -106,7 +106,7 @@ fun QuickShortcutBar(
                     .onSizeChanged { barSize = it },
                 shape = RoundedCornerShape(12.dp),
                 color = Color(0xF0161B22),
-                shadowElevation = 8.dp
+                // v2.7.0: shadowElevation 移除——SOFTWARE 渲染内容丢失 bug
             ) {
                 Column(modifier = Modifier.padding(3.dp)) {
                     // 拖动头

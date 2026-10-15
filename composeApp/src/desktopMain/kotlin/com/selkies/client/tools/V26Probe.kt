@@ -179,7 +179,7 @@ object V26Probe {
             val savedInfo = AtomicReference<Triple<String?, Long, String?>?>(null)
             val recStart = session.startRecording()
             // ⚠️ startRecording 内部会注册自己的 onSaved（写 savedMediaEvent），必须在之后覆写才能拿到回调
-            session.recorder.onSaved = { p, frames, err ->
+            session.recorder.onSaved = { p, frames, err, _ ->
                 savedInfo.set(Triple(p, frames, err)); saved.countDown()
             }
             println("[诊断] startRecording=$recStart state=${session.recorder.state} path=$recPath")
@@ -321,7 +321,7 @@ object V26Probe {
         override fun showSoftInput(show: Boolean) {}
         override fun isTouchDevice(): Boolean = false
         override fun nativeKeyCodeToKeysym(nativeKeyCode: Int, unicodeChar: Int): Int? = null
-        override fun setPhysicalKeyHandler(handler: ((Int, Boolean) -> Unit)?) {}
+        override fun setPhysicalKeyHandler(handler: ((Int, Boolean) -> Boolean)?) {}
         override fun readFileBytes(path: String): ByteArray? = null
         override fun exitApp() {}
         override fun openFile(path: String) {}

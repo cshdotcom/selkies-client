@@ -342,7 +342,7 @@ object ProtocolProbe {
         override fun showSoftInput(show: Boolean) {}
         override fun isTouchDevice(): Boolean = false
         override fun nativeKeyCodeToKeysym(nativeKeyCode: Int, unicodeChar: Int): Int? = null
-        override fun setPhysicalKeyHandler(handler: ((Int, Boolean) -> Unit)?) {}
+        override fun setPhysicalKeyHandler(handler: ((Int, Boolean) -> Boolean)?) {}
         override fun readFileBytes(path: String): ByteArray? = null
         override fun exitApp() {}
         override fun openFile(path: String) {}

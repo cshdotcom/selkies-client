@@ -63,6 +63,16 @@ class SelkiesSession(
     /** 服务器设置的镜像（encoder 等） */
     val serverSettings = MutableStateFlow<Map<String, kotlinx.serialization.json.JsonElement>>(emptyMap())
 
+    // ---- v2.7.0：服务器能力开关（server_settings 解析；UI 据此禁用入口并给出明确提示） ----
+    /** 服务器是否允许音频下行（audio_enabled） */
+    val serverAudioEnabled = MutableStateFlow(true)
+    /** 服务器是否允许麦克风上行（microphone_enabled；实测存在 false 的部署） */
+    val serverMicEnabled = MutableStateFlow(true)
+    /** 服务器是否允许摄像头上行（webcam_enabled） */
+    val serverWebcamEnabled = MutableStateFlow(true)
+    /** 音频流状态提示（AUDIO_STARTED 但无帧时自动恢复/告知用户；null = 正常） */
+    val audioStallNotice = MutableStateFlow<String?>(null)
+
     /** 当前生效编码器（服务器通知） */
     val currentEncoder = MutableStateFlow("h264enc")
 
@@ -94,6 +104,9 @@ class SelkiesSession(
 
     /** 录屏引擎（WS 流直采，无系统录屏权限） */
     val recorder = StreamRecorder { path -> platform.makeStreamMuxer(path) }
+
+    /** v2.7.0：会话级录制中标志（含自动分段切换瞬间；UI 观察它而非 recorder.state，避免段间闪烁） */
+    val recordingActive = MutableStateFlow(false)
 
     /** 截图/录屏保存结果通知（路径 + 帧数 + 错误；UI 弹保存引导） */
     val savedMediaEvent = MutableStateFlow<SavedMediaEvent?>(null)
@@ -145,6 +158,52 @@ class SelkiesSession(
     val webcamCapture by lazy { platform.makeWebcamCapture() }
     val filesClient by lazy { FilesClient(this) }
 
+    // ---- v2.7.0：音频停看门狗（AUDIO_STARTED 但服务器无帧 → 自动重启音频管线 + 状态透明化） ----
+    @Volatile private var audioStartedAt = 0L
+    @Volatile private var audioFramesSinceStart = 0L
+    @Volatile private var audioReviveAttempts = 0
+    private var audioStallJob: Job? = null
+
+    private fun startAudioStallWatchdog() {
+        if (audioStallJob?.isActive == true) return
+        audioStallJob = scope.launch {
+            while (isActive) {
+                delay(2000)
+                if (audioStartedAt == 0L || userClosed) continue
+                val elapsed = System.currentTimeMillis() - audioStartedAt
+                if (audioFramesSinceStart > 0) {
+                    // 帧已流动：一切正常，清除提示并重置恢复计数（下次停滞可获得新一轮自动恢复）
+                    if (audioStallNotice.value != null) audioStallNotice.value = null
+                    audioReviveAttempts = 0
+                    continue
+                }
+                if (elapsed < 8000) continue  // 等待首个音频帧的宽限期
+                // AUDIO_STARTED 后 8 秒无任何音频帧 → 服务器音频管线疑似停滞
+                if (audioReviveAttempts < 3) {
+                    audioReviveAttempts++
+                    audioStallNotice.value = "远程音频无数据，正在尝试恢复（第 $audioReviveAttempts 次）…"
+                    post {
+                        runCatching {
+                            connection.sendText("STOP_AUDIO")
+                            delay(600)
+                            connection.sendText("START_AUDIO")
+                        }
+                        audioStartedAt = System.currentTimeMillis()
+                        audioFramesSinceStart = 0
+                    }
+                } else {
+                    audioStallNotice.value = "远程音频无数据（服务器端音频管线异常）——视频不受影响；可尝试断开后重连"
+                    stopAudioStallWatchdog()
+                }
+            }
+        }
+    }
+
+    private fun stopAudioStallWatchdog() {
+        audioStallJob?.cancel()
+        audioStallJob = null
+    }
+
     lateinit var connection: SelkiesConnection
         private set
 
@@ -169,6 +228,10 @@ class SelkiesSession(
     private var clipboardMultipartExpected = 0L
     private var clipboardMultipartIsReply = false
     private var awaitingReplyVerbs = mutableSetOf<String>()
+    // ---- v2.7.0：剪贴板可靠同步（轮询 + 焦点拉取；覆盖服务器 announcement 失效的部署） ----
+    private var clipboardPollJob: Job? = null
+    /** 收到大二进制载荷后暂停轮询（避免大图反复全量拉取） */
+    @Volatile private var clipboardPollBackoffUntil = 0L
     private var userClosed = false
     private var reconnectAttempts = 0
     private var reconnectJob: Job? = null
@@ -263,6 +326,9 @@ class SelkiesSession(
         statsSampler?.cancel()
         keyHeartbeatJob?.cancel()
         stopGamepadHeartbeat()
+        stopClipboardPoll()
+        stopAudioStallWatchdog()
+        recordingActive.value = false
         heldKeys.clear()
         // 录屏中退出会话 → 自动保存（用户要求：退出默认视为保存）
         if (recorder.state == StreamRecorder.State.RECORDING) {
@@ -298,7 +364,31 @@ class SelkiesSession(
             // 请求服务器剪贴板（cache-only）
             connection.sendText("cr")
         }
+        // v2.7.0：剪贴板可靠同步——定向轮询拉取（REQUEST_CLIPBOARD 响应未打标记，
+        // 与 announcement 同路处理；内容未变时静默去重，不会反复覆盖本地剪贴板）。
+        // 覆盖实测「服务器剪贴板变更推送（announcement）不工作」的部署。
+        startClipboardPoll()
         startAckLoop()
+    }
+
+    /** v2.7.0：剪贴板轮询（每 5s，仅在前台且开启自动接收时；服务器去抖 0.25s 远低于此间隔） */
+    private fun startClipboardPoll() {
+        if (clipboardPollJob?.isActive == true) return
+        clipboardPollJob = scope.launch {
+            while (isActive && !userClosed) {
+                delay(5000)
+                if (userClosed || status.value != Status.CONNECTED) continue
+                if (!settings().clipboardAutoReceive || !settings().clipboardPollSync) continue
+                if (!hasWindowFocus()) continue
+                if (System.currentTimeMillis() < clipboardPollBackoffUntil) continue
+                post { runCatching { connection.sendText("REQUEST_CLIPBOARD") } }
+            }
+        }
+    }
+
+    private fun stopClipboardPoll() {
+        clipboardPollJob?.cancel()
+        clipboardPollJob = null
     }
 
     private suspend fun sendInitialSettings() {
@@ -442,11 +532,25 @@ class SelkiesSession(
             text == "AUDIO_STARTED" -> {
                 // 声道数来自 server_settings（官方默认 2 声道；旧版硬编码 1 导致无声/变音）
                 runCatching { audioPlayer.start(48000, audioChannels.value) }
+                // v2.7.0：音频停看门狗状态归零（实测存在 AUDIO_STARTED 但服务器管线无帧的部署）
+                // ⚠️ 恢复尝试计数不在此归零（否则每次自动恢复的 AUDIO_STARTED 都重置计数 = 无限重试循环）；
+                //    帧真正流动时才归零
+                audioStartedAt = System.currentTimeMillis()
+                audioFramesSinceStart = 0
+                startAudioStallWatchdog()
                 startStatsSamplerIfNeeded()
             }
-            text == "AUDIO_STOPPED" -> { }
+            text == "AUDIO_STOPPED" -> {
+                audioStartedAt = 0L
+                stopAudioStallWatchdog()
+                audioStallNotice.value = null
+            }
             text == "AUDIO_DISABLED" -> {
                 statusDetail.value = "音频被服务器禁用"
+                serverAudioEnabled.value = false
+                audioStartedAt = 0L
+                stopAudioStallWatchdog()
+                audioStallNotice.value = null
                 runCatching { audioPlayer.stop() }
             }
             text == "MICROPHONE_DISABLED" -> { runCatching { micCapture.stop() } }
@@ -555,6 +659,28 @@ class SelkiesSession(
                         (enc["value"] as? kotlinx.serialization.json.JsonPrimitive)?.let { v ->
                             currentEncoder.value = v.content
                         }
+                    }
+                    // v2.7.0：服务器能力开关（麦克风/摄像头/音频；UI 据此禁用入口）
+                    fun boolFlag(key: String, current: MutableStateFlow<Boolean>) {
+                        (map[key] as? kotlinx.serialization.json.JsonObject)?.let { o ->
+                            (o["value"] as? kotlinx.serialization.json.JsonPrimitive)?.let { v ->
+                                current.value = v.content == "true" || v.content == "1"
+                            }
+                        }
+                    }
+                    boolFlag("audio_enabled", serverAudioEnabled)
+                    boolFlag("microphone_enabled", serverMicEnabled)
+                    boolFlag("webcam_enabled", serverWebcamEnabled)
+                    if (!serverMicEnabled.value && micActive.value) {
+                        // 服务器已禁用：立即停掉上行（避免持续发被丢弃的帧）
+                        runCatching { micCapture.stop() }
+                        micActive.value = false
+                        notices.value = "服务器已禁用麦克风，上行已停止"
+                    }
+                    if (!serverWebcamEnabled.value && webcamActive.value) {
+                        runCatching { webcamCapture.stop() }
+                        webcamActive.value = false
+                        notices.value = "服务器已禁用摄像头，上行已停止"
                     }
                     // 服务器音频声道数（官方默认 2，修复单声道硬编码导致的无声/变音）
                     (map["audio_channels"] as? kotlinx.serialization.json.JsonObject)?.let { ch ->
@@ -825,6 +951,7 @@ class SelkiesSession(
                     for ((opus, quiet) in frames) {
                         if (quiet) audioPlayer.onQuiet()
                         if (opus.isNotEmpty()) {
+                            audioFramesSinceStart++
                             audioPlayer.playOpus(opus)
                             // 录屏：录主 Opus 载荷
                             if (recorder.state == StreamRecorder.State.RECORDING) {
@@ -1328,6 +1455,9 @@ class SelkiesSession(
             val bytes = Base64.getDecoder().decode(b64)
             if (mime == "text/plain" || mime.startsWith("text/")) {
                 val text = bytes.toString(Charsets.UTF_8)
+                // v2.7.0：去重防护——内容与上次完全相同（轮询拉取的未变更响应）时静默跳过，
+                // 不重复写本地剪贴板/不刷提示（否则 5s 轮询会反复覆盖与弹提示）
+                val unchanged = text == lastRemoteClipboardText
                 lastRemoteClipboardText = text
                 // v2.6.0：迟到的 cr 空快照（reply）不覆盖已收到的真实内容
                 //   （服务器连接期读剪贴板可能数秒后才回空，此时更早的真实同步不应被清空显示）
@@ -1336,8 +1466,10 @@ class SelkiesSession(
                     remoteClipboard.value = text to mime
                 }
                 onClipboardFromRemote(text, mime)
-                clipboardNotice.value = if (isReply) "已获取远程剪贴板（${text.length} 字符）" else "远程剪贴板已同步到本地（${text.length} 字符）"
-                if (!isReply && settings().clipboardAutoReceive && text.isNotEmpty()) {
+                if (!unchanged) {
+                    clipboardNotice.value = if (isReply) "已获取远程剪贴板（${text.length} 字符）" else "远程剪贴板已同步到本地（${text.length} 字符）"
+                }
+                if (!isReply && !unchanged && settings().clipboardAutoReceive && text.isNotEmpty()) {
                     applyRemoteClipboardLocally {
                         // 后台（无焦点）时 Android 禁止写剪贴板 → 挂起，回焦点补写
                         if (!hasWindowFocus()) {
@@ -1349,6 +1481,8 @@ class SelkiesSession(
                     }
                 }
             } else {
+                // 二进制载荷（图片等）：拉取成本高，暂停轮询 60s
+                clipboardPollBackoffUntil = System.currentTimeMillis() + 60_000
                 remoteClipboard.value = null to mime
                 onClipboardFromRemote(null, mime)
                 clipboardNotice.value = "远程剪贴板收到 $mime 内容（${bytes.size / 1024} KB）"
@@ -1492,8 +1626,14 @@ class SelkiesSession(
         }
     }
 
-    fun startMicUplink() {
-        if (micActive.value || micCapture.active) { micActive.value = true; return }
+    fun startMicUplink(): Boolean {
+        // v2.7.0：服务器禁用麦克风时明确拒绝（旧版静默发送被丢弃的帧 = "麦克风有问题"的迷惑根因）
+        if (!serverMicEnabled.value) {
+            notices.value = "服务器已禁用麦克风（microphone_enabled=false），无法上行"
+            micActive.value = false
+            return false
+        }
+        if (micActive.value || micCapture.active) { micActive.value = true; return true }
         micActive.value = true
         micCapture.start(
             deviceIds = selectedMicIds.value,
@@ -1512,6 +1652,7 @@ class SelkiesSession(
                 runCatching { micCapture.stop() }
             }
         )
+        return true
     }
 
     fun stopMicUplink() {
@@ -1519,8 +1660,14 @@ class SelkiesSession(
         runCatching { micCapture.stop() }
     }
 
-    fun startWebcamUplink() {
-        if (webcamActive.value || webcamCapture.active) { webcamActive.value = true; return }
+    fun startWebcamUplink(): Boolean {
+        // v2.7.0：服务器禁用摄像头时明确拒绝
+        if (!serverWebcamEnabled.value) {
+            notices.value = "服务器已禁用摄像头（webcam_enabled=false），无法上行"
+            webcamActive.value = false
+            return false
+        }
+        if (webcamActive.value || webcamCapture.active) { webcamActive.value = true; return true }
         webcamActive.value = true
         webcamCapture.start(
             encoder = server.webcamEncoder,
@@ -1544,6 +1691,7 @@ class SelkiesSession(
                 runCatching { webcamCapture.stop() }
             }
         )
+        return true
     }
 
     fun stopWebcamUplink() {
@@ -1614,6 +1762,9 @@ class SelkiesSession(
      *  （服务器限流 4 次/s 每显示，1.5s 间隔远低于限制；实测关键帧 1~5s 内到达） */
     private var recKeyframeJob: Job? = null
 
+    /** v2.7.0：自动续录——分辨率/编码器切换分段保存后自动开新段（旧版只停不续 = 用户丢录后半段） */
+    @Volatile private var recordingAutoContinue = false
+
     /** 开始录屏（WS 流直采；Android 前台服务保活→后台持续录） */
     fun startRecording(): Boolean {
         if (recorder.state == StreamRecorder.State.RECORDING) return false
@@ -1622,6 +1773,8 @@ class SelkiesSession(
         val target = platform.mediaStore().createRecordingFile(name) ?: return false
         val ok = recorder.start(target)
         if (ok) {
+            recordingAutoContinue = true
+            recordingActive.value = true
             // ⚠️【v2.6.0】录制启动即强制关键帧：H.264/H.265 复用器需要参数集（SPS/PPS）写头；
             //    服务器无限 GOP（按需关键帧）下不主动请求则可能长时间无关键帧 → 录屏无法开始
             forceKeyframe()
@@ -1643,26 +1796,47 @@ class SelkiesSession(
             }
             RecordingShutdownHook.register(recorder)
             platform.setRecordingActive(true)
-            recorder.onSaved = { path, frames, error ->
+            recorder.onSaved = { path, frames, error, kind ->
                 platform.setRecordingActive(false)
                 recKeyframeJob?.cancel()
                 RecordingShutdownHook.register(null)
-                savedMediaEvent.value = SavedMediaEvent(
-                    "recording", path,
-                    path?.substringAfterLast('/') ?: "",
-                    detail = "$frames 帧 · ${recorder.durationSec().coerceAtLeast(0)}s",
-                    error = error
-                )
+                if (kind == "segment" && recordingAutoContinue && !userClosed &&
+                    status.value == Status.CONNECTED
+                ) {
+                    // 分辨率切换分段：静默保存当前段，自动开新段继续录（recordingActive 保持 true，UI 不闪烁）
+                    val next = platform.mediaStore().createRecordingFile(StreamRecorder.autoName(""))
+                    if (next != null && recorder.start(next)) {
+                        forceKeyframe()
+                        RecordingShutdownHook.register(recorder)
+                        platform.setRecordingActive(true)
+                    } else {
+                        recordingAutoContinue = false
+                        recordingActive.value = false
+                        notices.value = "分辨率切换：上一段录屏已保存，新段无法创建"
+                    }
+                } else {
+                    recordingAutoContinue = false
+                    recordingActive.value = false
+                    savedMediaEvent.value = SavedMediaEvent(
+                        "recording", path,
+                        path?.substringAfterLast('/') ?: "",
+                        detail = "$frames 帧 · ${recorder.durationSec().coerceAtLeast(0)}s",
+                        error = error
+                    )
+                }
             }
         }
         return ok
     }
 
-    /** 停止录屏并保存（幂等） */
+    /** 停止录屏并保存（幂等；v2.7.0：保存移出主线程——muxer 收尾可能数百 ms，旧版在 UI 线程同步执行 = ANR/闪退风险） */
     fun stopRecording() {
+        recordingAutoContinue = false
         recKeyframeJob?.cancel()
         if (recorder.state == StreamRecorder.State.RECORDING) {
-            recorder.stopAndSave("manual")
+            ioScope.launch {
+                runCatching { recorder.stopAndSave("manual") }
+            }
         }
     }
 
@@ -1693,6 +1867,11 @@ class SelkiesSession(
                     pushLocalClipboard(t)
                 }
             }
+        }
+        // 3) v2.7.0：回前台立即拉取一次远程剪贴板（覆盖服务器 announcement 失效的部署；
+        //    内容未变时由去重防护静默跳过，不会覆盖本地新复制的内容）
+        if (status.value == Status.CONNECTED && settings().clipboardAutoReceive && settings().clipboardPollSync) {
+            post { runCatching { connection.sendText("REQUEST_CLIPBOARD") } }
         }
     }
 

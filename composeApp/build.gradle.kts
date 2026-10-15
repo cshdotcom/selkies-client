@@ -92,8 +92,8 @@ android {
         applicationId = "com.selkies.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 20600
-        versionName = "2.6.0"
+        versionCode = 20700
+        versionName = "2.7.0"
         ndkVersion = ""
     }
     signingConfigs {
@@ -131,7 +131,7 @@ compose.desktop {
         mainClass = "com.selkies.client.MainKt"
         nativeDistributions {
             packageName = "Selkies-Desktop"
-            packageVersion = "2.6.0"
+            packageVersion = "2.7.0"
             description = "Selkies 远程桌面原生客户端"
             vendor = "Selkies Client"
         }
@@ -148,7 +148,7 @@ val desktopFatJar = tasks.register<Jar>("desktopFatJar") {
     manifest {
         attributes["Main-Class"] = "com.selkies.client.MainKt"
         attributes["Implementation-Title"] = "Selkies Desktop Client"
-        attributes["Implementation-Version"] = "2.6.0"
+        attributes["Implementation-Version"] = "2.7.0"
     }
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
     exclude("META-INF/versions/**/module-info.class")
@@ -225,6 +225,18 @@ tasks.register<JavaExec>("probeRec") {
     group = "verification"
     description = "录屏专项诊断：逐秒打印收帧 vs 写帧，定位 0 帧断点"
     mainClass.set("com.selkies.client.tools.RecProbe")
+    val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
+    classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
+    for (k in listOf("probeUrl", "probeUser", "probePass")) {
+        if (project.hasProperty(k)) systemProperty(k, project.property(k).toString())
+    }
+}
+
+// v2.7.0 综合端到端验证（服务器能力/麦克风门控/剪贴板轮询去重/音频看门狗/录屏自动分段）
+tasks.register<JavaExec>("probeV27") {
+    group = "verification"
+    description = "v2.7.0 无头综合验证：服务器能力 + 麦克风门控 + 剪贴板可靠同步 + 音频看门狗 + 录屏分段续录"
+    mainClass.set("com.selkies.client.tools.V27Probe")
     val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
     classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
     for (k in listOf("probeUrl", "probeUser", "probePass")) {

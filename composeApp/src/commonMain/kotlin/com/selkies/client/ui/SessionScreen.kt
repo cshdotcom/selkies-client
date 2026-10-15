@@ -39,6 +39,10 @@ import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Keyboard
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Mouse
@@ -192,6 +196,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     var panel by remember { mutableStateOf(SessionPanel.NONE) }
     var fullscreen by remember { mutableStateOf(false) }
     var toolbarVisible by remember { mutableStateOf(true) }
+    // v2.7.0：全屏工具栏自动隐藏（不遮挡远程控制区；边缘唤出）
+    var toolbarShowAt by remember { mutableStateOf(System.currentTimeMillis()) }
     var floatingKb by remember { mutableStateOf(false) }
     var quickBar by remember { mutableStateOf(false) }
     var showInputPicker by remember { mutableStateOf(false) }
@@ -203,6 +209,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     // v2.5.0：截图/录屏/音量/保存引导
     var recording by remember { mutableStateOf(false) }
     var recordingSec by remember { mutableStateOf(0) }
+    // v2.7.0：会话级录制状态（自动分段切换不闪烁；异常终止自动复位）
+    val sessionRecording by session.recordingActive.collectAsState()
     var showVolumePopup by remember { mutableStateOf(false) }
     val savedEvent by session.savedMediaEvent.collectAsState()
     val appMuted by session.appMuted.collectAsState()
@@ -218,6 +226,12 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     var zoomPan by remember { mutableStateOf(Offset.Zero) }  // 缩放后平移（视图 px）
     var showZoomControls by remember { mutableStateOf(false) }
 
+    // v2.7.0：服务器能力（麦克风/摄像头/音频是否被服务器禁用；UI 据此禁用入口）
+    val serverMicEnabled by session.serverMicEnabled.collectAsState()
+    val serverWebcamEnabled by session.serverWebcamEnabled.collectAsState()
+    val serverAudioEnabled by session.serverAudioEnabled.collectAsState()
+    val audioStallNotice by session.audioStallNotice.collectAsState()
+
     // v2.6.0：工具栏自定义顺序
     val toolbarOrder = remember(state.store.settings.value.toolbarOrder) {
         val order = state.store.settings.value.toolbarOrder
@@ -229,6 +243,13 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     var viewSize by remember { mutableStateOf(IntSize.Zero) }
     var streamSize by remember { mutableStateOf(realizedRes ?: Pair(1280, 720)) }
 
+    /** 平移范围限制：缩放后内容必须始终覆盖整个视图（放大镜拖拽不会把画面拖丢） */
+    fun clampZoomPan(p: Offset, z: Float): Offset {
+        val mx = ((z - 1f) * viewSize.width / 2f).coerceAtLeast(0f)
+        val my = ((z - 1f) * viewSize.height / 2f).coerceAtLeast(0f)
+        return Offset(p.x.coerceIn(-mx, mx), p.y.coerceIn(-my, my))
+    }
+
     /** 在视图焦点 f 处缩放到新倍率（保持焦点下的内容不动） */
     fun zoomAt(f: Offset, newZoom: Float) {
         val nz = newZoom.coerceIn(1f, 5f)
@@ -236,12 +257,19 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         val cx = viewSize.width / 2f
         val cy = viewSize.height / 2f
         // 内容点 q = c + (f - c - pan)/z 保持位于 f：pan' = f - c - (f - c - pan)*(z'/z)
-        zoomPan = Offset(
+        var np = Offset(
             (f.x - cx - (f.x - cx - zoomPan.x) * (nz / localZoom)),
             (f.y - cy - (f.y - cy - zoomPan.y) * (nz / localZoom))
         )
-        if (nz == 1f) zoomPan = Offset.Zero
+        if (nz == 1f) np = Offset.Zero
+        zoomPan = clampZoomPan(np, nz)
         localZoom = nz
+    }
+
+    /** 本地平移（放大镜拖拽/方向按钮；纯本地，不控制远程） */
+    fun panLocalBy(d: Offset) {
+        if (localZoom <= 1.01f) return
+        zoomPan = clampZoomPan(zoomPan + d, localZoom)
     }
     LaunchedEffect(realizedRes) {
         realizedRes?.let {
@@ -315,16 +343,17 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         }
     }
 
-    // 录屏中：每秒刷新时长 + 与真实录制状态同步（分辨率切换自动分段/异常终止时 UI 自动复位）
-    LaunchedEffect(recording) {
-        if (recording) {
-            while (recording) {
+    // 录屏中：每秒刷新时长 + 与真实录制状态同步（v2.7.0：观察会话级 recordingActive，
+    // 分辨率切换自动分段期间保持 true，UI 不闪烁）
+    LaunchedEffect(sessionRecording) {
+        if (sessionRecording) {
+            recording = true
+            while (sessionRecording) {
                 delay(1000)
                 recordingSec = session.recorder.durationSec().toInt()
-                if (session.recorder.state != com.selkies.client.core.StreamRecorder.State.RECORDING) {
-                    recording = false
-                }
             }
+        } else if (recording) {
+            recording = false
         }
     }
 
@@ -390,8 +419,11 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
 
         // 桌面（AWT 分发器）物理键直通；无本地面板打开时才转发，避免在文本框输入时打到远程
         // v2.6.0：虚拟手柄键盘映射优先拦截（桌面无触屏的替代操作方案）
+        // v2.7.0：返回 true = 已转发 → AWT 分发器消费（防 Compose 路径双发）；
+        //        quickBar/放大镜控制等交互层也纳入门控
         platform.setPhysicalKeyHandler { code, down ->
-            if (!viewOnly && panel == SessionPanel.NONE && !floatingKb &&
+            if (!viewOnly && panel == SessionPanel.NONE && !floatingKb && !quickBar &&
+                !showZoomControls && !showVirtualPad && !showVolumePopup && !showInputPicker && !showModeSelector &&
                 state.store.settings.value.physicalKeyboardPassthrough
             ) {
                 val ks = platform.nativeKeyCodeToKeysym(code, 0)
@@ -400,11 +432,13 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     if (virtualEngine.isConnected && virtualPadKbMap &&
                         virtualEngine.handleKeysym(ks.toLong(), down)
                     ) {
-                        return@setPhysicalKeyHandler
+                        return@setPhysicalKeyHandler true
                     }
                     session.sendKey(ks.toLong(), down)
+                    return@setPhysicalKeyHandler true
                 }
             }
+            false
         }
 
         onDispose {
@@ -415,6 +449,18 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             clip.removeListener(clipListener)
             session.disconnect()
             platform.setFullscreen(false)
+        }
+    }
+
+    // 全屏模式：工具栏闲置 4 秒自动隐藏（顶部/底部边缘触碰或鼠标移近唤出）
+    LaunchedEffect(fullscreen, toolbarVisible) {
+        if (fullscreen && toolbarVisible) {
+            while (fullscreen && toolbarVisible) {
+                delay(500)
+                if (System.currentTimeMillis() - toolbarShowAt >= 4000) {
+                    toolbarVisible = false
+                }
+            }
         }
     }
 
@@ -533,9 +579,17 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         }
     }
 
+    /** 是否有本地交互层打开（此时物理键不得发往远程——文本框/面板要接收键盘） */
+    fun inputOverlayOpen(): Boolean =
+        panel != SessionPanel.NONE || floatingKb || quickBar || showZoomControls || showVirtualPad ||
+                showVolumePopup || showInputPicker || showModeSelector || exitConfirm || savedEvent != null
+
     fun handleKeyEvent(event: androidx.compose.ui.input.key.KeyEvent): Boolean {
         if (viewOnly) return false
         if (!state.store.settings.value.physicalKeyboardPassthrough) return false
+        // v2.7.0 修复：面板/键盘/弹窗打开时物理键必须留给本地 UI（文本框输入）。
+        // 旧版无条件直发远程 → IME 面板/剪贴板/搜索等一切文本输入被拦截 = “无法录入”根因。
+        if (inputOverlayOpen()) return false
         if (event.type == KeyEventType.KeyDown || event.type == KeyEventType.KeyUp) {
             val keysym = event.keysymOrNull()
             if (keysym != null && keysym > 0) {
@@ -574,6 +628,15 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                         var twoFingerDist = 0f
                         var twoFingerMoved = false
                         var lastTapUpAt = 0L            // 双击检测
+
+                        // ---- v2.7.0：桌面鼠标拖拽 = 放大镜平移（纯本地）；全屏边缘唤出工具栏 ----
+                        // 放大状态：左键按下不动→松开 = 远程点击（延迟决策）；拖动 = 本地平移；中键拖动 = 平移
+                        var mousePanActive = false
+                        var mousePanLast = Offset.Zero
+                        var mousePressPos = Offset.Zero
+                        var mousePressMoved = false
+                        val edgeRevealPx = 36f
+                        val mousePanSlop = 6f
 
                         fun endTouchSession(sendRelease: Boolean) {
                             if (leftDownSent && sendRelease && !viewOnly) {
@@ -640,15 +703,45 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                     }
                                     PointerEventType.Press -> {
                                         val pos = changes.first().position
+                                        mousePressPos = pos
+                                        mousePressMoved = false
                                         when {
-                                            event.tertiaryPressed() -> middleClickAt(pos)
+                                            event.tertiaryPressed() -> {
+                                                // v2.7.0：放大状态中键拖拽 = 本地平移；未放大 = 中键点击
+                                                if (localZoom > 1.01f) {
+                                                    mousePanActive = true
+                                                    mousePanLast = pos
+                                                } else middleClickAt(pos)
+                                            }
                                             event.secondaryPressed() -> rightClickAt(pos)
-                                            event.primaryPressed() -> leftClickAt(pos)
+                                            event.primaryPressed() -> {
+                                                // v2.7.0：放大状态左键拖拽 = 本地平移（点击在松手时判定）；未放大 = 左键点击
+                                                if (localZoom > 1.01f) {
+                                                    mousePanActive = true
+                                                    mousePanLast = pos
+                                                } else leftClickAt(pos)
+                                            }
                                         }
                                         changes.forEach { it.consume() }
                                     }
                                     PointerEventType.Move -> {
                                         val pos = changes.first().position
+                                        // v2.7.0：全屏时鼠标移到顶部/底部边缘 → 唤出工具栏
+                                        if (fullscreen && !toolbarVisible &&
+                                            (pos.y <= edgeRevealPx || pos.y >= viewSize.height - edgeRevealPx)
+                                        ) {
+                                            toolbarShowAt = System.currentTimeMillis()
+                                            toolbarVisible = true
+                                        }
+                                        if (mousePanActive) {
+                                            // 放大镜平移（本地）：拖拽画面，与远程无关
+                                            val d = pos - mousePanLast
+                                            if (abs(d.x) > 0.1f || abs(d.y) > 0.1f) mousePressMoved = true
+                                            panLocalBy(d)
+                                            mousePanLast = pos
+                                            changes.forEach { it.consume() }
+                                            continue
+                                        }
                                         val mask = when {
                                             event.primaryPressed() -> Protocol.BUTTON_LEFT
                                             event.secondaryPressed() -> Protocol.BUTTON_RIGHT
@@ -662,7 +755,15 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                     }
                                     PointerEventType.Release -> {
                                         val pos = changes.first().position
-                                        if (!viewOnly) {
+                                        if (mousePanActive) {
+                                            mousePanActive = false
+                                            // 放大状态未移动的松开 = 远程点击（延迟决策，保持可控）
+                                            if (!mousePressMoved &&
+                                                hypot(pos.x - mousePressPos.x, pos.y - mousePressPos.y) < mousePanSlop && !viewOnly
+                                            ) {
+                                                leftClickAt(pos)
+                                            }
+                                        } else if (!viewOnly) {
                                             val (x, y) = mapToStream(pos)
                                             session.sendMouseMove(x, y, 0)
                                         }
@@ -687,7 +788,9 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                         longFired = false
                                         leftDownSent = false
                                         if (!viewOnly) {
-                                            if (inputMode == InputMode.TOUCH) {
+                                            if (localZoom > 1.01f) {
+                                                // v2.7.0：放大状态单指拖动 = 本地平移；点击延迟到松手判定
+                                            } else if (inputMode == InputMode.TOUCH) {
                                                 // 直接模式：按下即左键按下（零延迟）
                                                 val (x, y) = mapToStream(pressPos)
                                                 session.sendMouseMove(x, y, Protocol.BUTTON_LEFT)
@@ -725,7 +828,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                         } else if (localZoom > 1.01f && (abs(pan.x) > 0.5f || abs(pan.y) > 0.5f)) {
                                             // 放大状态：双指稳定距离拖动 = 平移画面（本地）
                                             twoFingerMoved = true
-                                            zoomPan = zoomPan + pan
+                                            zoomPan = clampZoomPan(zoomPan + pan, localZoom)
                                         } else if (abs(pan.y) > 0.5f) {
                                             twoFingerMoved = true
                                             acc.scrollY += -pan.y / 2f
@@ -742,7 +845,19 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                         if (!touchMoved && hypot(delta.x, delta.y) > TAP_SLOP_PX) {
                                             touchMoved = true
                                         }
-                                        if (!viewOnly && touchMoved) {
+                                        if (localZoom > 1.01f) {
+                                            // v2.7.0：放大状态单指拖动 = 本地平移画面（不控远程；可拖到未显示区域后轻点）
+                                            if (touchMoved) {
+                                                panLocalBy(touchChanges.first().positionChange())
+                                            }
+                                            // v2.7.0：全屏时手指移到顶部/底部边缘 → 唤出工具栏
+                                            if (fullscreen && !toolbarVisible &&
+                                                (pos.y <= 36f || pos.y >= viewSize.height - 36f)
+                                            ) {
+                                                toolbarShowAt = System.currentTimeMillis()
+                                                toolbarVisible = true
+                                            }
+                                        } else if (!viewOnly && touchMoved) {
                                             if (inputMode == InputMode.TOUCH) {
                                                 val (x, y) = mapToStream(pos)
                                                 session.sendMouseMove(x, y, if (leftDownSent) Protocol.BUTTON_LEFT else 0)
@@ -775,8 +890,15 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                             val tapDur = System.currentTimeMillis() - pressStart
                                             when (inputMode) {
                                                 InputMode.TOUCH -> {
-                                                    // 松手：释放左键（按下时已发）
-                                                    endTouchSession(true)
+                                                    if (localZoom > 1.01f) {
+                                                        // v2.7.0：放大状态轻点 = 远程点击（延迟判定；坐标已含缩放映射）
+                                                        if (!touchMoved && !longFired && tapDur < TAP_MAX_MS && !viewOnly) {
+                                                            leftClickAt(pressPos)
+                                                        }
+                                                    } else {
+                                                        // 松手：释放左键（按下时已发）
+                                                        endTouchSession(true)
+                                                    }
                                                 }
                                                 InputMode.TRACKPAD -> {
                                                     if (!viewOnly && !touchMoved && !longFired) {
@@ -969,12 +1091,15 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     .padding(top = 4.dp)
                     .size(width = 120.dp, height = 26.dp)
                     .background(Color.Black.copy(alpha = 0.35f), RoundedCornerShape(13.dp))
-                    .clickable { toolbarVisible = true },
+                    .clickable {
+                        toolbarShowAt = System.currentTimeMillis()
+                        toolbarVisible = true
+                    },
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    "显示工具栏",
-                    color = Color.White, fontSize = 11.sp,
+                    if (fullscreen) "显工具栏（或碰屏幕边缘）" else "显示工具栏",
+                    color = Color.White, fontSize = 10.sp,
                     modifier = Modifier.padding(2.dp)
                 )
             }
@@ -996,7 +1121,16 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                         .fillMaxWidth()
                         .horizontalScroll(rememberScrollState())
                         .padding(horizontal = 6.dp, vertical = 6.dp)
-                        .navigationBarsPadding(),
+                        .navigationBarsPadding()
+                        // v2.7.0：全屏自动隐藏计时刷新（正在滑动/操作工具栏时不隐藏）
+                        .pointerInput(fullscreen) {
+                            awaitPointerEventScope {
+                                while (true) {
+                                    awaitPointerEvent()
+                                    if (fullscreen) toolbarShowAt = System.currentTimeMillis()
+                                }
+                            }
+                        },
                     horizontalArrangement = Arrangement.spacedBy(4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -1019,15 +1153,27 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                             ) { panel = if (panel == SessionPanel.PRINT) SessionPanel.NONE else SessionPanel.PRINT }
                             "mic" -> ToolButton(
                                 if (micSessionOn) Icons.Filled.Mic else Icons.Filled.MicOff, "麦克风",
-                                tint = if (micSessionOn) Color(0xFF4ADE80) else Color.White
+                                tint = when {
+                                    micSessionOn -> Color(0xFF4ADE80)
+                                    !serverMicEnabled -> Color(0xFF6B7280)
+                                    else -> Color.White
+                                }
                             ) {
-                                if (micSessionOn) session.stopMicUplink() else session.startMicUplink()
+                                if (!serverMicEnabled) {
+                                    toast = "服务器已禁用麦克风（microphone_enabled=false），无法上行"
+                                } else if (micSessionOn) session.stopMicUplink() else session.startMicUplink()
                             }
                             "camera" -> ToolButton(
                                 if (camSessionOn) Icons.Filled.Videocam else Icons.Filled.VideocamOff, "摄像头",
-                                tint = if (camSessionOn) Color(0xFF4ADE80) else Color.White
+                                tint = when {
+                                    camSessionOn -> Color(0xFF4ADE80)
+                                    !serverWebcamEnabled -> Color(0xFF6B7280)
+                                    else -> Color.White
+                                }
                             ) {
-                                if (camSessionOn) session.stopWebcamUplink() else session.startWebcamUplink()
+                                if (!serverWebcamEnabled) {
+                                    toast = "服务器已禁用摄像头（webcam_enabled=false），无法上行"
+                                } else if (camSessionOn) session.stopWebcamUplink() else session.startWebcamUplink()
                             }
                             "hardware" -> ToolButton(Icons.Filled.DevicesOther, "硬件") { panel = if (panel == SessionPanel.HARDWARE) SessionPanel.NONE else SessionPanel.HARDWARE }
                             "quality" -> ToolButton(Icons.Filled.Tune, "画质") { panel = if (panel == SessionPanel.SETTINGS) SessionPanel.NONE else SessionPanel.SETTINGS }
@@ -1048,7 +1194,6 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                             ) {
                                 if (recording) {
                                     session.stopRecording()
-                                    recording = false
                                 } else {
                                     if (session.startRecording()) recording = true
                                     else toast = "无法开始录制（存储不可用）"
@@ -1068,12 +1213,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                 Icons.Filled.ZoomIn, if (localZoom > 1.01f) "${(localZoom * 100).toInt()}%" else "放大镜",
                                 tint = if (localZoom > 1.01f) Color(0xFF60A5FA) else Color.White
                             ) {
-                                if (localZoom > 1.01f && !showZoomControls) {
-                                    // 已放大：一键重置；未放大：打开控制面板
-                                    localZoom = 1f; zoomPan = Offset.Zero
-                                } else {
-                                    showZoomControls = !showZoomControls
-                                }
+                                showZoomControls = true
                             }
                             "media" -> ToolButton(Icons.Filled.PhotoLibrary, "媒体库") { panel = if (panel == SessionPanel.MEDIA) SessionPanel.NONE else SessionPanel.MEDIA }
                             "fullscreen" -> ToolButton(
@@ -1095,7 +1235,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     .fillMaxHeight(0.62f),
                 color = MaterialTheme.colorScheme.surface,
                 shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
-                shadowElevation = 12.dp
+                // v2.7.0: shadowElevation 移除——Skiko SOFTWARE 渲染（Win7/8 强制软渲染 + Xvfb）下 Surface(shape+shadow) 内容丢失 bug
             ) {
                 Column {
                     // 面板标题栏
@@ -1185,7 +1325,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     .padding(bottom = 96.dp),
                 shape = RoundedCornerShape(16.dp),
                 color = Color.Black.copy(alpha = 0.75f),
-                shadowElevation = 8.dp
+                // v2.7.0: shadowElevation 移除——SOFTWARE 渲染内容丢失 bug
             ) {
                 Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1223,21 +1363,21 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             }
         }
 
-        // ============ v2.6.0 本地缩放控制（放大镜：滑条 + 加减/重置 + 百分比；只调本地显示） ============
+        // ============ v2.7.0 本地缩放控制（放大镜：滑条 + 加减/重置 + 方向移动按钮 + 百分比；只调本地显示） ============
         if (status == SelkiesSession.Status.CONNECTED) {
-            // 放大中常驻指示（点按重置）
+            // 放大中常驻指示（点按打开控制面板：方向按钮/滑条/重置）
             if (localZoom > 1.01f && !showZoomControls) {
                 Surface(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .statusBarsPadding()
                         .padding(top = 52.dp, end = 6.dp)
-                        .clickable { localZoom = 1f; zoomPan = Offset.Zero },
+                        .clickable { showZoomControls = true },
                     shape = RoundedCornerShape(8.dp),
                     color = Color.Black.copy(alpha = 0.6f)
                 ) {
                     Text(
-                        "${(localZoom * 100).toInt()}% ✕",
+                        "${(localZoom * 100).toInt()}% ⤢",
                         color = Color(0xFF7DD3FC),
                         style = MaterialTheme.typography.labelMedium,
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
@@ -1250,9 +1390,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()
                         .padding(bottom = 96.dp),
-                    shape = RoundedCornerShape(16.dp),
                     color = Color.Black.copy(alpha = 0.75f),
-                    shadowElevation = 8.dp
+                    shape = RoundedCornerShape(16.dp)
                 ) {
                     Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1291,8 +1430,36 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                             }) { Text("重置 100%") }
                             TextButton(onClick = { showZoomControls = false }) { Text("关闭") }
                         }
+                        Spacer(Modifier.height(6.dp))
+                        // v2.7.0：手动移动画面按钮（上下左右；纯本地平移，不控制远程）
                         Text(
-                            "只缩放本机画面，不改变远程分辨率 · 触屏：双指捏合缩放/放大后双指拖动平移 · 桌面：Ctrl+滚轮缩放",
+                            "移动画面（本地，不影响远程）",
+                            color = Color.White.copy(alpha = 0.8f),
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                        val panStepX = (viewSize.width * 0.18f).coerceAtLeast(40f)
+                        val panStepY = (viewSize.height * 0.18f).coerceAtLeast(40f)
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            androidx.compose.material3.OutlinedButton(onClick = {
+                                panLocalBy(Offset(-panStepX, 0f))
+                            }) { Icon(Icons.Filled.KeyboardArrowLeft, "左移", tint = Color.White); Text(" 左") }
+                            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                androidx.compose.material3.OutlinedButton(onClick = {
+                                    panLocalBy(Offset(0f, -panStepY))
+                                }) { Icon(Icons.Filled.KeyboardArrowUp, "上移", tint = Color.White); Text(" 上") }
+                                androidx.compose.material3.OutlinedButton(onClick = {
+                                    panLocalBy(Offset(0f, panStepY))
+                                }) { Icon(Icons.Filled.KeyboardArrowDown, "下移", tint = Color.White); Text(" 下") }
+                            }
+                            androidx.compose.material3.OutlinedButton(onClick = {
+                                panLocalBy(Offset(panStepX, 0f))
+                            }) { Icon(Icons.Filled.KeyboardArrowRight, "右移", tint = Color.White); Text(" 右") }
+                        }
+                        Text(
+                            "只缩放/移动本机画面，不改变远程分辨率与远程操作 · 触屏：双指捏合缩放，放大后单指拖动平移 · 桌面：Ctrl+滚轮缩放，放大后鼠标拖拽/中键拖拽平移",
                             color = Color.White.copy(alpha = 0.6f),
                             style = MaterialTheme.typography.labelSmall
                         )
@@ -1368,6 +1535,25 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     }
                 }
             )
+        }
+
+        // ============ v2.7.0：音频流状态提示（服务器音频管线无数据时自动恢复/透明化） ============
+        if (audioStallNotice != null && status == SelkiesSession.Status.CONNECTED) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = 52.dp),
+                shape = RoundedCornerShape(8.dp),
+                color = Color.Black.copy(alpha = 0.72f)
+            ) {
+                Text(
+                    audioStallNotice ?: "",
+                    color = Color(0xFFF59E0B),
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                )
+            }
         }
 
         // ============ 录屏指示器（红点闪烁 + 时长） ============

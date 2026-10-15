@@ -619,7 +619,7 @@ fun CompleteKeyboard(
                     },
                 shape = RoundedCornerShape(12.dp),
                 color = Color(0xF0161B22),
-                shadowElevation = 10.dp
+                // v2.7.0: shadowElevation 移除——SOFTWARE 渲染内容丢失 bug
             ) {
                 Column(modifier = Modifier.padding(3.dp)) {
                     // ---------- 拖动头 + 分类页签（可横向滑动） + 模式/缩放控制 ----------

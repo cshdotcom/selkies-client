@@ -48,8 +48,9 @@ class StreamRecorder(
     var bytesCaptured: Long = 0
         private set
 
-    /** 录屏完成（无论成功与否）→ 回调（路径 null = 失败/无内容） */
-    var onSaved: ((path: String?, frames: Long, error: String?) -> Unit)? = null
+    /** 录屏完成（无论成功与否）→ 回调（路径 null = 失败/无内容）
+     *  v2.7.0：kind = "final"（用户停止/退出）| "segment"（分辨率切换自动分段，UI 静默处理）| "empty"（空录制） */
+    var onSaved: ((path: String?, frames: Long, error: String?, kind: String) -> Unit)? = null
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var muxer: com.selkies.client.platform.StreamMuxer? = null
@@ -67,6 +68,9 @@ class StreamRecorder(
     private var jpegCanvasH = 0
     private var jpegParts = ArrayList<Pair<Int, ByteArray>>() // (stripeY, jpeg)
     private var lastJpegPts = 0L
+
+    // v2.7.0：缓冲硬上限（防 OOM 闪退——旧版 240 帧高码率关键帧可累积 >100MB）
+    private var pendingBytes = 0L
 
     /** 是否包含远程音频 */
     var includeAudio = true
@@ -113,11 +117,11 @@ class StreamRecorder(
                     muxer?.close()
                     muxer = null
                     state = State.DONE
-                    onSaved?.invoke(null, 0, "此设备不支持录制 ${header.codecName} 流")
+                    onSaved?.invoke(null, 0, "此设备不支持录制 ${header.codecName} 流", "final")
                     return
                 }
             } else if (header.codecId != videoCodecId || header.width != width || header.height != height) {
-                // 分辨率/编码器切换：结束当前文件（分段保存），新文件由会话层重建
+                // 分辨率/编码器切换：结束当前段（自动分段保存，会话层续开新段）
                 stopAndSaveInternal(trigger = "分辨率切换")
                 return
             }
@@ -194,6 +198,7 @@ class StreamRecorder(
         var path: String? = null
         var frames = 0L
         var error: String? = null
+        var kind = if (trigger == "分辨率切换") "segment" else "final"
         synchronized(this) {
             if (state != State.RECORDING) return
             state = State.FINALIZING
@@ -214,10 +219,10 @@ class StreamRecorder(
         if (videoFramesWritten == 0L && audioFramesWritten == 0L) {
             // 空录制：删除文件避免垃圾
             path?.let { runCatching { java.io.File(it).delete() } }
-            onSaved?.invoke(null, 0, "录制内容为空")
+            onSaved?.invoke(null, 0, "录制内容为空", "empty")
             return
         }
-        onSaved?.invoke(path, frames, error)
+        onSaved?.invoke(path, frames, error, kind)
     }
 
     private fun stopAndSaveInternal(trigger: String) {

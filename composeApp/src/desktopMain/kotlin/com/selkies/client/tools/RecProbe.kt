@@ -102,7 +102,7 @@ object RecProbe {
             override fun showSoftInput(show: Boolean) {}
             override fun isTouchDevice(): Boolean = false
             override fun nativeKeyCodeToKeysym(nativeKeyCode: Int, unicodeChar: Int): Int? = null
-            override fun setPhysicalKeyHandler(handler: ((Int, Boolean) -> Unit)?) {}
+            override fun setPhysicalKeyHandler(handler: ((Int, Boolean) -> Boolean)?) {}
             override fun readFileBytes(path: String): ByteArray? = null
             override fun exitApp() {}
             override fun openFile(path: String) {}
@@ -136,7 +136,7 @@ object RecProbe {
         val savedInfo = AtomicReference<Triple<String?, Long, String?>?>(null)
 
         val ok = session.startRecording()
-        session.recorder.onSaved = { p, frames, err ->
+        session.recorder.onSaved = { p, frames, err, _ ->
             savedInfo.set(Triple(p, frames, err)); saved.countDown()
         }
         println("[录制] startRecording=$ok state=${session.recorder.state} path=$recPath")

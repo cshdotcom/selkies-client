@@ -82,6 +82,29 @@ object GuiProbe {
                         robot.mouseWheel(arg.toInt())
                         println("[wheel] $arg")
                     }
+                    "moveto" -> {
+                        val xy = arg.split(",")
+                        robot.mouseMove(xy[0].toInt(), xy[1].toInt())
+                        Thread.sleep(150)
+                        println("[moveto] $arg")
+                    }
+                    "combo" -> {
+                        // 组合键物理按下（快捷键录制盒捕获验证）：combo:CONTROL,C
+                        val keys = arg.split(",").map { it.trim() }
+                        for (k in keys) robot.keyPress(KeyEvent::class.java.getField("VK_$k").getInt(null))
+                        Thread.sleep(120)
+                        for (k in keys.reversed()) robot.keyRelease(KeyEvent::class.java.getField("VK_$k").getInt(null))
+                        println("[combo] $arg")
+                    }
+                    "ctrlwheel" -> {
+                        // Ctrl+滚轮（本地缩放）：ctrlwheel:2
+                        robot.keyPress(KeyEvent.VK_CONTROL)
+                        Thread.sleep(60)
+                        robot.mouseWheel(arg.toInt())
+                        Thread.sleep(60)
+                        robot.keyRelease(KeyEvent.VK_CONTROL)
+                        println("[ctrlwheel] $arg")
+                    }
                     else -> println("[??] $step")
                 }
             } catch (e: Exception) {

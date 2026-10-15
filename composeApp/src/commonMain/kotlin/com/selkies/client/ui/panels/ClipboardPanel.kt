@@ -103,6 +103,12 @@ fun ClipboardPanel(state: AppState, session: SelkiesSession) {
             state.store.settings.value.clipboardAutoReceive = it
             state.store.saveSettings()
         }
+        var pollSync by remember { mutableStateOf(state.store.settings.value.clipboardPollSync) }
+        SettingSwitch("可靠同步（前台定时拉取）", pollSync) {
+            pollSync = it
+            state.store.settings.value.clipboardPollSync = it
+            state.store.saveSettings()
+        }
 
         // 本地剪贴板
         SectionCard("本机剪贴板") {
