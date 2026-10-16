@@ -92,8 +92,8 @@ android {
         applicationId = "com.selkies.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 20700
-        versionName = "2.7.0"
+        versionCode = 20701
+        versionName = "2.7.1"
         ndkVersion = ""
     }
     signingConfigs {
@@ -131,7 +131,7 @@ compose.desktop {
         mainClass = "com.selkies.client.MainKt"
         nativeDistributions {
             packageName = "Selkies-Desktop"
-            packageVersion = "2.7.0"
+            packageVersion = "2.7.1"
             description = "Selkies 远程桌面原生客户端"
             vendor = "Selkies Client"
         }
@@ -148,7 +148,7 @@ val desktopFatJar = tasks.register<Jar>("desktopFatJar") {
     manifest {
         attributes["Main-Class"] = "com.selkies.client.MainKt"
         attributes["Implementation-Title"] = "Selkies Desktop Client"
-        attributes["Implementation-Version"] = "2.7.0"
+        attributes["Implementation-Version"] = "2.7.1"
     }
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
     exclude("META-INF/versions/**/module-info.class")
@@ -242,4 +242,12 @@ tasks.register<JavaExec>("probeV27") {
     for (k in listOf("probeUrl", "probeUser", "probePass")) {
         if (project.hasProperty(k)) systemProperty(k, project.property(k).toString())
     }
+}
+
+tasks.register<JavaExec>("probeAudioSink") {
+    group = "verification"
+    description = "v2.7.1 音频播放管线自检：Opus 解码 → PCM → SourceDataLine（不依赖服务器）"
+    mainClass.set("com.selkies.client.tools.AudioSinkProbe")
+    val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
+    classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
 }

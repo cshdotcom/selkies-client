@@ -33,6 +33,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DevicesOther
 import androidx.compose.material.icons.filled.Folder
@@ -452,12 +453,13 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         }
     }
 
-    // 全屏模式：工具栏闲置 4 秒自动隐藏（顶部/底部边缘触碰或鼠标移近唤出）
+    // 全屏模式：工具栏闲置自动隐藏（顶部/底部边缘内滑或鼠标移近唤出）
+    // v2.7.1：4s → 2.5s（更快让位给远程画面）；且全屏中触摸远程画面会立即隐藏（见触屏 Press 分支）
     LaunchedEffect(fullscreen, toolbarVisible) {
         if (fullscreen && toolbarVisible) {
             while (fullscreen && toolbarVisible) {
                 delay(500)
-                if (System.currentTimeMillis() - toolbarShowAt >= 4000) {
+                if (System.currentTimeMillis() - toolbarShowAt >= 2500) {
                     toolbarVisible = false
                 }
             }
@@ -638,6 +640,13 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                         val edgeRevealPx = 36f
                         val mousePanSlop = 6f
 
+                        // ---- v2.7.1：触屏边缘滑动唤出工具栏（防误触）----
+                        // 起点：pressOrigin（不动）；pressFromEdge：-1=从顶边缘按下 / 1=从底边缘按下 / 0=非边缘。
+                        // 唤出条件 = 起点在边缘带(12px)内且向内滑动 >28px——单纯点击/操作远程画面
+                        // 顶部（如浏览器标签栏、任务栏）不会误触唤出工具栏。
+                        var pressOrigin = Offset.Zero
+                        var pressFromEdge = 0
+
                         fun endTouchSession(sendRelease: Boolean) {
                             if (leftDownSent && sendRelease && !viewOnly) {
                                 if (inputMode == InputMode.TOUCH) {
@@ -784,9 +793,22 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                         // 新的单指会话
                                         pressStart = System.currentTimeMillis()
                                         pressPos = touchChanges.first().position
+                                        pressOrigin = pressPos
+                                        // v2.7.1：起点是否在屏幕顶/底边缘带内（用于「向内滑动唤出工具栏」判定）
+                                        pressFromEdge = when {
+                                            pressPos.y <= 12f -> -1
+                                            pressPos.y >= viewSize.height - 12f -> 1
+                                            else -> 0
+                                        }
                                         touchMoved = false
                                         longFired = false
                                         leftDownSent = false
+                                        // v2.7.1【全屏工具栏不挡触屏】：全屏 + 工具栏可见时，触摸远程画面
+                                        // → 工具栏立即隐藏让位；本次触摸照常发送远程（等效点击穿透）。
+                                        // 远程画面顶部/底部元素从此可以直接点到，无需等 4 秒超时。
+                                        if (fullscreen && toolbarVisible) {
+                                            toolbarVisible = false
+                                        }
                                         if (!viewOnly) {
                                             if (localZoom > 1.01f) {
                                                 // v2.7.0：放大状态单指拖动 = 本地平移；点击延迟到松手判定
@@ -845,17 +867,22 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                         if (!touchMoved && hypot(delta.x, delta.y) > TAP_SLOP_PX) {
                                             touchMoved = true
                                         }
+                                        // v2.7.1【边缘滑动唤出·防误触】：起点在屏幕顶/底边缘带(12px)内且向内滑动
+                                        // >28px 才唤出工具栏；任何缩放状态均可用（v2.7.0 旧逻辑错嵌在放大镜
+                                        // 分支内，未放大时不生效，且「移动到边缘即唤出」会误触——点击远程画面
+                                        // 顶部标签栏/任务栏时把工具栏唤出来挡住，正是用户报的「阻挡部分触屏」）。
+                                        if (fullscreen && !toolbarVisible && pressFromEdge != 0) {
+                                            val inward = if (pressFromEdge < 0) pos.y - pressOrigin.y else pressOrigin.y - pos.y
+                                            if (inward > 28f) {
+                                                toolbarShowAt = System.currentTimeMillis()
+                                                toolbarVisible = true
+                                                pressFromEdge = 0
+                                            }
+                                        }
                                         if (localZoom > 1.01f) {
                                             // v2.7.0：放大状态单指拖动 = 本地平移画面（不控远程；可拖到未显示区域后轻点）
                                             if (touchMoved) {
                                                 panLocalBy(touchChanges.first().positionChange())
-                                            }
-                                            // v2.7.0：全屏时手指移到顶部/底部边缘 → 唤出工具栏
-                                            if (fullscreen && !toolbarVisible &&
-                                                (pos.y <= 36f || pos.y >= viewSize.height - 36f)
-                                            ) {
-                                                toolbarShowAt = System.currentTimeMillis()
-                                                toolbarVisible = true
                                             }
                                         } else if (!viewOnly && touchMoved) {
                                             if (inputMode == InputMode.TOUCH) {
@@ -1083,14 +1110,22 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         }
 
         // 隐藏工具栏后的唤出按钮
+        // v2.7.1：全屏时缩成小把手（84×20dp、低透明度）——大胶囊本身也挡远程画面顶部触屏；
+        // 全屏主要靠「边缘内滑」唤出，把手只是提示入口；非全屏保持原尺寸
         if (!toolbarVisible && status == SelkiesSession.Status.CONNECTED) {
             Box(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .statusBarsPadding()
                     .padding(top = 4.dp)
-                    .size(width = 120.dp, height = 26.dp)
-                    .background(Color.Black.copy(alpha = 0.35f), RoundedCornerShape(13.dp))
+                    .size(
+                        width = if (fullscreen) 84.dp else 120.dp,
+                        height = if (fullscreen) 20.dp else 26.dp
+                    )
+                    .background(
+                        Color.Black.copy(alpha = if (fullscreen) 0.22f else 0.35f),
+                        RoundedCornerShape(if (fullscreen) 10.dp else 13.dp)
+                    )
                     .clickable {
                         toolbarShowAt = System.currentTimeMillis()
                         toolbarVisible = true
@@ -1098,8 +1133,9 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    if (fullscreen) "显工具栏（或碰屏幕边缘）" else "显示工具栏",
-                    color = Color.White, fontSize = 10.sp,
+                    if (fullscreen) "▼ 工具栏" else "显示工具栏",
+                    color = Color.White.copy(alpha = if (fullscreen) 0.75f else 1f),
+                    fontSize = 10.sp,
                     modifier = Modifier.padding(2.dp)
                 )
             }
@@ -1364,24 +1400,44 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         }
 
         // ============ v2.7.0 本地缩放控制（放大镜：滑条 + 加减/重置 + 方向移动按钮 + 百分比；只调本地显示） ============
+        // 【v2.7.1】放大镜可明确退出：常驻指示旁 ✕ 一键退出 + 面板内「退出放大镜」按钮（恢复 100% 并收起）
         if (status == SelkiesSession.Status.CONNECTED) {
-            // 放大中常驻指示（点按打开控制面板：方向按钮/滑条/重置）
+            // 放大中常驻指示（点按打开控制面板：方向按钮/滑条/重置；✕ = 直接退出放大镜）
             if (localZoom > 1.01f && !showZoomControls) {
                 Surface(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .statusBarsPadding()
-                        .padding(top = 52.dp, end = 6.dp)
-                        .clickable { showZoomControls = true },
+                        .padding(top = 52.dp, end = 6.dp),
                     shape = RoundedCornerShape(8.dp),
                     color = Color.Black.copy(alpha = 0.6f)
                 ) {
-                    Text(
-                        "${(localZoom * 100).toInt()}% ⤢",
-                        color = Color(0xFF7DD3FC),
-                        style = MaterialTheme.typography.labelMedium,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "${(localZoom * 100).toInt()}% ⤢",
+                            color = Color(0xFF7DD3FC),
+                            style = MaterialTheme.typography.labelMedium,
+                            modifier = Modifier
+                                .clickable { showZoomControls = true }
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                        // v2.7.1：退出放大镜（恢复 1x，关闭面板）——修「放大镜点击之后无法退出」
+                        Box(
+                            modifier = Modifier
+                                .clickable {
+                                    localZoom = 1f
+                                    zoomPan = Offset.Zero
+                                    showZoomControls = false
+                                }
+                                .padding(horizontal = 6.dp, vertical = 4.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.Filled.Close, "退出放大镜",
+                                tint = Color(0xFFF87171), modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
                 }
             }
             if (showZoomControls) {
@@ -1428,7 +1484,16 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                             androidx.compose.material3.OutlinedButton(onClick = {
                                 localZoom = 1f; zoomPan = Offset.Zero
                             }) { Text("重置 100%") }
-                            TextButton(onClick = { showZoomControls = false }) { Text("关闭") }
+                            // v2.7.1：明确退出放大镜（恢复 1x + 收起面板）——修「放大镜点击之后无法退出」
+                            androidx.compose.material3.Button(onClick = {
+                                localZoom = 1f
+                                zoomPan = Offset.Zero
+                                showZoomControls = false
+                            }) {
+                                Icon(Icons.Filled.Close, null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                Text(" 退出放大镜")
+                            }
+                            TextButton(onClick = { showZoomControls = false }) { Text("收起") }
                         }
                         Spacer(Modifier.height(6.dp))
                         // v2.7.0：手动移动画面按钮（上下左右；纯本地平移，不控制远程）

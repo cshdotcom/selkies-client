@@ -27,12 +27,22 @@ fun main() {
         glSelfTest()
         return
     }
+    // v2.7.1：窗口尺寸可用 -Dselkies.winsize=1280x400 自定义（默认 1280x800 不变）
+    //   用途：小屏/横屏手机布局实测（完整键盘 fit、工具栏布局）与自动化验证
+    val winSize = runCatching {
+        val p = (System.getProperty("selkies.winsize") ?: "").split("x")
+        require(p.size == 2 && p[0].toInt() > 0 && p[1].toInt() > 0)
+        p[0].toInt() to p[1].toInt()
+    }.getOrNull()
     application {
         DesktopPlatform.init()
         Window(
             onCloseRequest = ::exitApplicationCompat,
             title = "Selkies 远程桌面",
-            state = rememberWindowState(width = 1280.dp, height = 800.dp)
+            state = rememberWindowState(
+                width = (winSize?.first ?: 1280).dp,
+                height = (winSize?.second ?: 800).dp
+            )
         ) {
             // AWT 帧引用（文件选择器 / 全屏控制 / 焦点追踪）
             DesktopPlatform.windowFrame = window

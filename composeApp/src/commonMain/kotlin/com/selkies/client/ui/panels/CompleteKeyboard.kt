@@ -5,6 +5,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -48,6 +50,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -524,9 +527,36 @@ fun CompleteKeyboard(
     val density = LocalDensity.current
     var kbWidthDp by remember { mutableStateOf(0f) }
 
+    // 【v2.7.1 修复·完整键盘显示不完整】根因：完整模式 6 行网格在横屏矮屏/用户放大过的 scale 下
+    // 总高度超过屏幕高度，BottomCenter 对齐使顶部行被推出屏幕外裁掉（只能看到下面几行）。
+    // 修复三件套：
+    //   ① fitFullScale()：高度方向能容纳全部 6 行的最大 scale（chrome=头部行+内边距保守 66dp）
+    //   ② 打开/切到完整模式时自动把 scale clamp 到 fit（打开即完整可见；用户仍可手动放大，配合③滚动查看）
+    //   ③ 键区加 verticalScroll + Surface 高度上限——即使内容超高也不再裁切，可上下滚动
+    fun fitFullScale(): Float {
+        if (parentSize == IntSize.Zero) return 2f
+        val hDp = with(density) { parentSize.height.toDp().value }
+        // 完整模式 6 行键 + 5 间隙 ≈ (6×34 + 5×2.8)×scale ≈ 218×scale；头部行/内边距保守 66dp
+        val availH = hDp * 0.92f - 66f
+        if (availH <= 60f) return 0.3f   // 极矮屏：交由纵向滚动兜底
+        return (availH / 218f).coerceIn(0.3f, 2f)
+    }
+
     fun doScale(f: Float) {
         scale = (scale * f).coerceIn(if (fullMode) 0.3f else 0.55f, if (fullMode) 2.0f else 1.6f)
         onScaleChange(scale)
+    }
+
+    // 【v2.7.1】打开键盘即处于完整模式（savedFullMode）或父容器尺寸就绪时：
+    // 同样把 scale clamp 到高度适配值——保证「打开即 6 行全部可见」，不再出现顶部行被裁。
+    LaunchedEffect(fullMode, parentSize) {
+        if (fullMode && parentSize != IntSize.Zero) {
+            val fit = fitFullScale()
+            if (scale > fit) {
+                scale = fit
+                onScaleChange(fit)
+            }
+        }
     }
 
     /** 发送普通键（含粘滞修饰键组合） */
@@ -602,6 +632,10 @@ fun CompleteKeyboard(
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
+                    // 【v2.7.1】高度上限 = 父容器 92%：完整模式内容再高也不会把顶部行推出屏幕
+                    .heightIn(max = if (parentSize != IntSize.Zero)
+                        with(density) { (parentSize.height * 0.92f).toInt().toDp() } else Dp.Unspecified
+                    )
                     .padding(horizontal = if (fullMode) 0.dp else 3.dp, vertical = 4.dp)
                     .offset { offset }
                     .onSizeChanged { kbSize = it }
@@ -688,6 +722,11 @@ fun CompleteKeyboard(
                         ) {
                             fullMode = !fullMode
                             tab = if (fullMode) KbTab.FULL else KbTab.MAIN
+                            // 【v2.7.1】切到完整模式：scale 超出高度适配值时自动降到 fit（打开即 6 行全可见）
+                            if (fullMode) {
+                                val fit = fitFullScale()
+                                if (scale > fit) { scale = fit; onScaleChange(fit) }
+                            }
                             onFullModeChange(fullMode)
                         }
                         KbIcon(Icons.Filled.Remove, "缩小") { doScale(1f / 1.15f) }
@@ -809,6 +848,7 @@ fun CompleteKeyboard(
 
                     if (fullMode && tab == KbTab.FULL) {
                         // 完整模式：真实单位宽度（可超出屏幕，横向滚动查看全键盘）
+                        // 【v2.7.1】+ 纵向滚动：scale 放大后 6 行超出可见高度时不再裁切，上下滚动可达全部按键
                         val unitDp = (34f * scale).coerceAtLeast(12f)
                         val gridWidthDp = (23f * unitDp + 8f)
                         val screenDp = kbWidthDp
@@ -816,6 +856,7 @@ fun CompleteKeyboard(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .horizontalScroll(rememberScrollState())
+                                .verticalScroll(rememberScrollState())
                         ) {
                             Column(
                                 modifier = Modifier
