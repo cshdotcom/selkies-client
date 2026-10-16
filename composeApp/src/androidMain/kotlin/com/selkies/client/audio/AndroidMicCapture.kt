@@ -34,11 +34,14 @@ class AndroidMicCapture : MicCapture {
     override val active: Boolean get() = running
 
     companion object {
-        /** 枚举麦克风设备（内置/外接/蓝牙） */
+        /** 枚举麦克风设备（内置/外接/蓝牙）
+         *  v2.7.4【名称修复】：Android 的 productName 在多个内置麦上常完全相同（SoC 名），
+         *  旧版显示"设备名称都一样"无法区分。现在用 类型+位置(address)+序号 组合成
+         *  用户可辨认的名称（如"内置麦克风 1（机身底部）""内置麦克风 2（机身顶部）"）。 */
         fun devices(): List<HardwareDevice> {
             val ctx = runCatching { AndroidPlatform.appCtx() }.getOrNull() ?: return emptyList()
             val am = ctx.getSystemService(android.content.Context.AUDIO_SERVICE) as? AudioManager ?: return emptyList()
-            return am.getDevices(AudioManager.GET_DEVICES_INPUTS)
+            val raw = am.getDevices(AudioManager.GET_DEVICES_INPUTS)
                 .filter {
                     it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC ||
                             it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
@@ -48,22 +51,47 @@ class AndroidMicCapture : MicCapture {
                             it.type == AudioDeviceInfo.TYPE_FM_TUNER ||
                             it.type == AudioDeviceInfo.TYPE_TELEPHONY
                 }
-                .mapIndexed { idx, d ->
-                    val kind = when (d.type) {
-                        AudioDeviceInfo.TYPE_BUILTIN_MIC -> "内置麦克风"
-                        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "有线耳机麦克风"
-                        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "蓝牙麦克风"
-                        AudioDeviceInfo.TYPE_USB_DEVICE, AudioDeviceInfo.TYPE_USB_HEADSET -> "USB 麦克风"
-                        else -> "其他输入"
-                    }
-                    val addr = d.address?.ifBlank { null }
-                    HardwareDevice(
-                        id = addr ?: "mic-$idx",
-                        name = d.productName?.toString()?.ifBlank { kind } ?: kind,
-                        type = "mic",
-                        detail = kind + (addr?.let { " · $it" } ?: "")
-                    )
+            // 同类型计数（生成 #1/#2 序号）
+            val typeCount = HashMap<Int, Int>()
+            val typeSeen = HashMap<Int, Int>()
+            for (d in raw) typeCount[d.type] = (typeCount[d.type] ?: 0) + 1
+            return raw.mapIndexed { idx, d ->
+                val kind = when (d.type) {
+                    AudioDeviceInfo.TYPE_BUILTIN_MIC -> "内置麦克风"
+                    AudioDeviceInfo.TYPE_WIRED_HEADSET -> "有线耳机麦克风"
+                    AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "蓝牙麦克风"
+                    AudioDeviceInfo.TYPE_USB_DEVICE, AudioDeviceInfo.TYPE_USB_HEADSET -> "USB 麦克风"
+                    else -> "其他输入"
                 }
+                val addr = d.address?.ifBlank { null }?.lowercase()
+                // 位置描述（Android 常见 address 值）
+                val pos = when (addr) {
+                    "bottom" -> "机身底部"
+                    "top" -> "机身顶部"
+                    "back" -> "机身背部"
+                    "front" -> "机身前部"
+                    "mic" -> null
+                    else -> addr?.takeIf { it.isNotBlank() && it != kind.lowercase() }
+                }
+                // 同类型多于 1 个 → 加序号；productName 有区分度时优先展示
+                typeSeen[d.type] = (typeSeen[d.type] ?: 0) + 1
+                val seq = if ((typeCount[d.type] ?: 0) > 1) " ${typeSeen[d.type]}" else ""
+                val product = d.productName?.toString()?.ifBlank { null }?.take(24)
+                // productName 与类型名相同/是 SoC 无区分度时不用
+                val productUseful = product != null && !product.equals(kind, true) && !addr.equals(product, true)
+                val name = buildString {
+                    append(kind).append(seq)
+                    if (productUseful && pos == null) append("（$product）")
+                    else if (pos != null) append("（$pos）")
+                }
+                val address = d.address?.ifBlank { null }
+                HardwareDevice(
+                    id = address ?: "mic-$idx",
+                    name = name,
+                    type = "mic",
+                    detail = kind + (address?.let { " · $it" } ?: "")
+                )
+            }
         }
     }
 

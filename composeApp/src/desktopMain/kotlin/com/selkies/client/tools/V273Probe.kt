@@ -195,6 +195,12 @@ object V273Probe {
         override fun vibrate(ms: Long) {}
         override fun openUrl(url: String) {}
         override fun pickFiles(mimeTypes: List<String>, onResult: (List<PickedFile>) -> Unit) { onResult(emptyList()) }
+
+        override fun saveFileWithPicker(
+            suggestedName: String,
+            mime: String,
+            onResult: (com.selkies.client.platform.PickedSaveTarget?) -> Unit
+        ) { onResult(null) }
         override fun saveFile(suggestedName: String, bytes: ByteArray, onDone: (Boolean) -> Unit) { onDone(true) }
         override fun makeVideoSink(): VideoSink = object : VideoSink {
             override val firstFrameRendered = MutableStateFlow(false)

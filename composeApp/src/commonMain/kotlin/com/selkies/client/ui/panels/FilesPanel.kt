@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material.icons.filled.Share
@@ -206,21 +207,23 @@ fun FilesPanel(state: AppState, session: SelkiesSession) {
                     FileRow(
                         entry = entry,
                         selectMode = selectMode,
-                        selected = entry.path in selected
-                    ) {
-                        if (selectMode) {
-                            if (!entry.isDir) {
-                                selected = if (entry.path in selected) selected - entry.path else selected + entry.path
+                        selected = entry.path in selected,
+                        onSaveAs = { session.filesClient.downloadToPicker(entry.path, entry.name) },
+                        onClick = {
+                            if (selectMode) {
+                                if (!entry.isDir) {
+                                    selected = if (entry.path in selected) selected - entry.path else selected + entry.path
+                                }
+                            } else if (entry.isDir) {
+                                // 目录：href 已带尾斜杠，直接列出（无需 301 探测——秒开）
+                                load(entry.path)
+                            } else {
+                                // 下载到媒体库分类目录（自动时间戳命名 + 保存引导）
+                                session.filesClient.downloadToMedia(entry.path, entry.name)
+                                showTransfers = true
                             }
-                        } else if (entry.isDir) {
-                            // 目录：href 已带尾斜杠，直接列出（无需 301 探测——秒开）
-                            load(entry.path)
-                        } else {
-                            // 下载到媒体库分类目录（自动时间戳命名 + 保存引导）
-                            session.filesClient.downloadToMedia(entry.path, entry.name)
-                            showTransfers = true
                         }
-                    }
+                    )
                 }
             }
         } else {
@@ -324,7 +327,13 @@ private fun formatBytes(b: Long): String = when {
 }
 
 @Composable
-private fun FileRow(entry: RemoteFileEntry, selectMode: Boolean = false, selected: Boolean = false, onClick: () -> Unit) {
+private fun FileRow(
+    entry: RemoteFileEntry,
+    selectMode: Boolean = false,
+    selected: Boolean = false,
+    onClick: () -> Unit,
+    onSaveAs: (() -> Unit)? = null
+) {
     Surface(
         shape = RoundedCornerShape(8.dp),
         color = if (selected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
@@ -363,6 +372,18 @@ private fun FileRow(entry: RemoteFileEntry, selectMode: Boolean = false, selecte
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            // v2.7.4：非多选、非目录时提供「另存为」（选任意位置的文件选择器）
+            if (!selectMode && !entry.isDir && onSaveAs != null) {
+                Spacer(Modifier.size(4.dp))
+                IconButton(onClick = onSaveAs, modifier = Modifier.size(30.dp)) {
+                    Icon(
+                        Icons.Filled.SaveAlt,
+                        "另存为（选择保存位置）",
+                        modifier = Modifier.size(16.dp),
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
         }
     }
 }

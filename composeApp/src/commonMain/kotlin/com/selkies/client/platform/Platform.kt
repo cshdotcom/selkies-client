@@ -170,6 +170,16 @@ interface MediaStoreBridge {
 /** 文件选择/保存结果 */
 data class PickedFile(val name: String, val path: String, val size: Long)
 
+/** v2.7.4：「另存为」目标——用户在系统选择器选定的可写位置 */
+data class PickedSaveTarget(
+    /** 展示名（含扩展） */
+    val displayName: String,
+    /** 打开可写输出流（调用方负责 close） */
+    val open: () -> java.io.OutputStream?,
+    /** 展示用真实路径（Android SAF 拿不到绝对路径时为 uri.toString） */
+    val displayPath: String
+)
+
 /** 平台服务集合——由 Android/Desktop 各自提供 */
 interface PlatformServices {
     val platformName: String
@@ -182,6 +192,14 @@ interface PlatformServices {
     fun pickFiles(mimeTypes: List<String>, onResult: (List<PickedFile>) -> Unit)
     /** 保存字节到用户选择位置 */
     fun saveFile(suggestedName: String, bytes: ByteArray, onDone: (Boolean) -> Unit)
+    /** v2.7.4：弹出系统「另存为」选择器，返回用户选择的可写输出流目标（绝对路径/URI）。
+     *  Android=SAF CreateDocument；Desktop=JFileChooser 保存对话框。
+     *  用户取消时 onResult(null)。 */
+    fun saveFileWithPicker(
+        suggestedName: String,
+        mime: String,
+        onResult: (PickedSaveTarget?) -> Unit
+    )
     fun makeVideoSink(): VideoSink
     fun makeAudioPlayer(): AudioPlayer
     fun makeMicCapture(): MicCapture

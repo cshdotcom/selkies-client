@@ -86,6 +86,9 @@ object AndroidPlatform : PlatformServices {
     private var saveLauncher: androidx.activity.result.ActivityResultLauncher<String>? = null
     private var permLauncher: androidx.activity.result.ActivityResultLauncher<Array<String>>? = null
     private var pendingPerm: ((Boolean) -> Unit)? = null
+    // v2.7.4：另存为选择器（SAF CreateDocument，按 MIME 分类型）
+    private var savePickerLauncher: androidx.activity.result.ActivityResultLauncher<String>? = null
+    private var pendingSaveTarget: ((PickedSaveTarget?) -> Unit)? = null
 
     private val clipboardBridge = AndroidClipboardBridge()
 
@@ -131,6 +134,19 @@ object AndroidPlatform : PlatformServices {
             pendingSave = null
             pendingSaveBytes = null
             cb?.invoke(ok)
+        }
+        // v2.7.4：另存为选择器——用户选定位置后回传可写目标（不落字节，由调用方流式写入）
+        savePickerLauncher = activity.registerForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+            val cb = pendingSaveTarget
+            pendingSaveTarget = null
+            if (uri == null) { cb?.invoke(null); return@registerForActivityResult }
+            val resolver = activity.contentResolver
+            val target = PickedSaveTarget(
+                displayName = uri.lastPathSegment?.substringAfterLast('/') ?: "file",
+                open = { runCatching { resolver.openOutputStream(uri, "wt") }.getOrNull() },
+                displayPath = uri.toString()
+            )
+            cb?.invoke(target)
         }
         permLauncher = activity.registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
             val cb = pendingPerm
@@ -269,6 +285,21 @@ object AndroidPlatform : PlatformServices {
         pendingSaveBytes = bytes
         pendingSaveName = suggestedName
         launcher.launch(suggestedName)
+    }
+
+    /** v2.7.4：另存为（SAF）——用户选任意位置（含 U 盘/网盘/任意目录），流式写入 */
+    override fun saveFileWithPicker(
+        suggestedName: String,
+        mime: String,
+        onResult: (PickedSaveTarget?) -> Unit
+    ) {
+        val launcher = savePickerLauncher
+        val act = activityRef
+        if (launcher == null || act == null) { onResult(null); return }
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            pendingSaveTarget = onResult
+            launcher.launch(suggestedName)
+        }
     }
 
     override fun makeVideoSink(): VideoSink {

@@ -103,8 +103,16 @@ class AndroidMediaStoreBridge(private val ctx: Context) : MediaStoreBridge {
             val uri = ctx.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
                 ?: return null
             val os = ctx.contentResolver.openOutputStream(uri) ?: return null
+            // v2.7.4【真实路径修复】：content:// URI 对用户不可认知（「保存位置不是真实路径」根因）。
+            // 查询 DATA 列拿到 /storage/emulated/0/Download/Selkies/xxx 真实绝对路径；
+            // 查不到时回退构造 RELATIVE_PATH + 文件名的可读路径。
+            val realPath = runCatching {
+                ctx.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DATA), null, null, null)?.use { c ->
+                    if (c.moveToFirst()) c.getString(0) else null
+                }
+            }.getOrNull() ?: "/storage/emulated/0/Download/Selkies/$fileName"
             object : OutputStreamHandle {
-                override val path: String = uri.toString()
+                override val path: String = realPath
                 override fun write(bytes: ByteArray, off: Int, len: Int) = os.write(bytes, off, len)
                 override fun close() = os.close()
             }
@@ -664,8 +672,12 @@ private class JpegH264Encoder(
         val canvas = Canvas(bmp)
         for ((y, s) in stripes) canvas.drawBitmap(s, 0f, y.toFloat(), null)
         stripes.forEach { it.second.recycle() }
+        // v2.7.4【录屏闪退根因修复】：lockHardwareCanvas 在非渲染线程对 MediaCodec inputSurface
+        // 调用在大量设备（Android 11+，尤其部分 OEM）上 native crash（EXCEPTION_ACCESS_VIOLATION）。
+        // 用户实测「点击录屏后过 2 秒闪退」= 首关键帧到达 → JPEG 转码启动 → hardware canvas 崩溃。
+        // 改用 lockCanvas（CPU 软件画布）：MediaCodec inputSurface 的传统稳定路径，兼容性好。
         runCatching {
-            val c = surface.lockHardwareCanvas()
+            val c = surface.lockCanvas(null)
             c.drawBitmap(bmp, 0f, 0f, null)
             surface.unlockCanvasAndPost(c)
         }.onFailure { return false }

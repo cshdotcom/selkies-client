@@ -234,6 +234,12 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     val serverWebcamEnabled by session.serverWebcamEnabled.collectAsState()
     val serverAudioEnabled by session.serverAudioEnabled.collectAsState()
     val audioStallNotice by session.audioStallNotice.collectAsState()
+    // v2.7.4：音频警告用户已关闭标记（新警告出现时重置；同一警告不再打扰）
+    var audioNoticeDismissed by remember { mutableStateOf(false) }
+    LaunchedEffect(audioStallNotice) {
+        // 新的警告文案出现 → 重新允许显示
+        if (audioStallNotice != null) audioNoticeDismissed = false
+    }
 
     // v2.6.0：工具栏自定义顺序
     val toolbarOrder = remember(state.store.settings.value.toolbarOrder) {
@@ -471,6 +477,12 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     }
 
     LaunchedEffect(fullscreen) { platform.setFullscreen(fullscreen) }
+
+    // v2.7.4：进入全屏时自动收起快捷按钮栏——修「全屏底部工具栏按钮挡住视线」；
+    // 退出全屏不自动恢复（用户按需再开）。悬浮键盘保留（打字场景常见），可手动关。
+    LaunchedEffect(fullscreen) {
+        if (fullscreen && quickBar) quickBar = false
+    }
 
     // ---------- 输入方式选择（软键盘 / 系统输入法 / 快捷按钮）----------
     fun openInputMethod(kind: String) {
@@ -1426,7 +1438,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                 .clickable { showZoomControls = true }
                                 .padding(horizontal = 8.dp, vertical = 4.dp)
                         )
-                        // v2.7.1：退出放大镜（恢复 1x，关闭面板）——修「放大镜点击之后无法退出」
+                        // v2.7.1：退出放大镜（恢复 1x，关闭面板）；v2.7.4 命中区域增大（用户反馈找不到退出）
                         Box(
                             modifier = Modifier
                                 .clickable {
@@ -1434,14 +1446,33 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                     zoomPan = Offset.Zero
                                     showZoomControls = false
                                 }
-                                .padding(horizontal = 6.dp, vertical = 4.dp),
+                                .padding(horizontal = 8.dp, vertical = 6.dp),
                             contentAlignment = Alignment.Center
                         ) {
-                            Icon(
-                                Icons.Filled.Close, "退出放大镜",
-                                tint = Color(0xFFF87171), modifier = Modifier.size(16.dp)
-                            )
+                            Text("退出", color = Color(0xFFF87171), style = MaterialTheme.typography.labelMedium)
                         }
+                    }
+                }
+                // v2.7.4：右下角常驻大号「退出放大」按钮（一击退出；比顶部小指示更直观）
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(end = 14.dp, bottom = 18.dp)
+                        .clickable {
+                            localZoom = 1f
+                            zoomPan = Offset.Zero
+                            showZoomControls = false
+                        },
+                    shape = RoundedCornerShape(18.dp),
+                    color = Color.Black.copy(alpha = 0.62f)
+                ) {
+                    Row(
+                        Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Filled.Close, null, tint = Color(0xFFF87171), modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("退出放大", color = Color.White, style = MaterialTheme.typography.labelMedium)
                     }
                 }
             }
@@ -1608,7 +1639,14 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         }
 
         // ============ v2.7.0：音频流状态提示（服务器音频管线无数据时自动恢复/透明化） ============
-        if (audioStallNotice != null && status == SelkiesSession.Status.CONNECTED) {
+        // 【v2.7.4】可关闭（✕）+ 20s 无新内容自动收起——修「警告无法关闭遮挡视线」；
+        // 用户主动关闭后本次连接内不再弹（直到新的恢复尝试发生）
+        if (audioStallNotice != null && status == SelkiesSession.Status.CONNECTED && !audioNoticeDismissed) {
+            LaunchedEffect(audioStallNotice) {
+                // 同一提示文案 20s 后自动收起（避免长期遮挡远程画面）
+                kotlinx.coroutines.delay(20_000)
+                audioNoticeDismissed = true
+            }
             Surface(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
@@ -1617,12 +1655,26 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                 shape = RoundedCornerShape(8.dp),
                 color = Color.Black.copy(alpha = 0.72f)
             ) {
-                Text(
-                    audioStallNotice ?: "",
-                    color = Color(0xFFF59E0B),
-                    style = MaterialTheme.typography.labelSmall,
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(start = 10.dp, end = 2.dp, top = 2.dp, bottom = 2.dp)
+                ) {
+                    Text(
+                        audioStallNotice ?: "",
+                        color = Color(0xFFF59E0B),
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.weight(1f, fill = false).padding(vertical = 3.dp)
+                    )
+                    androidx.compose.material3.IconButton(
+                        onClick = { audioNoticeDismissed = true },
+                        modifier = Modifier.size(24.dp)
+                    ) {
+                        Icon(
+                            Icons.Filled.Close, "关闭警告",
+                            tint = Color(0xFFF59E0B), modifier = Modifier.size(14.dp)
+                        )
+                    }
+                }
             }
         }
 

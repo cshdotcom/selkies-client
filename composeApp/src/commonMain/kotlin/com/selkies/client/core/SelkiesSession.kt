@@ -975,7 +975,10 @@ class SelkiesSession(
         runCatching {
             when (data[0]) {
                 Protocol.FRAME_AUDIO -> {
-                    if (role.value == "viewer") return
+                    // v2.7.4【关键修复】：viewer 角色也播放音频——对齐官方 web 客户端
+                    // （官方 0x01 接收仅门控 audioPort && audioOn && primary，无 role 检查；
+                    //   服务器 _hears_audio 也向 viewer 广播）。旧版 viewer 直接 return 丢帧 =
+                    // 多客户端竞争被降级 viewer 时「网页能听、App 无声」的根因之一。
                     val frames = Protocol.parseAudioFrames(data, length, audioParseState)
                     for ((opus, quiet) in frames) {
                         if (quiet) {

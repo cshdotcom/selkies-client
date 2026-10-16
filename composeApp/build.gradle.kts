@@ -92,8 +92,8 @@ android {
         applicationId = "com.selkies.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 20703
-        versionName = "2.7.3"
+        versionCode = 20704
+        versionName = "2.7.4"
         ndkVersion = ""
     }
     signingConfigs {
@@ -131,7 +131,7 @@ compose.desktop {
         mainClass = "com.selkies.client.MainKt"
         nativeDistributions {
             packageName = "Selkies-Desktop"
-            packageVersion = "2.7.3"
+            packageVersion = "2.7.4"
             description = "Selkies 远程桌面原生客户端"
             vendor = "Selkies Client"
         }
@@ -148,7 +148,7 @@ val desktopFatJar = tasks.register<Jar>("desktopFatJar") {
     manifest {
         attributes["Main-Class"] = "com.selkies.client.MainKt"
         attributes["Implementation-Title"] = "Selkies Desktop Client"
-        attributes["Implementation-Version"] = "2.7.3"
+        attributes["Implementation-Version"] = "2.7.4"
     }
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
     exclude("META-INF/versions/**/module-info.class")
@@ -248,6 +248,17 @@ tasks.register<JavaExec>("probeV273") {
     group = "verification"
     description = "v2.7.3 无头综合验证：麦克风locked语义 + 剪贴板往返 + 音频活性"
     mainClass.set("com.selkies.client.tools.V273Probe")
+    val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
+    classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
+    for (k in listOf("probeUrl", "probeUser", "probePass")) {
+        if (project.hasProperty(k)) systemProperty(k, project.property(k).toString())
+    }
+}
+
+tasks.register<JavaExec>("probeV274") {
+    group = "verification"
+    description = "v2.7.4 无头综合验证：locked语义回归 + 剪贴板 + 手柄 + 文件往返 + 音频活性"
+    mainClass.set("com.selkies.client.tools.V274Probe")
     val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
     classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
     for (k in listOf("probeUrl", "probeUser", "probePass")) {

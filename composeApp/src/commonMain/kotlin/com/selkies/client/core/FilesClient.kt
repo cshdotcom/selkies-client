@@ -252,6 +252,64 @@ class FilesClient(private val session: SelkiesSession) {
         }
     }
 
+    /** v2.7.4：另存为——弹系统选择器（Android SAF / 桌面 JFileChooser）选任意位置后流式下载。
+     *  用户取消时不创建任务。 */
+    fun downloadToPicker(remotePath: String, displayName: String) {
+        session.platform.saveFileWithPicker(displayName, "application/octet-stream") { target ->
+            if (target == null) return@saveFileWithPicker
+            val task = TransferTask(
+                id = UUID.randomUUID().toString(),
+                fileName = target.displayName,
+                filePath = remotePath,
+                totalBytes = 0,
+                upload = false
+            )
+            addTask(task)
+            scope.launch {
+                try {
+                    task.status = "running"
+                    updateTask(task)
+                    val os = target.open()
+                    if (os == null) {
+                        task.status = "error"
+                        task.message = "无法打开所选位置的写入流"
+                        updateTask(task)
+                        return@launch
+                    }
+                    val (code, written) = session.connection.apiDownloadStream(
+                        "/api/files/" + remotePath.trimStart('/')
+                    ) { buf, n, total ->
+                        os.write(buf, 0, n)
+                        task.sentBytes += n
+                        if (task.totalBytes == 0L && total > 0) task.totalBytes = total
+                        updateTask(task)
+                    }
+                    os.close()
+                    if (code != 200) {
+                        task.status = "error"
+                        task.message = "下载失败：HTTP $code"
+                    } else {
+                        task.status = "done"
+                        task.sentBytes = written
+                        task.totalBytes = written
+                        task.message = target.displayPath
+                        if (session.settings().recordingNotifyOnSave) {
+                            session.savedMediaEvent.value = com.selkies.client.model.SavedMediaEvent(
+                                "download", target.displayPath, target.displayName,
+                                detail = String.format(java.util.Locale.US, "%.1f MB", written / 1048576.0)
+                            )
+                        }
+                    }
+                    updateTask(task)
+                } catch (e: Exception) {
+                    task.status = "error"
+                    task.message = e.message ?: e.toString()
+                    updateTask(task)
+                }
+            }
+        }
+    }
+
     private fun updateTask(task: TransferTask) {
         transfers.value = transfers.value.map { if (it.id == task.id) task.copy() else it }
     }

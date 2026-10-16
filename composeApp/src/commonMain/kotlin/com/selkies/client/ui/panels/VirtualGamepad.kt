@@ -22,6 +22,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -40,6 +41,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlin.math.hypot
 
 /**
@@ -116,18 +118,35 @@ class VirtualGamepadEngine(private val session: SelkiesSession) {
         if (connected && sendEnabled) session.sendGamepadHeartbeat(slot)
     }
 
+    // v2.7.4：最近发送事件（UI 实时反馈——用户能立刻看到「手柄真的在发」）
+    val lastEvent = MutableStateFlow<String?>(null)
+    private var lastEventAt = 0L
+    private fun noteEvent(desc: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastEventAt > 60) {  // 节流
+            lastEvent.value = desc
+            lastEventAt = now
+        }
+    }
+
     fun setButton(index: Int, pressed: Boolean) {
         val v = if (pressed) 1f else 0f
         if (buttons[index] == v) return
         buttons[index] = v
-        if (sendEnabled) session.sendGamepadButton(slot, index, v.toDouble())
+        if (sendEnabled) {
+            session.sendGamepadButton(slot, index, v.toDouble())
+            noteEvent("按钮${buttonName(index)}${if (pressed) "按下" else "松开"} → js,b,$slot,$index,$v")
+        }
     }
 
     fun setAxis(index: Int, value: Float) {
         val v = value.coerceIn(-1f, 1f)
         if (axes[index] == v) return
         axes[index] = v
-        if (sendEnabled) session.sendGamepadAxis(slot, index, v.toDouble())
+        if (sendEnabled) {
+            session.sendGamepadAxis(slot, index, v.toDouble())
+            noteEvent("轴${axisName(index)}=${"%.2f".format(v)} → js,a,$slot,$index")
+        }
     }
 
     /** 摇杆直接置值（触摸拖动） */
@@ -181,6 +200,16 @@ class VirtualGamepadEngine(private val session: SelkiesSession) {
         for (i in 0 until N_BUTTONS) setButton(i, false)
         for (i in 0 until N_AXES) setAxis(i, 0f)
         heldKeys.clear()
+    }
+
+    // v2.7.4：按钮/轴名称（事件反馈用；与官方 XPAD_CONFIG 客户端编号一致）
+    private fun buttonName(i: Int) = when (i) {
+        0 -> "A"; 1 -> "B"; 2 -> "X"; 3 -> "Y"; 4 -> "LB"; 5 -> "RB"
+        6 -> "LT"; 7 -> "RT"; 8 -> "Back"; 9 -> "Start"; 10 -> "LS"; 11 -> "RS"
+        12 -> "上"; 13 -> "下"; 14 -> "左"; 15 -> "右"; 16 -> "Guide"; else -> "#$i"
+    }
+    private fun axisName(i: Int) = when (i) {
+        0 -> "左X"; 1 -> "左Y"; 2 -> "右X"; 3 -> "右Y"; 4 -> "轴4"; 5 -> "轴5"; else -> "#$i"
     }
 }
 
@@ -280,6 +309,27 @@ fun VirtualGamepadOverlay(
                         contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
                     ) { Text("关闭", fontSize = 10.sp) }
                 }
+            }
+
+            // v2.7.4：连接状态 + 最近事件实时反馈（用户能立刻看到手柄在发什么——
+            // 「不起作用」时先看这里：有事件 = 链路在发；无事件 = 只读/未连接）
+            val lastEvent by engine.lastEvent.collectAsState()
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    if (engine.isConnected) "已连接 js$slot" else "未连接",
+                    color = if (engine.isConnected) Color(0xFF4ADE80) else Color(0xFFF87171),
+                    fontSize = 9.sp
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    lastEvent ?: "等待输入…（按按钮/拖摇杆，此处显示发送事件）",
+                    color = Color(0x99FFFFFF), fontSize = 9.sp,
+                    maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
             }
 
             if (!collapsed) {

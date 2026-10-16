@@ -514,12 +514,14 @@ fun CompleteKeyboard(
     var composeText by remember { mutableStateOf("") }
     // 缩放：分类模式 0.55–1.6（作用于自动键高），完整模式 0.3–2.0（作用于单位宽度）
     // 【v2.6.0 修复】两种模式各自持久化（keyboardScale / keyboardFullScale）：
-    //   旧版共用一个值——在完整模式缩小后切回分类模式键盘变微型，反之亦然；
-    //   完整模式默认按屏宽自适应（23 单位恰好可见），不再依赖外部 autoScaleHint。
+    //   旧版共用一个值——在完整模式缩小后切回分类模式键盘变微型，反之亦然。
+    // 【v2.7.4】完整模式默认 scale 提高：旧版 autoScaleHint（屏宽恰好容纳 23 单位）在手机上
+    //   ≈0.45（每键 15dp）→「太小了团在一起」。现在默认 = max(autoScaleHint, 0.7)——
+    //   键更大更舒展（超屏部分横向滚动可达），用户仍可 -/+ 或捏合调整。
     var scale by remember(savedScale, savedFullScale, fullMode) {
         mutableStateOf(
             if (fullMode) {
-                if (savedFullScale > 0f) savedFullScale else autoScaleHint.coerceIn(0.3f, 1f)
+                if (savedFullScale > 0f) savedFullScale else autoScaleHint.coerceIn(0.7f, 1.2f)
             } else {
                 if (savedScale > 0f) savedScale else 1f
             }
@@ -739,6 +741,33 @@ fun CompleteKeyboard(
                         KbIcon(Icons.Filled.Add, "放大") { doScale(1.15f) }
                         KbIcon(Icons.Filled.KeyboardArrowDown, "折叠") { collapsed = true }
                         KbIcon(Icons.Filled.Close, "关闭") { onDismiss() }
+                    }
+
+                    // v2.7.4：缩放滑杆（直观调整键盘大小——用户要求「支持调整大小」）。
+                    // 拖动中只改本地 scale（不写盘——updateSettings 每次都会落盘，
+                    // 高频拖动会狂写磁盘），松手时才持久化。
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Filled.Remove, null, tint = Color(0x88FFFFFF), modifier = Modifier.size(12.dp))
+                        androidx.compose.material3.Slider(
+                            value = scale,
+                            onValueChange = {
+                                scale = it.coerceIn(if (fullMode) 0.3f else 0.55f, if (fullMode) 2.0f else 1.6f)
+                            },
+                            onValueChangeFinished = { onScaleChange(scale) },
+                            valueRange = (if (fullMode) 0.3f else 0.55f)..(if (fullMode) 2.0f else 1.6f),
+                            modifier = Modifier.weight(1f).height(18.dp),
+                            colors = androidx.compose.material3.SliderDefaults.colors(
+                                thumbColor = Color(0xFF60A5FA),
+                                activeTrackColor = Color(0xFF60A5FA),
+                                inactiveTrackColor = Color(0x33FFFFFF)
+                            )
+                        )
+                        Icon(Icons.Filled.Add, null, tint = Color(0x88FFFFFF), modifier = Modifier.size(12.dp))
                     }
 
                     // ---------- 文本合成条（输入法等效；文本页签=大号版）----------

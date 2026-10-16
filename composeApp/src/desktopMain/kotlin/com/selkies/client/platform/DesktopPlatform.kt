@@ -136,6 +136,37 @@ object DesktopPlatform : PlatformServices {
         }.apply { isDaemon = true }.start()
     }
 
+    /** v2.7.4：另存为选择器——返回用户选择的绝对路径目标（流式写入） */
+    override fun saveFileWithPicker(
+        suggestedName: String,
+        mime: String,
+        onResult: (PickedSaveTarget?) -> Unit
+    ) {
+        Thread {
+            runCatching {
+                val chooser = JFileChooser()
+                chooser.dialogTitle = "选择保存位置"
+                chooser.selectedFile = File(suggestedName)
+                val r = chooser.showSaveDialog(windowFrame)
+                if (r == JFileChooser.APPROVE_OPTION) {
+                    val f = chooser.selectedFile
+                    // 确保扩展名（用户手输常漏）
+                    val dot = suggestedName.lastIndexOf('.')
+                    val finalFile = if (dot > 0 && !f.name.endsWith(suggestedName.substring(dot), true)) {
+                        File(f.parentFile, f.name + suggestedName.substring(dot))
+                    } else f
+                    onResult(
+                        PickedSaveTarget(
+                            displayName = finalFile.name,
+                            open = { runCatching { finalFile.outputStream() }.getOrNull() },
+                            displayPath = finalFile.absolutePath
+                        )
+                    )
+                } else onResult(null)
+            }.onFailure { onResult(null) }
+        }.apply { isDaemon = true }.start()
+    }
+
     override fun makeAudioPlayer(): AudioPlayer = com.selkies.client.audio.DesktopAudioPlayer()
 
     override fun makeMicCapture(): MicCapture = com.selkies.client.audio.DesktopMicCapture()

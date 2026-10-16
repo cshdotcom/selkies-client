@@ -103,6 +103,12 @@ object VideoDecodeProbe {
         override fun pickFiles(mimeTypes: List<String>, onResult: (List<PickedFile>) -> Unit) {
             onResult(emptyList())
         }
+
+        override fun saveFileWithPicker(
+            suggestedName: String,
+            mime: String,
+            onResult: (com.selkies.client.platform.PickedSaveTarget?) -> Unit
+        ) { onResult(null) }
         override fun saveFile(suggestedName: String, bytes: ByteArray, onDone: (Boolean) -> Unit) {
             onDone(false)
         }
