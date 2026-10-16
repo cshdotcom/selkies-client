@@ -32,6 +32,7 @@ import androidx.compose.ui.unit.dp
 import com.selkies.client.AppState
 import com.selkies.client.core.SelkiesSession
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /**
  * 剪贴板面板：双向同步 + 手动发送 + 同步开关 + 历史
@@ -39,6 +40,11 @@ import kotlinx.coroutines.delay
  *  - 远程剪贴板直接观察 session.remoteClipboard（旧版本地 state 从未更新 = "收不了"的 UI 根因）
  *  - 本地剪贴板实时刷新（多监听器，桌面端已实现真正的 addListener）
  *  - 同步事件提示（clipboardNotice：发送/接收成功/失败一目了然）
+ *
+ * 【v2.7.3 修复】实测验证服务器剪贴板双向协议完全正常后，针对用户实际反镄的 UI 反馈问题：
+ *  - 「获取远程剪贴板」fetching 状态永不复位（卡在"正在获取…"）→ 3s 超时自动复位并给出空结果反馈
+ *  - 「复制到本机」点击后无任何反馈 → 成功/空内容均给出明确提示
+ *  - 服务器剪贴板为空时 REQUEST_CLIPBOARD 无应答（官方设计）→ 明确告知而非永远等待
  */
 @Composable
 fun ClipboardPanel(state: AppState, session: SelkiesSession) {
@@ -56,6 +62,16 @@ fun ClipboardPanel(state: AppState, session: SelkiesSession) {
         fetching = true
         delay(1500)
         fetching = false
+    }
+
+    // v2.7.3：手动获取——带超时自动复位（旧版 fetching=true 永不复位 = "点击后卡住"的根因）
+    fun fetchRemote() {
+        fetching = true
+        session.requestClipboard()
+        session.scope.launch {
+            delay(3000)
+            fetching = false
+        }
     }
 
     // 远程内容变化 → 同步本地面板显示
@@ -137,22 +153,23 @@ fun ClipboardPanel(state: AppState, session: SelkiesSession) {
         SectionCard("远程剪贴板（$remoteMime）") {
             Text(
                 if (fetching && remote == null) "正在获取…"
-                else remoteText?.ifBlank { "（远程剪贴板为空）" } ?: "（尚未获取——点下方按钮）",
+                else remoteText?.ifBlank { "（远程剪贴板为空）" } ?: "（尚未获取——点下方按钮拉取；远程无内容时不会有应答）",
                 style = MaterialTheme.typography.bodySmall,
                 maxLines = 6,
                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
             )
             Spacer(Modifier.height(6.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = {
-                    fetching = true
-                    session.requestClipboard()
-                }) { Text("获取远程剪贴板") }
+                Button(onClick = { fetchRemote() }) { Text("获取远程剪贴板") }
                 OutlinedButton(onClick = {
                     val t = remoteText
                     if (!t.isNullOrBlank()) {
                         state.platform.clipboard().setText(t)
                         localText = t
+                        // v2.7.3：明确反馈（旧版点击后无任何提示 = "点了没反应"的体验）
+                        session.clipboardNotice.value = "已复制 ${t.length} 字符到本机剪贴板（可在本机粘贴）"
+                    } else {
+                        session.clipboardNotice.value = "远程剪贴板为空或尚未获取——先点「获取远程剪贴板」"
                     }
                 }) { Text("复制到本机") }
             }

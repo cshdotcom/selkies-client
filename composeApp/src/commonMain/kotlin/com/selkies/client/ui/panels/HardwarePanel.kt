@@ -72,6 +72,10 @@ fun HardwarePanel(session: SelkiesSession) {
     val serverMicEnabled by session.serverMicEnabled.collectAsState()
     val serverWebcamEnabled by session.serverWebcamEnabled.collectAsState()
     val serverAudioEnabled by session.serverAudioEnabled.collectAsState()
+    // v2.7.3：官方语义——只有 locked 的禁用才是真禁用；未锁定的 false 只是默认关（可随时开启）
+    val serverMicLocked by session.serverMicLocked.collectAsState()
+    val serverWebcamLocked by session.serverWebcamLocked.collectAsState()
+    val serverAudioLocked by session.serverAudioLocked.collectAsState()
 
     var search by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(true) }
@@ -92,21 +96,33 @@ fun HardwarePanel(session: SelkiesSession) {
     val selectedCameraIds = selectedCamera.split(',').filter { it.isNotBlank() }
 
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
-        // v2.7.0：服务器能力提示（被禁用的功能一目了然）
-        if (!serverMicEnabled || !serverWebcamEnabled || !serverAudioEnabled) {
+        // v2.7.3：区分「锁定禁用」（真不可用，红色）与「默认关」（可开启，蓝色提示）
+        val hardOff = mutableListOf<String>()
+        val softOff = mutableListOf<String>()
+        if (!serverMicEnabled && serverMicLocked) hardOff.add(" 麦克风") else if (!serverMicEnabled) softOff.add(" 麦克风")
+        if (!serverWebcamEnabled && serverWebcamLocked) hardOff.add(" 摄像头") else if (!serverWebcamEnabled) softOff.add(" 摄像头")
+        if (!serverAudioEnabled && serverAudioLocked) hardOff.add(" 远程声音")
+        if (hardOff.isNotEmpty()) {
             Surface(
                 shape = RoundedCornerShape(8.dp),
                 color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.6f),
                 modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
             ) {
                 Text(
-                    buildString {
-                        append("服务器已禁用：")
-                        if (!serverMicEnabled) append(" 麦克风")
-                        if (!serverWebcamEnabled) append(" 摄像头")
-                        if (!serverAudioEnabled) append(" 远程声音")
-                        append("（对应功能不可用，这是服务器端配置而非客户端故障）")
-                    },
+                    "服务器已锁定禁用：${hardOff.joinToString("")}（服务器端配置锁定，客户端无法开启）",
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                )
+            }
+        }
+        if (softOff.isNotEmpty()) {
+            Surface(
+                shape = RoundedCornerShape(8.dp),
+                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+            ) {
+                Text(
+                    "服务器${softOff.joinToString("")}默认关闭——直接打开上方开关即可按需开启（与网页版行为一致）",
                     style = MaterialTheme.typography.labelMedium,
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
                 )

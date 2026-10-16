@@ -39,7 +39,8 @@ class SelkiesSession(
 
     enum class Status { IDLE, CONNECTING, CONNECTED, RECONNECTING, FAILED, CLOSED }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    /** 会话协程作用域（剪贴板面板等的轻量延迟任务；主作用域仍为 private） */
+    internal val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     val status = MutableStateFlow(Status.IDLE)
@@ -70,6 +71,12 @@ class SelkiesSession(
     val serverMicEnabled = MutableStateFlow(true)
     /** 服务器是否允许摄像头上行（webcam_enabled） */
     val serverWebcamEnabled = MutableStateFlow(true)
+    // v2.7.3：官方语义修正——服务器开关是 (value, locked) 二元组。未锁定的 false 只是“默认关”，
+    // 客户端发数据即视为开启（官方 web 客户端如此，服务器 0x02 门控也只拒绝 locked 的 false）。
+    // 旧版把 value=false 当硬拒绝 = “网页能用麦克风、App 用不了”的根因（实测验证）。
+    val serverMicLocked = MutableStateFlow(false)
+    val serverWebcamLocked = MutableStateFlow(false)
+    val serverAudioLocked = MutableStateFlow(false)
     /** 音频流状态提示（AUDIO_STARTED 但无帧时自动恢复/告知用户；null = 正常） */
     val audioStallNotice = MutableStateFlow<String?>(null)
 
@@ -161,6 +168,7 @@ class SelkiesSession(
     // ---- v2.7.0：音频停看门狗（AUDIO_STARTED 但服务器无帧 → 自动重启音频管线 + 状态透明化） ----
     @Volatile private var audioStartedAt = 0L
     @Volatile private var audioFramesSinceStart = 0L
+    @Volatile private var audioQuietMarkerAt = 0L  // v2.7.3：静默门标记到达时间（服务器 [0x01,quiet]）
     @Volatile private var audioReviveAttempts = 0
     private var audioStallJob: Job? = null
 
@@ -177,8 +185,15 @@ class SelkiesSession(
                     audioReviveAttempts = 0
                     continue
                 }
+                // v2.7.3：静默门标记也算活性——服务器发 [0x01,quiet] 表示“管线健康，只是远程无声”，
+                // 不应误判为停滞（实测：纯静默期服务器可能完全不发消息，但 quiet 标记到达时必为健康）
+                if (audioQuietMarkerAt > 0 && System.currentTimeMillis() - audioQuietMarkerAt < 12000) {
+                    if (audioStallNotice.value != null) audioStallNotice.value = null
+                    audioReviveAttempts = 0
+                    continue
+                }
                 if (elapsed < 8000) continue  // 等待首个音频帧的宽限期
-                // AUDIO_STARTED 后 8 秒无任何音频帧 → 服务器音频管线疑似停滞
+                // AUDIO_STARTED 后 8 秒无任何音频帧 → 两种可能：远程确实无声 / 管线停滞
                 if (audioReviveAttempts < 3) {
                     audioReviveAttempts++
                     audioStallNotice.value = "远程音频无数据，正在尝试恢复（第 $audioReviveAttempts 次）…"
@@ -192,7 +207,9 @@ class SelkiesSession(
                         audioFramesSinceStart = 0
                     }
                 } else {
-                    audioStallNotice.value = "远程音频无数据（服务器端音频管线异常）——视频不受影响；可尝试断开后重连"
+                    // v2.7.3：诚实措辞——实测服务器音频链路正常时纯静默期也不发帧，
+                    // 不能一味断言“服务器管线异常”（误导用户报修）
+                    audioStallNotice.value = "远程音频无数据——常见原因是远程桌面当前没有声音在播放（请确认远程视频在播放且未静音）；若确认在播放仍无声，可尝试断开重连。视频不受影响"
                     stopAudioStallWatchdog()
                 }
             }
@@ -668,19 +685,31 @@ class SelkiesSession(
                             }
                         }
                     }
+                    // v2.7.3：解析 locked 字段（锁定后客户端不可覆盖；未锁定的 false 可由客户端开启）
+                    fun boolLockedFlag(key: String, current: MutableStateFlow<Boolean>) {
+                        (map[key] as? kotlinx.serialization.json.JsonObject)?.let { o ->
+                            (o["locked"] as? kotlinx.serialization.json.JsonPrimitive)?.let { v ->
+                                current.value = v.content == "true" || v.content == "1"
+                            }
+                        }
+                    }
                     boolFlag("audio_enabled", serverAudioEnabled)
                     boolFlag("microphone_enabled", serverMicEnabled)
                     boolFlag("webcam_enabled", serverWebcamEnabled)
-                    if (!serverMicEnabled.value && micActive.value) {
+                    boolLockedFlag("microphone_enabled", serverMicLocked)
+                    boolLockedFlag("webcam_enabled", serverWebcamLocked)
+                    boolLockedFlag("audio_enabled", serverAudioLocked)
+                    // v2.7.3：只有「服务器锁定禁用」才停上行（未锁定的 false = 默认关，可随时开启）
+                    if (!serverMicEnabled.value && serverMicLocked.value && micActive.value) {
                         // 服务器已禁用：立即停掉上行（避免持续发被丢弃的帧）
                         runCatching { micCapture.stop() }
                         micActive.value = false
-                        notices.value = "服务器已禁用麦克风，上行已停止"
+                        notices.value = "服务器已锁定禁用麦克风，上行已停止"
                     }
-                    if (!serverWebcamEnabled.value && webcamActive.value) {
+                    if (!serverWebcamEnabled.value && serverWebcamLocked.value && webcamActive.value) {
                         runCatching { webcamCapture.stop() }
                         webcamActive.value = false
-                        notices.value = "服务器已禁用摄像头，上行已停止"
+                        notices.value = "服务器已锁定禁用摄像头，上行已停止"
                     }
                     // 服务器音频声道数（官方默认 2，修复单声道硬编码导致的无声/变音）
                     (map["audio_channels"] as? kotlinx.serialization.json.JsonObject)?.let { ch ->
@@ -949,7 +978,11 @@ class SelkiesSession(
                     if (role.value == "viewer") return
                     val frames = Protocol.parseAudioFrames(data, length, audioParseState)
                     for ((opus, quiet) in frames) {
-                        if (quiet) audioPlayer.onQuiet()
+                        if (quiet) {
+                            audioPlayer.onQuiet()
+                            // v2.7.3：quiet 标记也是服务器活性信号（静默门健康运行的证明）
+                            audioQuietMarkerAt = System.currentTimeMillis()
+                        }
                         if (opus.isNotEmpty()) {
                             audioFramesSinceStart++
                             audioPlayer.playOpus(opus)
@@ -1632,14 +1665,21 @@ class SelkiesSession(
     }
 
     fun startMicUplink(): Boolean {
-        // v2.7.0：服务器禁用麦克风时明确拒绝（旧版静默发送被丢弃的帧 = "麦克风有问题"的迷惑根因）
-        if (!serverMicEnabled.value) {
-            notices.value = "服务器已禁用麦克风（microphone_enabled=false），无法上行"
+        // v2.7.3：官方语义修正——服务器 microphone_enabled=(value, locked)：
+        //   locked=true 且 value=false → 真禁用，拒绝上行（服务器发 MICROPHONE_DISABLED 并丢弃帧）
+        //   locked=false 且 value=false → 仅默认关，客户端发送数据即视为开启（与官方 web 客户端一致；
+        //     实测服务器 0x02 门控：not microphone_enabled and locked 才拒绝——nodebyte 实测验证）
+        // 旧版把 value=false 一律拒绝 = “网页端能用麦克风、App 用不了”的根因。
+        if (!serverMicEnabled.value && serverMicLocked.value) {
+            notices.value = "服务器已锁定禁用麦克风（microphone_enabled 锁定为关），无法上行"
             micActive.value = false
             return false
         }
         if (micActive.value || micCapture.active) { micActive.value = true; return true }
         micActive.value = true
+        if (!serverMicEnabled.value) {
+            notices.value = "服务器麦克风默认关闭，已按需开启上行"
+        }
         micCapture.start(
             deviceIds = selectedMicIds.value,
             onOpusFrame = { opus ->
@@ -1666,9 +1706,9 @@ class SelkiesSession(
     }
 
     fun startWebcamUplink(): Boolean {
-        // v2.7.0：服务器禁用摄像头时明确拒绝
-        if (!serverWebcamEnabled.value) {
-            notices.value = "服务器已禁用摄像头（webcam_enabled=false），无法上行"
+        // v2.7.3：同麦克风——仅锁定禁用才拒绝（未锁定的 false = 默认关可开启）
+        if (!serverWebcamEnabled.value && serverWebcamLocked.value) {
+            notices.value = "服务器已锁定禁用摄像头（webcam_enabled 锁定为关），无法上行"
             webcamActive.value = false
             return false
         }
