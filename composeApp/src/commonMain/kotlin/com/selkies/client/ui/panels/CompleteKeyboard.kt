@@ -47,6 +47,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
@@ -445,7 +446,9 @@ private object KbLayout {
 // 悬浮完整键盘（会话内使用）
 // =====================================================================
 
-/** 修饰键粘滞状态机：单次粘滞 / 双击锁定 */
+/** 修饰键粘滞状态机：单次粘滞 / 双击锁定
+ *  【v2.7.2 修复】旧逻辑双击 = 粘滞→取消（第二次 tap 直接 remove），「双击锁定」永远
+ *  触发不了（用户需三击才锁定）。新三态循环：未粘滞→粘滞(蓝)→锁定(青)→解除。 */
 private class ModLatches {
     val latched = LinkedHashMap<Long, Boolean>()   // keysym -> locked
     private val lastTap = HashMap<Long, Long>()
@@ -454,10 +457,10 @@ private class ModLatches {
         val now = System.currentTimeMillis()
         val dbl = lastTap[mod]?.let { now - it < 380 } == true
         lastTap[mod] = now
-        return if (latched.containsKey(mod)) {
-            latched.remove(mod); false
-        } else {
-            latched[mod] = dbl; true
+        return when {
+            !latched.containsKey(mod) -> { latched[mod] = dbl; true }   // 粘滞（快速二连击直接锁定）
+            latched[mod] == false && dbl -> { latched[mod] = true; true } // 快速二连击 → 锁定
+            else -> { latched.remove(mod); false }                       // 慢速再点取消 / 已锁定解除
         }
     }
 
@@ -491,7 +494,10 @@ fun CompleteKeyboard(
     onScaleChange: (Float) -> Unit = {},
     onFullModeChange: (Boolean) -> Unit = {},
     onDismiss: () -> Unit,
-    onChord: ((List<Long>) -> Unit)? = null
+    onChord: ((List<Long>) -> Unit)? = null,
+    // v2.7.2：文本合成条焦点回调（会话层据此放行物理键直通远程——键盘打开但无文本框聚焦时
+    // 桌面物理键盘不再被完全屏蔽，修复「键盘开着物理键打不出字」）
+    onTextFocusChanged: (Boolean) -> Unit = {}
 ) {
     if (!visible) return
 
@@ -761,7 +767,9 @@ fun CompleteKeyboard(
                                     textStyle = TextStyle(color = Color(0xFFE8EDF4), fontSize = 14.sp),
                                     cursorBrush = SolidColor(Color(0xFF60A5FA)),
                                     singleLine = true,
-                                    modifier = Modifier.fillMaxWidth()
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .onFocusChanged { onTextFocusChanged(it.isFocused) }
                                 )
                             }
                             KbChip("发送 ⏎", active = true) { commitText() }
@@ -1083,10 +1091,17 @@ private fun androidx.compose.foundation.layout.RowScope.FixedKbKey(
                 .clickable(interactionSource = interaction, indication = null) {},
             contentAlignment = Alignment.Center
         ) {
+            // 【v2.7.2 根因修复】旧公式 14f * unit（unit=34×scale≈14~34dp）→ 字号 200~476sp
+            // 塞进 14~34dp 高的键 → 字形只剩顶部空隙被裁掉 = 完整模式字母键全部空白
+            // （用户截图片段：仅 tiny 键 Esc/Tab/Caps/Ctrl 有字，字母/数字/功能键全空 =
+            //  「软键盘无法使用」根因；该 bug 自 v2.3.0 引入）。新公式随键高自适应，
+            // 与分类模式 KbKey 同思路：字号 = min(基准, 键高×系数)，下限 6.5sp。
             Text(
                 label,
                 color = if (latched) Color(0xFF06131F) else Color(0xFFE8EDF4),
-                fontSize = (if (key.tiny) 10f else 14f * unit.coerceAtLeast(0.6f)).coerceAtLeast(7f).sp,
+                fontSize = (if (key.tiny) 10f else 15.5f)
+                    .coerceAtMost(keyH * (if (key.tiny) 0.65f else 0.5f))
+                    .coerceAtLeast(6.5f).sp,
                 maxLines = 1
             )
         }

@@ -194,6 +194,8 @@ object DesktopPlatform : PlatformServices {
     @Volatile
     private var physicalKeyHandler: ((Int, Boolean) -> Boolean)? = null
     private var keyDispatcherInstalled = false
+    // v2.7.2：物理键链路追踪（-Dselkies.keytrace；区分「AWT 未收到事件」与「门控拦截」）
+    private val keyTrace = System.getProperty("selkies.keytrace") != null
 
     override fun setPhysicalKeyHandler(handler: ((Int, Boolean) -> Boolean)?) {
         physicalKeyHandler = handler
@@ -203,6 +205,11 @@ object DesktopPlatform : PlatformServices {
                 java.awt.KeyboardFocusManager.getCurrentKeyboardFocusManager()
                     .addKeyEventDispatcher { e ->
                         val h = physicalKeyHandler ?: return@addKeyEventDispatcher false
+                        if (keyTrace && (e.id == java.awt.event.KeyEvent.KEY_PRESSED ||
+                                    e.id == java.awt.event.KeyEvent.KEY_RELEASED)
+                        ) {
+                            println("[Selkies][KeyTrace] AWT keyCode=${e.keyCode} down=${e.id == java.awt.event.KeyEvent.KEY_PRESSED}")
+                        }
                         when (e.id) {
                             java.awt.event.KeyEvent.KEY_PRESSED -> h(e.keyCode, true)
                             java.awt.event.KeyEvent.KEY_RELEASED -> h(e.keyCode, false)

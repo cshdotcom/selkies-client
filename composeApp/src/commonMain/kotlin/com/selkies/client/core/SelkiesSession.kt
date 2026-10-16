@@ -1227,7 +1227,11 @@ class SelkiesSession(
         ioScope.launch { runCatching { block() } }
     }
 
+    // v2.7.2：按键链路追踪（-Dselkies.keytrace 开启；实测物理/软键盘输入是否真正发出）
+    private val keyTrace = System.getProperty("selkies.keytrace") != null
+
     fun sendKey(keysym: Long, down: Boolean) = post {
+        if (keyTrace) println("[Selkies][KeyTrace] ${if (down) "kd" else "ku"},$keysym")
         if (down) heldKeys.add(keysym) else heldKeys.remove(keysym)
         connection.sendText(Protocol.keyEvent(down, keysym))
         if (down) startKeyHeartbeat() else if (heldKeys.isEmpty()) stopKeyHeartbeat()
@@ -1253,6 +1257,7 @@ class SelkiesSession(
     }
 
     fun sendKeyChord(keysyms: List<Long>) = post {
+        if (keyTrace) println("[Selkies][KeyTrace] chord ${keysyms.joinToString("+")}")
         val mods = keysyms.dropLast(1)
         val main = keysyms.last()
         for (m in mods) connection.sendText(Protocol.keyEvent(true, m))

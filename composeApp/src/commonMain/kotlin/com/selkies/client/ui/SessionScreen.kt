@@ -200,6 +200,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     // v2.7.0：全屏工具栏自动隐藏（不遮挡远程控制区；边缘唤出）
     var toolbarShowAt by remember { mutableStateOf(System.currentTimeMillis()) }
     var floatingKb by remember { mutableStateOf(false) }
+    // v2.7.2：悬浮键盘文本合成条焦点（false = 键盘打开但无文本框聚焦 → 桌面物理键直通远程）
+    var kbTextFocused by remember { mutableStateOf(false) }
     var quickBar by remember { mutableStateOf(false) }
     var showInputPicker by remember { mutableStateOf(false) }
     var inputMode by remember { mutableStateOf(if (state.store.settings.value.touchMouseMode) InputMode.TRACKPAD else InputMode.TOUCH) }
@@ -422,8 +424,10 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         // v2.6.0：虚拟手柄键盘映射优先拦截（桌面无触屏的替代操作方案）
         // v2.7.0：返回 true = 已转发 → AWT 分发器消费（防 Compose 路径双发）；
         //        quickBar/放大镜控制等交互层也纳入门控
+        // v2.7.2：悬浮键盘打开但文本合成条未聚焦时不再屏蔽物理键（桌面用户开软键盘后
+        //        仍可用物理键盘打字到远程；仅文本框聚焦时才留给本地输入）
         platform.setPhysicalKeyHandler { code, down ->
-            if (!viewOnly && panel == SessionPanel.NONE && !floatingKb && !quickBar &&
+            if (!viewOnly && panel == SessionPanel.NONE && (!floatingKb || !kbTextFocused) && !quickBar &&
                 !showZoomControls && !showVirtualPad && !showVolumePopup && !showInputPicker && !showModeSelector &&
                 state.store.settings.value.physicalKeyboardPassthrough
             ) {
@@ -1337,6 +1341,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     }
                 },
                 onFullModeChange = { f -> state.store.updateSettings { it.keyboardFullMode = f } },
+                onTextFocusChanged = { kbTextFocused = it },
                 onDismiss = { floatingKb = false }
             )
         }
