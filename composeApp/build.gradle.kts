@@ -42,6 +42,11 @@ kotlin {
                 implementation("androidx.camera:camera-core:1.3.4")
                 implementation("androidx.camera:camera-camera2:1.3.4")
                 implementation("androidx.camera:camera-lifecycle:1.3.4")
+                // v2.7.5：音频备用解码引擎（FFmpeg Opus 软解，与桌面端同一验证过的代码路径）。
+                // 原生库（android-arm64 .so）由 extractFfmpegAndroidNatives 任务从下面
+                // ffmpegAndroidNatives 配置提取进 jniLibs，APK 内由 System.loadLibrary 加载。
+                implementation("org.bytedeco:javacpp:1.5.12")
+                implementation("org.bytedeco:ffmpeg:7.1.1-1.5.12")
             }
         }
         val desktopMain by getting {
@@ -62,6 +67,37 @@ kotlin {
             }
         }
     }
+}
+
+// v2.7.5：Android FFmpeg 原生库（Opus 软解备用引擎）——仅提取 avcodec/avutil/swresample
+// 及其 JNI 包装（Opus 解码所需最小集，~31MB 未压缩；useLegacyPackaging 压缩存储控 APK 体积）
+val ffmpegAndroidNatives: Configuration by configurations.creating
+dependencies {
+    ffmpegAndroidNatives("org.bytedeco:ffmpeg:7.1.1-1.5.12:android-arm64")
+    ffmpegAndroidNatives("org.bytedeco:javacpp:1.5.12:android-arm64")
+}
+
+val extractFfmpegAndroidNatives = tasks.register<Copy>("extractFfmpegAndroidNatives") {
+    group = "build"
+    description = "从 javacpp android-arm64 制品提取 Opus 解码所需最小 .so 集到 jniLibs"
+    // 注意：保留 zip 内 lib/arm64-v8a/ 相对路径（jniLibs.srcDir 指向 generated/ffmpeg-jniLibs/lib，
+    // AGP 即从 arm64-v8a/ 目录识别 ABI）
+    into(layout.buildDirectory.dir("generated/ffmpeg-jniLibs"))
+    from(ffmpegAndroidNatives.map { if (it.isDirectory) it else zipTree(it) })
+    include(
+        "lib/arm64-v8a/libjnijavacpp.so",
+        "lib/arm64-v8a/libavutil.so",
+        "lib/arm64-v8a/libjniavutil.so",
+        "lib/arm64-v8a/libswresample.so",
+        "lib/arm64-v8a/libjniswresample.so",
+        "lib/arm64-v8a/libavcodec.so",
+        "lib/arm64-v8a/libjniavcodec.so"
+    )
+}
+
+// AGP 合并 jniLibs 前必须先提取（debug/release 两个变体都覆盖）
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
+    dependsOn(extractFfmpegAndroidNatives)
 }
 
 // 通用桌面 fat JAR 所需的全部平台原生库
@@ -92,9 +128,20 @@ android {
         applicationId = "com.selkies.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 20704
-        versionName = "2.7.4"
+        versionCode = 20705
+        versionName = "2.7.5"
         ndkVersion = ""
+    }
+    // v2.7.5：FFmpeg 原生库压缩存储（APK ~26MB 而非 ~48MB；安装时解压到本地）
+    sourceSets {
+        getByName("main") {
+            // 提取任务保留 lib/arm64-v8a/ 前缀 → srcDir 指向 lib/，AGP 从 arm64-v8a/ 识别 ABI
+            jniLibs.srcDir(layout.buildDirectory.dir("generated/ffmpeg-jniLibs/lib"))
+        }
+    }
+    packaging {
+        resources.excludes += setOf("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
+        jniLibs.useLegacyPackaging = true
     }
     signingConfigs {
         create("release") {
@@ -131,7 +178,7 @@ compose.desktop {
         mainClass = "com.selkies.client.MainKt"
         nativeDistributions {
             packageName = "Selkies-Desktop"
-            packageVersion = "2.7.4"
+            packageVersion = "2.7.5"
             description = "Selkies 远程桌面原生客户端"
             vendor = "Selkies Client"
         }
@@ -148,7 +195,7 @@ val desktopFatJar = tasks.register<Jar>("desktopFatJar") {
     manifest {
         attributes["Main-Class"] = "com.selkies.client.MainKt"
         attributes["Implementation-Title"] = "Selkies Desktop Client"
-        attributes["Implementation-Version"] = "2.7.4"
+        attributes["Implementation-Version"] = "2.7.5"
     }
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
     exclude("META-INF/versions/**/module-info.class")
@@ -259,6 +306,17 @@ tasks.register<JavaExec>("probeV274") {
     group = "verification"
     description = "v2.7.4 无头综合验证：locked语义回归 + 剪贴板 + 手柄 + 文件往返 + 音频活性"
     mainClass.set("com.selkies.client.tools.V274Probe")
+    val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
+    classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
+    for (k in listOf("probeUrl", "probeUser", "probePass")) {
+        if (project.hasProperty(k)) systemProperty(k, project.property(k).toString())
+    }
+}
+
+tasks.register<JavaExec>("probeV275") {
+    group = "verification"
+    description = "v2.7.5 无头综合验证：认证闭环 + 渲染停滞看门狗 + 剪贴板图像 + 分辨率关键帧 + 只读切换 + 麦克风恢复 + 音频计量"
+    mainClass.set("com.selkies.client.tools.V275Probe")
     val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
     classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
     for (k in listOf("probeUrl", "probeUser", "probePass")) {

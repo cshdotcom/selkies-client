@@ -41,6 +41,15 @@ interface VideoSink {
     val avgPresentMs: Double get() = 0.0
     /** 因队列溢出丢弃的帧数（累计）——frames_not_shown */
     val framesDropped: Long get() = 0L
+    /** v2.7.5：最近一次成功渲染时间戳（System.currentTimeMillis；0=从未）。
+     *  会话看门狗监测「帧在到达但渲染停滞」（decode stall）——频繁黑屏的第四类根因。
+     *  实现方必须在每次真正上屏（releaseOutputBuffer(render=true)/位图发布）时更新。 */
+    val lastRenderAtMs: Long get() = 0L
+    /** v2.7.5：解码端主动请求关键帧（队列溢出/解码器出错/输入被丢弃后置位；
+     *  关键帧到达时实现方自行清除）。会话看门狗轮询消费。 */
+    val needsKeyframe: Boolean get() = false
+    /** 会话层消费 needsKeyframe 后清除（防重复请求） */
+    fun clearNeedsKeyframe() {}
 }
 
 /** 平台音频播放器（下行 Opus 48kHz） */
@@ -51,7 +60,8 @@ interface AudioPlayer {
     fun onQuiet()
     fun setVolume(volume: Float)
     /** v2.6.0 多输出设备 + 独立音量：deviceId → 增益(0..1)。
-     *  空映射 = 系统默认设备。平台实现：桌面 = 多条 SourceDataLine（各自混音器）；
+     *  空映射 = 系统默认设备（Android：跟随系统路由——扬声器/耳机自动切换）。
+     *  平台实现：桌面 = 多条 SourceDataLine（各自混音器）；
      *  Android = 多条 AudioTrack（各自 setPreferredDevice）。设备不可用时静默跳过。 */
     fun setOutputDevices(outputs: Map<String, Float>) {}
     /** v2.6.0 播放器错误回调（设备打开失败等；UI 呈现） */
@@ -60,6 +70,12 @@ interface AudioPlayer {
         set(_) { /* 默认无操作；平台实现覆写 */ }
     fun stop()
     val bufferLevelMs: Int
+    /** v2.7.5：已渲染 PCM 字节总量（音频自诊断：帧在到达但无输出 → 换解码器） */
+    val renderedPcmBytes: Long get() = 0L
+    /** v2.7.5：已送入解码器的 Opus 帧数 */
+    val opusFramesFed: Long get() = 0L
+    /** v2.7.5：当前实际使用的解码器描述（如 "MediaCodec" / "FFmpeg 软解"；诊断显示） */
+    val decoderDescription: String get() = ""
 }
 
 /** 平台麦克风采集（上行 Opus 24kHz mono；支持多设备混音） */
@@ -222,8 +238,9 @@ interface PlatformServices {
     fun setPhysicalKeyHandler(handler: ((keyCode: Int, down: Boolean) -> Boolean)?)
     /** 读取本地文件/内容 URI 字节（导入、上传预读等） */
     fun readFileBytes(path: String): ByteArray?
-    /** 用系统查看器打开本地文件（下载完成后「打开」） */
-    fun openFile(path: String)
+    /** 用系统查看器打开本地文件（下载完成后「打开」）。
+     *  v2.7.5：返回是否成功唤起查看器（失败时 UI 提示，不再静默无反应）。 */
+    fun openFile(path: String): Boolean
     /** 分享本地文件（系统分享面板） */
     fun shareFile(path: String, displayName: String)
     /** 退出应用（Android=finish；Desktop=System.exit） */
@@ -246,8 +263,8 @@ interface PlatformServices {
     fun openLocalFile(path: String): Boolean = false
 
     // ---- v2.5.0 媒体与手柄 ----
-    /** 打开文件所在目录（文件管理器定位到该文件） */
-    fun openFileLocation(path: String) {}
+    /** 打开文件所在目录（文件管理器定位到该文件）；v2.7.5 返回是否成功 */
+    fun openFileLocation(path: String): Boolean = false
     /** 手柄振动（服务器 rumble 指令 → 本机手柄马达；无手柄/不支持时 no-op） */
     fun rumbleGamepad(slot: Int, strong: Float, weak: Float, ms: Int) {}
     /** 截图当前视频帧 → PNG 字节（Android PixelCopy 直取解码 Surface；桌面取最新位图） */

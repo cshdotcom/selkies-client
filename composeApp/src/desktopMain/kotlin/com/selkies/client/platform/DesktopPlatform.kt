@@ -95,12 +95,13 @@ object DesktopPlatform : PlatformServices {
         File(path).takeIf { it.exists() }?.readBytes()
     }.getOrNull()
 
-    override fun openFile(path: String) {
-        runCatching {
+    override fun openFile(path: String): Boolean {
+        return runCatching {
             if (java.awt.Desktop.isDesktopSupported()) {
                 java.awt.Desktop.getDesktop().open(File(path))
-            }
-        }
+                true
+            } else false
+        }.getOrDefault(false)
     }
 
     override fun shareFile(path: String, displayName: String) {
@@ -390,10 +391,10 @@ object DesktopPlatform : PlatformServices {
         return sink
     }
 
-    override fun openFileLocation(path: String) {
-        runCatching {
+    override fun openFileLocation(path: String): Boolean {
+        return runCatching {
             val file = File(path)
-            if (!file.exists()) return
+            if (!file.exists()) return false
             val os = System.getProperty("os.name", "").lowercase()
             when {
                 os.contains("win") -> {
@@ -408,7 +409,8 @@ object DesktopPlatform : PlatformServices {
                     ProcessBuilder("xdg-open", file.parentFile?.absolutePath ?: file.absolutePath).start()
                 }
             }
-        }
+            true
+        }.getOrDefault(false)
     }
 
     override fun rumbleGamepad(slot: Int, strong: Float, weak: Float, ms: Int) {

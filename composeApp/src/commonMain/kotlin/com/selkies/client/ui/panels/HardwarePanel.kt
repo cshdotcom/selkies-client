@@ -165,6 +165,13 @@ fun HardwarePanel(session: SelkiesSession) {
                     title = "麦克风（可多选混音）",
                     right = {
                         Row(verticalAlignment = Alignment.CenterVertically) {
+                            // v2.7.5：「系统默认」芯片——清空选择即用系统默认麦克风（省心默认）
+                            FilterChip(
+                                selected = selectedMics.isEmpty(),
+                                onClick = { session.selectMics(emptyList()) },
+                                label = { Text("系统默认") }
+                            )
+                            Spacer(Modifier.size(6.dp))
                             if (filteredMics.isNotEmpty()) {
                                 FilterChip(
                                     selected = filteredMics.isNotEmpty() && filteredMics.all { it.id in selectedMics },
@@ -182,6 +189,17 @@ fun HardwarePanel(session: SelkiesSession) {
                         }
                     }
                 )
+            }
+            // v2.7.5：空选择 = 系统默认——给一行提示而不是「未找到」
+            if (selectedMics.isEmpty()) {
+                item {
+                    Text(
+                        "当前使用系统默认麦克风",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 46.dp, bottom = 2.dp)
+                    )
+                }
             }
             if (filteredMics.isEmpty() && !loading) {
                 item { EmptyDeviceRow("未找到麦克风设备") }
@@ -206,6 +224,17 @@ fun HardwarePanel(session: SelkiesSession) {
                     title = "摄像头（可多选 · 多路自动拼接合成上行）",
                     right = {
                         Row(verticalAlignment = Alignment.CenterVertically) {
+                            // v2.7.5：「系统默认」芯片
+                            FilterChip(
+                                selected = selectedCameraIds.isEmpty(),
+                                onClick = {
+                                    // 逐个反选清空（selectCamera 是切换语义）
+                                    selectedCameraIds.forEach { session.selectCamera(it) }
+                                    session.selectCamera("")
+                                },
+                                label = { Text("系统默认") }
+                            )
+                            Spacer(Modifier.size(6.dp))
                             if (filteredCameras.isNotEmpty()) {
                                 FilterChip(
                                     selected = filteredCameras.isNotEmpty() && filteredCameras.all { it.id in selectedCameraIds },
@@ -228,6 +257,16 @@ fun HardwarePanel(session: SelkiesSession) {
                     }
                 )
             }
+            if (selectedCameraIds.isEmpty()) {
+                item {
+                    Text(
+                        "当前使用系统默认摄像头",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 46.dp, bottom = 2.dp)
+                    )
+                }
+            }
             if (filteredCameras.isEmpty() && !loading) {
                 item { EmptyDeviceRow("未找到摄像头设备") }
             }
@@ -241,22 +280,33 @@ fun HardwarePanel(session: SelkiesSession) {
                 )
             }
 
-            // ---- 扬声器（输出；v2.6.0 多选 + 独立音量） ----
+            // ---- 扬声器（输出；v2.6.0 多选 + 独立音量；v2.7.5 默认跟随系统） ----
             if (speakerDevices.isNotEmpty()) {
                 item {
                     DeviceHeader(
                         icon = Icons.Filled.Speaker,
                         title = "音频输出（可多选 · 独立音量）",
                         right = {
-                            if (selectedSpeakers.isNotEmpty()) {
-                                FilterChip(
-                                    selected = false,
-                                    onClick = { session.selectSpeakers(emptyList()) },
-                                    label = { Text("恢复默认") }
-                                )
-                            }
+                            // v2.7.5：「跟随系统」芯片——空选择 = 系统默认路由（扬声器↔耳机自动切换）
+                            FilterChip(
+                                selected = selectedSpeakers.isEmpty(),
+                                onClick = { session.selectSpeakers(emptyList()) },
+                                label = { Text("跟随系统") }
+                            )
                         }
                     )
+                }
+                // v2.7.5：默认模式提示（用户要求「默认扬声器主播放器，有耳机选耳机」——
+                //  空选择时 Android 自动把媒体音频路由到扬声器，插耳机/连蓝牙自动切换，无需手选）
+                if (selectedSpeakers.isEmpty()) {
+                    item {
+                        Text(
+                            "跟随系统：扬声器自动播放，插入耳机/连接蓝牙自动切换",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(start = 46.dp, bottom = 2.dp)
+                        )
+                    }
                 }
                 items(speakerDevices, key = { "spk-" + it.id }) { dev ->
                     val selected = dev.id in selectedSpeakers

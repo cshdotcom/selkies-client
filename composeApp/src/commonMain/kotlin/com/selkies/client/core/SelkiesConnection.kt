@@ -189,15 +189,17 @@ class SelkiesConnection(
                             continue
                         }
                         status == 401 -> {
+                            // v2.7.5：区分「未配置凭据」与「凭据被拒」——前者交给会话层弹认证对话框
+                            // （用户输入 → 回填配置 → 重试），后者保持原错误提示。
                             if (authHeader == null) {
                                 listener.onError(
-                                    "服务器要求认证（HTTP 401）：请在服务器配置中填写用户名和密码",
-                                    "401 Unauthorized; no credentials configured"
+                                    "服务器要求认证（HTTP 401）：请在弹出的窗口输入用户名和密码",
+                                    "401-no-credentials"
                                 )
                             } else {
                                 listener.onError(
                                     "认证失败（HTTP 401）：${if (server.useTokenAuth) "请检查令牌是否正确" else "用户名或密码错误"}",
-                                    "401 Unauthorized with credentials user='${server.username.ifBlank { "(empty)" }}'"
+                                    "401-bad-credentials user='${server.username.ifBlank { "(empty)" }}'"
                                 )
                             }
                             return null

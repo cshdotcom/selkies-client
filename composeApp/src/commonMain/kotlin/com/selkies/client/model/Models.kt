@@ -2,9 +2,7 @@ package com.selkies.client.model
 
 import kotlinx.serialization.Serializable
 
-/**
- * 服务器条目
- */
+/** 服务器条目 */
 @Serializable
 data class ServerEntry(
     val id: String,
@@ -68,6 +66,14 @@ data class ServerEntry(
         return u
     }
 }
+
+/** v2.7.5：认证请求（连接遇 401 且未配置凭据 → UI 弹认证对话框输入并回填配置） */
+data class AuthPrompt(
+    val serverName: String,
+    val message: String,          // 面向用户的提示（来自连接层 401 消息）
+    val tokenMode: Boolean,       // 服务器条目配置为令牌模式
+    val rejected: Boolean         // true=已配置的凭据被拒绝（密码错误）；false=未配置凭据
+)
 
 /** 视频质量预设（映射到 ServerEntry 原始字段；与官方设置键一致） */
 object VideoPresets {

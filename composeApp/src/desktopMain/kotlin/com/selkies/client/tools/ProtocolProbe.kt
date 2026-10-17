@@ -351,7 +351,7 @@ object ProtocolProbe {
         override fun setPhysicalKeyHandler(handler: ((Int, Boolean) -> Boolean)?) {}
         override fun readFileBytes(path: String): ByteArray? = null
         override fun exitApp() {}
-        override fun openFile(path: String) {}
+        override fun openFile(path: String): Boolean = false
         override fun shareFile(path: String, displayName: String) {}
     }
 }

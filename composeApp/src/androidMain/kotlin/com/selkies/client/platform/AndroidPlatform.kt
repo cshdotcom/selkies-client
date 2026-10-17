@@ -225,45 +225,110 @@ object AndroidPlatform : PlatformServices {
         activityRef?.finish()
     }
 
-    /** 用系统查看器打开本地文件（FileProvider 授权） */
-    override fun openFile(path: String) {
-        runCatching {
-            val ctx = appContext ?: return
-            val uri = if (path.startsWith("content://")) {
-                android.net.Uri.parse(path)
-            } else {
-                val file = java.io.File(path)
-                if (!file.exists()) return
-                androidx.core.content.FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
-            }
-            val mime = ctx.contentResolver.getType(uri) ?: "*/*"
+    /** 用系统查看器打开本地文件（FileProvider 授权）。
+     *     v2.7.5【打开文件没反应根治】：
+     *     ① 扩展名→MIME 显式映射（系统 MimeTypeMap 不认 mkv/webm 等 → 旧版回退「任意类型」→
+     *        无应用可打开且 runCatching 靜默吞掉 ActivityNotFoundException = 「没反应」）
+     *     ② 公共媒体目录文件不再走 FileProvider 的 external-path 缺失异常（file_paths.xml 已补）
+     *     ③ 无查看器时回退系统选择器；仍失败返回 false（UI 提示） */
+    override fun openFile(path: String): Boolean {
+        val ctx = appContext ?: return false
+        return runCatching {
+            val uri = resolveShareUri(ctx, path) ?: return false
+            val name = path.substringAfterLast('/')
+            val mime = mimeForFile(name) ?: ctx.contentResolver.getType(uri) ?: "*/*"
             val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
                 setDataAndType(uri, mime)
                 addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            ctx.startActivity(intent)
-        }
+            try {
+                ctx.startActivity(intent)
+                true
+            } catch (e: android.content.ActivityNotFoundException) {
+                // 无单应用可处理 → 系统选择器（FileProvider 授权传递）
+                val chooser = android.content.Intent.createChooser(intent, "打开 $name").apply {
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                runCatching { ctx.startActivity(chooser) }.isSuccess
+            }
+        }.getOrDefault(false)
     }
 
-    /** 系统分享面板 */
+    /** 系统分享面板（v2.7.5：同样修复 MIME 与无应用的反馈） */
     override fun shareFile(path: String, displayName: String) {
         runCatching {
             val ctx = appContext ?: return
-            val uri = if (path.startsWith("content://")) {
-                android.net.Uri.parse(path)
-            } else {
-                val file = java.io.File(path)
-                if (!file.exists()) return
-                androidx.core.content.FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
-            }
+            val uri = resolveShareUri(ctx, path) ?: return
+            val mime = mimeForFile(displayName) ?: ctx.contentResolver.getType(uri) ?: "application/octet-stream"
             val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
-                type = ctx.contentResolver.getType(uri) ?: "application/octet-stream"
+                type = mime
                 putExtra(android.content.Intent.EXTRA_STREAM, uri)
                 addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             ctx.startActivity(android.content.Intent.createChooser(intent, "分享 $displayName").apply {
                 addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
             })
+        }
+    }
+
+    /** path → 可授权 Uri：content:// 直接用；文件路径走 FileProvider（失败时拷贝到缓存后重试）
+     *  v2.7.5：公共媒体目录（Pictures/Movies/Download 下的 Selkies）已入 file_paths.xml external-path */
+    private fun resolveShareUri(ctx: Context, path: String): android.net.Uri? {
+        if (path.startsWith("content://")) return android.net.Uri.parse(path)
+        val file = File(path)
+        if (!file.exists()) return null
+        val direct = runCatching {
+            androidx.core.content.FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
+        }.getOrNull()
+        if (direct != null) return direct
+        // 路径不在 FileProvider 范围（应用私有目录等特殊位置）：拷到缓存再授权
+        return runCatching {
+            val cache = File(ctx.cacheDir, "share_${System.currentTimeMillis()}_${file.name}")
+            file.copyTo(cache, overwrite = true)
+            androidx.core.content.FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", cache)
+        }.getOrNull()
+    }
+
+    /** v2.7.5：扩展名 → MIME 显式映射（系统 MimeTypeMap 缺 mkv/webm/flac 等 = 打开没反应根因之一） */
+    private fun mimeForFile(name: String): String? {
+        val ext = name.substringAfterLast('.', "").lowercase()
+        return when (ext) {
+            "png" -> "image/png"
+            "jpg", "jpeg" -> "image/jpeg"
+            "webp" -> "image/webp"
+            "gif" -> "image/gif"
+            "bmp" -> "image/bmp"
+            "heic", "heif" -> "image/heif"
+            "mp4" -> "video/mp4"
+            "mkv" -> "video/x-matroska"
+            "webm" -> "video/webm"
+            "avi" -> "video/x-msvideo"
+            "mov" -> "video/quicktime"
+            "3gp" -> "video/3gpp"
+            "ts" -> "video/mp2t"
+            "mp3" -> "audio/mpeg"
+            "wav" -> "audio/x-wav"
+            "flac" -> "audio/flac"
+            "ogg", "opus" -> "audio/ogg"
+            "m4a", "aac" -> "audio/mp4"
+            "pdf" -> "application/pdf"
+            "txt" -> "text/plain"
+            "html", "htm" -> "text/html"
+            "xml" -> "text/xml"
+            "json" -> "application/json"
+            "zip" -> "application/zip"
+            "rar" -> "application/vnd.rar"
+            "7z" -> "application/x-7z-compressed"
+            "tar", "gz" -> "application/x-gtar"
+            "apk" -> "application/vnd.android.package-archive"
+            "exe" -> "application/vnd.microsoft.portable-executable"
+            "doc" -> "application/msword"
+            "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            "xls" -> "application/vnd.ms-excel"
+            "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            "ppt" -> "application/vnd.ms-powerpoint"
+            "pptx" -> "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            else -> null
         }
     }
 
@@ -507,21 +572,51 @@ object AndroidPlatform : PlatformServices {
 
     // ---- v2.5.0 媒体/手柄/焦点 ----
 
-    override fun openFileLocation(path: String) {
-        // Android 无通用「定位到文件」；尽力打开文件管理器对应目录/文件
-        runCatching {
-            val ctx = appContext ?: return
-            val uri = if (path.startsWith("content://")) android.net.Uri.parse(path)
-            else runCatching {
-                androidx.core.content.FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", File(path))
-            }.getOrNull() ?: android.net.Uri.fromFile(File(path))
-            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "*/*")
-                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    override fun openFileLocation(path: String): Boolean {
+        // v2.7.5【打开文件夹没反应根治】：三级回退——
+        //  ① DocumentsContract 目录 URI（ExternalStorageProvider，多数国产 ROM 文件管理器支持
+        //     vnd.android.document/directory 定位到真实目录）
+        //  ② Download 目录文件 → 系统「下载」应用列表
+        //  ③ 打开文件本身（至少有响应）
+        val ctx = appContext ?: return false
+        // 先把 content URI 还原成真实路径（MediaStore DATA 列）
+        val realPath: String = if (path.startsWith("content://")) {
+            runCatching {
+                ctx.contentResolver.query(
+                    android.net.Uri.parse(path),
+                    arrayOf(MediaStore.MediaColumns.DATA), null, null, null
+                )?.use { c -> if (c.moveToFirst()) c.getString(0) ?: "" else "" } ?: ""
+            }.getOrDefault("") ?: ""
+        } else path
+        // ① DocumentsContract 目录视图（真实绝对路径 /storage/emulated/0/<相对>）
+        if (realPath.startsWith("/storage/emulated/0/")) {
+            val rel = realPath.removePrefix("/storage/emulated/0/").substringBeforeLast('/')
+            if (rel.isNotBlank()) {
+                val dirUri = runCatching {
+                    android.provider.DocumentsContract.buildDocumentUri(
+                        "com.android.externalstorage.documents", "primary:$rel"
+                    )
+                }.getOrNull()
+                if (dirUri != null) {
+                    val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                        setDataAndType(dirUri, "vnd.android.document/directory")
+                        addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    if (runCatching { ctx.startActivity(intent) }.isSuccess) return true
+                }
             }
-            ctx.startActivity(intent)
         }
+        // ② 下载目录 → 系统「下载」应用
+        if (realPath.contains("/Download/", true) || path.contains("Downloads", true)) {
+            val ok = runCatching {
+                ctx.startActivity(android.content.Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS)
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+            }.isSuccess
+            if (ok) return true
+        }
+        // ③ 兜底：打开文件本身
+        return openFile(path)
     }
 
     override fun rumbleGamepad(slot: Int, strong: Float, weak: Float, ms: Int) {
@@ -687,8 +782,60 @@ private class AndroidClipboardBridge : ClipboardBridge {
     }
 
     override fun getImagePng(): ByteArray? {
-        // Android 剪贴板图像读取复杂且少见，返回 null（远端图像 → 本地已支持 PNG 写入）
-        return null
+        // v2.7.5【图片剪贴板根因修复】：旧版直接 return null = 「本地复制/截图的图片永远发不出去」。
+        // 现在真正读取：ClipData item 的 uri（图库/截图复制）/ intent（ACTION_SEND EXTRA_STREAM）
+        // → 读字节 → 非 PNG（JPEG/WebP/HEIC）经 BitmapFactory 解码再压 PNG。
+        // 注意：此方法做磁盘/Resolver IO，调用方应放在 IO 线程。
+        return runCatching {
+            val ctx = appCtxRef() ?: return null
+            val cm = this.cm ?: return null
+            val clip = cm.primaryClip ?: return null
+            for (i in 0 until clip.itemCount) {
+                val item = clip.getItemAt(i) ?: continue
+                // ① 直接 URI（ClipData.newUri / 图库复制）
+                val uri = item.uri
+                    ?: runCatching { item.intent?.getParcelableExtra<android.net.Uri>(android.content.Intent.EXTRA_STREAM) }.getOrNull()
+                if (uri != null) {
+                    val bytes = runCatching {
+                        ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    }.getOrNull()
+                    if (bytes != null && bytes.size > 8) {
+                        if (bytes[0] == 0x89.toByte() && bytes[1] == 'P'.code.toByte() &&
+                            bytes[2] == 'N'.code.toByte() && bytes[3] == 'G'.code.toByte()
+                        ) return bytes
+                        val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        if (bmp != null) {
+                            val out = java.io.ByteArrayOutputStream()
+                            if (bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)) {
+                                bmp.recycle()
+                                return out.toByteArray()
+                            }
+                            bmp.recycle()
+                        }
+                    }
+                }
+                // ② 文本化 URI（部分 ROM 把 content URI coerce 成文本）
+                val t = item.text?.toString() ?: continue
+                if (t.startsWith("content://") || t.startsWith("file://")) {
+                    val u = android.net.Uri.parse(t.trim())
+                    val bytes = runCatching {
+                        ctx.contentResolver.openInputStream(u)?.use { it.readBytes() }
+                    }.getOrNull()
+                    if (bytes != null && bytes.size > 8) {
+                        val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        if (bmp != null) {
+                            val out = java.io.ByteArrayOutputStream()
+                            if (bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)) {
+                                bmp.recycle()
+                                return out.toByteArray()
+                            }
+                            bmp.recycle()
+                        }
+                    }
+                }
+            }
+            null
+        }.getOrNull()
     }
 
     override fun setImagePng(png: ByteArray) {

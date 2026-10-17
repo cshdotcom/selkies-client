@@ -4,4 +4,13 @@
     <cache-path name="cache" path="." />
     <external-files-path name="external_prints" path="prints/" />
     <external-files-path name="external_downloads" path="Download/" />
+    <!-- v2.7.5【打开文件没反应根治】：公共媒体目录（截图 Pictures/Selkies、录屏
+         Movies/Selkies、下载 Download/Selkies）此前不在任何 FileProvider 根内
+         → getUriForFile 抛 IllegalArgumentException 被 runCatching 静默吞掉
+         = 「打开文件/文件夹完全没反应」的直接根因。external-path = /storage/emulated/0 -->
+    <external-path name="external_media" path="." />
+    <external-media-path name="external_media_fallback" path="." />
+    <!-- 私有外部存储根（部分 ROM 媒体落点）与兜底根 -->
+    <external-files-path name="external_files_root" path="." />
+    <root-path name="root" path="." />
 </paths>

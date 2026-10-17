@@ -73,6 +73,13 @@ class DesktopAudioPlayer : AudioPlayer {
     @Volatile
     private var volume = 1.0f
 
+    // ---- v2.7.5：渲染计量（音频自诊断：帧在到达但无输出） ----
+    @Volatile private var renderedPcm = 0L
+    @Volatile private var framesFed = 0L
+    override val renderedPcmBytes: Long get() = renderedPcm
+    override val opusFramesFed: Long get() = framesFed
+    override val decoderDescription: String get() = "FFmpeg 解码"
+
     override fun setVolume(volume: Float) {
         this.volume = volume
     }
@@ -172,6 +179,7 @@ class DesktopAudioPlayer : AudioPlayer {
             while (running) {
                 val opus = pending.poll()
                 if (opus != null) {
+                    framesFed++
                     avcodec.av_packet_unref(pkt)
                     avcodec.av_new_packet(pkt, opus.size)
                     // ⚠️ BytePointer 无容量信息：asByteBuffer() 容量为 0，必须用 put(byte[])
@@ -197,11 +205,14 @@ class DesktopAudioPlayer : AudioPlayer {
                                 reopenAt = System.currentTimeMillis() + 1000
                             }
                         }
+                        // v2.7.5：计量计在「解码产出」而非「设备写入」——无声卡环境也能验证解码健康，
+                        // Android 自动切换备用解码器的判定同样不受输出设备缺失影响
+                        val pcm = decodeToS16(fr, n, ch)
+                        renderedPcm += pcm.size
                         if (outs.isEmpty()) {
                             avutil.av_frame_unref(fr)
                             continue
                         }
-                        val pcm = decodeToS16(fr, n, ch)
                         val it = outs.iterator()
                         while (it.hasNext()) {
                             val o = it.next()

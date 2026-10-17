@@ -44,6 +44,8 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Mouse
@@ -51,6 +53,7 @@ import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.QueryStats
+import androidx.compose.material.icons.filled.RemoveRedEye
 import androidx.compose.material.icons.filled.SportsEsports
 import androidx.compose.material.icons.filled.StopCircle
 import androidx.compose.material.icons.filled.TouchApp
@@ -62,12 +65,15 @@ import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material.icons.filled.ZoomOut
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -100,6 +106,8 @@ import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -127,6 +135,7 @@ import com.selkies.client.ui.panels.SavedMediaPanel
 import com.selkies.client.ui.panels.SessionSettingsPanel
 import com.selkies.client.ui.panels.StatsPanel
 import com.selkies.client.ui.panels.VirtualGamepadOverlay
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -405,7 +414,11 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                 if (img != lastImageSig) {
                     lastImageSig = img
                     if (img) {
-                        clip.getImagePng()?.let { png -> session.pushLocalImage(png) }
+                        // v2.7.5：图像读取（content resolver IO）移出主线程（旧版主线程读=卡顿/ANR风险）
+                        scope.launch(Dispatchers.IO) {
+                            val png = runCatching { clip.getImagePng() }.getOrNull()
+                            if (png != null) session.pushLocalImage(png)
+                        }
                     }
                 }
             }
@@ -1057,6 +1070,12 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                         if (status == SelkiesSession.Status.FAILED || lastError != null) {
                             Button(onClick = { session.connect() }) { Text("重试") }
                         }
+                        // v2.7.5：断开/被踢时一键切换只读模式重连（官方共享模式旁观通道，不掉线）
+                        if (!viewOnly) {
+                            androidx.compose.material3.OutlinedButton(onClick = {
+                                session.switchViewOnly(true)
+                            }) { Text("切到只读重连") }
+                        }
                         Button(onClick = { state.navigate(com.selkies.client.Screen.ServerList) }) { Text("返回") }
                     }
                 }
@@ -1116,6 +1135,36 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                 if (inputMode == InputMode.TRACKPAD) append(" · 触摸板")
                             },
                             color = Color.White.copy(alpha = 0.7f), fontSize = 11.sp
+                        )
+                    }
+                    // v2.7.5：连接中途切换 控制 ↔ 只读（重连实现——服务器角色绑定在连接上）
+                    var confirmModeSwitch by remember { mutableStateOf(false) }
+                    IconButton(onClick = { confirmModeSwitch = true }) {
+                        Icon(
+                            if (viewOnly) Icons.Filled.Lock else Icons.Filled.LockOpen,
+                            if (viewOnly) "切换到控制模式" else "切换到只读模式",
+                            tint = if (viewOnly) Color(0xFFF59E0B) else Color.White
+                        )
+                    }
+                    if (confirmModeSwitch) {
+                        AlertDialog(
+                            onDismissRequest = { confirmModeSwitch = false },
+                            title = { Text(if (viewOnly) "切换到控制模式？" else "切换到只读模式？") },
+                            text = {
+                                Text(
+                                    if (viewOnly) "将获得键鼠控制权（原控制端会被顶替）。切换需要重新连接，约 1~2 秒。"
+                                    else "只观察远程画面（不发送键鼠输入，可在控制端被占用时旁观）。切换需要重新连接，约 1~2 秒。"
+                                )
+                            },
+                            confirmButton = {
+                                TextButton(onClick = {
+                                    confirmModeSwitch = false
+                                    session.switchViewOnly(!viewOnly)
+                                }) { Text("切换") }
+                            },
+                            dismissButton = {
+                                TextButton(onClick = { confirmModeSwitch = false }) { Text("取消") }
+                            }
                         )
                     }
                     IconButton(onClick = { toolbarVisible = false }) {
@@ -1620,10 +1669,13 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     Row {
                         if (ev.path != null) {
                             androidx.compose.material3.TextButton(onClick = {
-                                platform.openFile(ev.path)
+                                // v2.7.5：反馈打开结果（旧版静默失败 = 「点了没反应」）
+                                val ok = platform.openFile(ev.path)
+                                if (!ok) toast = "没有可打开此文件的应用（或文件不存在）"
                             }) { Text("打开") }
                             androidx.compose.material3.TextButton(onClick = {
-                                platform.openFileLocation(ev.path)
+                                val ok = platform.openFileLocation(ev.path)
+                                if (!ok) toast = "无法打开所在文件夹（已尝试文件管理器/下载/文件本身）"
                             }) { Text("所在文件夹") }
                             androidx.compose.material3.TextButton(onClick = {
                                 platform.clipboard().setText(ev.path)
@@ -1634,6 +1686,28 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                             session.savedMediaEvent.value = null
                         }) { Text("完成") }
                     }
+                }
+            )
+        }
+
+        // ============ v2.7.5：认证对话框（连接遇 401 且未配置凭据 → 弹窗输入） ============
+        val authPrompt by session.authPromptEvent.collectAsState()
+        authPrompt?.let { prompt ->
+            AuthDialog(
+                prompt = prompt,
+                presetUsername = server.username,
+                presetToken = server.token,
+                onSubmit = { user, pass, remember ->
+                    // 回填服务器条目（连接立即使用）；勾选「保存」才持久化到配置
+                    session.applyCredentialsAndReconnect(user, pass)
+                    if (remember) state.store.saveServers()
+                },
+                onSubmitToken = { token, remember ->
+                    session.applyTokenAndReconnect(token)
+                    if (remember) state.store.saveServers()
+                },
+                onDismiss = {
+                    session.dismissAuthPrompt()
                 }
             )
         }
@@ -1963,5 +2037,108 @@ object ToolbarDefaults {
         "quality" to "画质", "touchmode" to "触屏/触摸板", "apps" to "应用", "stats" to "统计",
         "screenshot" to "截图", "record" to "录屏", "volume" to "音量", "gamepad" to "手柄",
         "virtualpad" to "虚拟手柄", "zoom" to "放大镜", "media" to "媒体库", "fullscreen" to "全屏"
+    )
+}
+
+/**
+ * v2.7.5：认证对话框——连接遇 401 时弹出，输入用户名/密码（或令牌），
+ * 提交后自动回填服务器配置并重连；密码/令牌带眼睛图标切换显示。
+ * 「记住」即回填配置（下次连接自动携带、编辑配置可见）。
+ */
+@Composable
+fun AuthDialog(
+    prompt: com.selkies.client.model.AuthPrompt,
+    presetUsername: String,
+    presetToken: String,
+    onSubmit: (username: String, password: String, remember: Boolean) -> Unit,
+    onSubmitToken: (token: String, remember: Boolean) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var username by remember { mutableStateOf(if (prompt.rejected) presetUsername else "") }
+    var password by remember { mutableStateOf("") }
+    var token by remember { mutableStateOf(if (prompt.rejected) presetToken else "") }
+    var showPassword by remember { mutableStateOf(false) }
+    var showToken by remember { mutableStateOf(false) }
+    var useToken by remember { mutableStateOf(prompt.tokenMode) }
+    var remember by remember { mutableStateOf(true) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (prompt.rejected) "认证失败" else "服务器需要认证") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "${prompt.serverName}\n${prompt.message}" +
+                            if (prompt.rejected) "\n请重新输入后重试" else "",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    androidx.compose.material3.Checkbox(checked = useToken, onCheckedChange = { useToken = it })
+                    Text("使用令牌（Token）", style = MaterialTheme.typography.bodyMedium)
+                }
+                if (useToken) {
+                    OutlinedTextField(
+                        value = token,
+                        onValueChange = { token = it },
+                        label = { Text("会话令牌") },
+                        singleLine = true,
+                        visualTransformation = if (showToken) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { showToken = !showToken }) {
+                                Icon(
+                                    if (showToken) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                    if (showToken) "隐藏令牌" else "显示令牌"
+                                )
+                            }
+                        }
+                    )
+                } else {
+                    OutlinedTextField(
+                        value = username,
+                        onValueChange = { username = it },
+                        label = { Text("用户名") },
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = { password = it },
+                        label = { Text("密码") },
+                        singleLine = true,
+                        visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { showPassword = !showPassword }) {
+                                Icon(
+                                    if (showPassword) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                    if (showPassword) "隐藏密码" else "显示密码"
+                                )
+                            }
+                        }
+                    )
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    androidx.compose.material3.Checkbox(checked = remember, onCheckedChange = { remember = it })
+                    Text("保存到配置（下次自动登录）", style = MaterialTheme.typography.bodySmall)
+                }
+                if (!remember) {
+                    Text(
+                        "不保存：本次连接使用，配置中不保留密码",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                if (useToken) {
+                    if (token.isNotBlank()) onSubmitToken(token, remember)
+                } else {
+                    if (username.isNotBlank() && password.isNotEmpty()) onSubmit(username, password, remember)
+                }
+            }) { Text("连接") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        }
     )
 }

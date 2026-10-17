@@ -1,6 +1,7 @@
 package com.selkies.client.core
 
 import com.selkies.client.model.AppSettings
+import com.selkies.client.model.AuthPrompt
 import com.selkies.client.model.CursorShape
 import com.selkies.client.model.HardwareDevice
 import com.selkies.client.model.PrintJobEntry
@@ -50,6 +51,10 @@ class SelkiesSession(
     val stats = MutableStateFlow(StatsInfo())
     /** 用户可见轻提示（打印到达/传输完成/硬件错误等，UI 自动消费） */
     val notices = MutableStateFlow<String?>(null)
+
+    /** v2.7.5：认证请求事件——连接遇 401 且未配置凭据时置位；UI 弹认证窗口，
+     *  输入结果经 applyCredentialsAndReconnect 回填服务器条目并重连 */
+    val authPromptEvent = MutableStateFlow<AuthPrompt?>(null)
     val realizedResolution = MutableStateFlow<Pair<Int, Int>?>(null)
     val apps = MutableStateFlow<List<Pair<String, String>>>(emptyList())
     val role = MutableStateFlow("controller")
@@ -108,6 +113,10 @@ class SelkiesSession(
     /** 麦克风/摄像头上行开关（UI 观察） */
     val micActive = MutableStateFlow(false)
     val webcamActive = MutableStateFlow(false)
+
+    // v2.7.5【远程硬件保活】：断线重连后自动恢复上行（MODE websockets 到达时检查）
+    @Volatile private var micWanted = false
+    @Volatile private var webcamWanted = false
 
     /** 录屏引擎（WS 流直采，无系统录屏权限） */
     val recorder = StreamRecorder { path -> platform.makeStreamMuxer(path) }
@@ -240,6 +249,8 @@ class SelkiesSession(
     val remoteClipboard = MutableStateFlow<Pair<String?, String>?>(null)
     /** v2.6.0 剪贴板同步事件提示（用户反馈：发送/接收成功或失败） */
     val clipboardNotice = MutableStateFlow<String?>(null)
+    /** v2.7.5：远程剪贴板图像（image/png 等二进制载荷；UI 预览/保存相册/粘贴） */
+    val remoteClipboardImage = MutableStateFlow<ByteArray?>(null)
     private var clipboardMultipart: StringBuilder? = null
     private var clipboardMultipartMime = "text/plain"
     private var clipboardMultipartExpected = 0L
@@ -289,6 +300,7 @@ class SelkiesSession(
         userClosed = false
         reconnectAttempts = 0
         startVideoAttempts = 0
+        renderStallStrikes = 0
         status.value = Status.CONNECTING
         statusDetail.value = "正在连接服务器..."
         modeReceived = false
@@ -535,6 +547,12 @@ class SelkiesSession(
                         if (server.audioEnabled) connection.sendText("START_AUDIO")
                         subscribeStats()
                         armStartVideoWatchdog()
+                        // v2.7.5【远程硬件保活】：断线重连后自动恢复麦克风/摄像头上行。
+                        // 旧版重连前 stop 但重连成功后无人重启 = 「会话中途麦克风/摄像头失效」根因。
+                        if (!server.viewOnly) {
+                            if (micWanted) { delay(400); startMicUplink() }
+                            if (webcamWanted) { delay(200); startWebcamUplink() }
+                        }
                     }
                 }
             }
@@ -1016,6 +1034,10 @@ class SelkiesSession(
                                 realizedResolution.value = header.width to header.height
                                 stats.value.resolution = "${header.width}x${header.height}"
                                 stats.value = stats.value
+                                // v2.7.5【黑屏修复】：分辨率变化但本帧非关键帧 → P 帧引用旧尺寸参考帧，
+                                // 解码器不会重配（仅关键帧携带新 SPS/PPS 时才重建）→ 花屏/黑屏。
+                                // 立刻请求关键帧强制 IDR 带新参数集重建解码器。
+                                if (!header.keyframe && cur != null) requestKeyframe()
                             }
                         }
                         stats.value.videoFrames++
@@ -1100,6 +1122,30 @@ class SelkiesSession(
         lastError.value = userMessage
         lastErrorTechnical.value = technical
         if (userClosed) return
+        // v2.7.5：未配置凭据遇到 401 → 弹认证窗口（用户输入回填配置并重连）
+        if (technical.contains("401-no-credentials")) {
+            status.value = Status.FAILED
+            statusDetail.value = "需要认证"
+            authPromptEvent.value = AuthPrompt(
+                server.name.ifBlank { server.url },
+                userMessage,
+                server.useTokenAuth,
+                rejected = false
+            )
+            return
+        }
+        // v2.7.5：已配置的凭据被拒 → 也弹认证窗口（标记 rejected，预填旧用户名）
+        if (technical.contains("401-bad-credentials")) {
+            status.value = Status.FAILED
+            statusDetail.value = "认证失败"
+            authPromptEvent.value = AuthPrompt(
+                server.name.ifBlank { server.url },
+                userMessage,
+                server.useTokenAuth,
+                rejected = true
+            )
+            return
+        }
         // 认证/路径/模式错误不自动重连
         val fatal = technical.contains("401") || technical.contains("403") ||
                 technical.contains("409") || technical.contains("no ws endpoint") ||
@@ -1110,6 +1156,64 @@ class SelkiesSession(
             return
         }
         scheduleReconnect(userMessage)
+    }
+
+    /** v2.7.5：认证窗口提交——回填服务器条目并重连（UI 层负责持久化 store） */
+    fun applyCredentialsAndReconnect(username: String, password: String) {
+        server.username = username.trim()
+        server.password = password
+        server.useTokenAuth = false
+        server.token = ""
+        authPromptEvent.value = null
+        lastError.value = null
+        statusDetail.value = "已更新认证信息，正在重连…"
+        reconnectAttempts = 0
+        connect()
+    }
+
+    /** v2.7.5：令牌认证窗口提交 */
+    fun applyTokenAndReconnect(token: String) {
+        server.useTokenAuth = true
+        server.token = token.trim()
+        server.username = ""
+        server.password = ""
+        authPromptEvent.value = null
+        lastError.value = null
+        statusDetail.value = "已更新令牌，正在重连…"
+        reconnectAttempts = 0
+        connect()
+    }
+
+    /** v2.7.5：认证窗口取消 */
+    fun dismissAuthPrompt() {
+        authPromptEvent.value = null
+        statusDetail.value = "需要认证——可点击重试或返回编辑配置"
+    }
+
+    /** v2.7.5：连接中途切换控制/只读模式（重连实现——服务器角色绑定在连接上） */
+    fun switchViewOnly(viewOnly: Boolean) {
+        server.viewOnly = viewOnly
+        // 乐观本地角色（服务器 AUTH_SUCCESS/ROLE_UPDATE 到达时会校正；
+        // 部分 viewer 连接不发 AUTH_SUCCESS，若不本地置位 UI 会一直显示旧角色）
+        role.value = if (viewOnly) "viewer" else "controller"
+        userClosed = false
+        reconnectAttempts = 0
+        runCatching { connection.close() }
+        status.value = Status.CONNECTING
+        statusDetail.value = if (viewOnly) "切换到只读模式…" else "切换到控制模式…"
+        scope.launch {
+            delay(300)
+            if (!userClosed) {
+                runCatching { micCapture.stop() }
+                runCatching { webcamCapture.stop() }
+                micActive.value = false
+                webcamActive.value = false
+                videoRequested = false
+                modeReceived = false
+                lastReceivedFrameId = -1
+                openConnection()
+            }
+        }
     }
 
     private fun scheduleReconnect(reason: String) {
@@ -1135,6 +1239,10 @@ class SelkiesSession(
             if (!userClosed) {
                 runCatching { micCapture.stop() }
                 runCatching { webcamCapture.stop() }
+                // v2.7.5：采集已停——状态归 false（micWanted/webcamWanted 仍为 true；
+                //  重连成功后 MODE 处理器据此自动重启上行）
+                micActive.value = false
+                webcamActive.value = false
                 videoRequested = false
                 modeReceived = false
                 lastReceivedFrameId = -1
@@ -1362,7 +1470,15 @@ class SelkiesSession(
      * 覆盖三类用户报障：①退到后台再回前台 SurfaceView 重建后解码器丢弃增量帧→永久黑屏；
      * ②链路丢帧导致参考帧断裂→画面冻结；③【v2.6.0+】帧到达但中途加入 GOP 解码不出
      * （non-existing PPS）→ 帧到达后 2.5s 仍未出首帧解码则强制关键帧。
+     *
+     * 【v2.7.5·频繁黑屏根治】新增第④类：**帧在持续到达但渲染无进展**（decode stall）——
+     * 解码器中途出错释放（旧版静默丢后续所有帧）、输入缓冲繁忙丢帧断了参考链、
+     * 无限 GOP 下无关键帧自愈——旧版看门狗只看「无帧到达」，这类黑屏永远不会触发恢复。
+     * 现在持续监测 sink.lastRenderAtMs：帧在到达而渲染停滞 >3s → 强制关键帧；
+     * 连续 3 次无改善 → 释放解码器（reset）再请求关键帧重建；
+     * 同时消费 sink.needsKeyframe（解码端溢出/出错主动请求）。
      */
+    private var renderStallStrikes = 0
     private fun startStallWatchdog() {
         stallWatchdog?.cancel()
         stallWatchdog = scope.launch {
@@ -1372,6 +1488,36 @@ class SelkiesSession(
                 if (!settings().requestKeyframeOnStall) continue
                 val last = lastReceivedFrameAt
                 val now = System.currentTimeMillis()
+                val sink = videoSink
+                // v2.7.5：解码端主动请求（队列溢出/解码错误/输入丢弃）。
+                // 注意：只在真正发出请求时才消费标志——限流窗口内保留标志，下轮重试
+                // （旧序：先清标志再限流 = 限流期内标志丢失、请求永远发不出）
+                if (sink != null && sink.needsKeyframe && now - lastKeyframeRequestAt > 2500) {
+                    sink.clearNeedsKeyframe()
+                    lastKeyframeRequestAt = now
+                    stats.value.keyframeRequests++
+                    runCatching { connection.sendText("REQUEST_KEYFRAME") }
+                }
+                // v2.7.5：帧在到达但渲染停滞 → 关键帧 → 重置解码器 → 再关键帧（三级递进恢复）
+                if (sink != null && last > 0 && now - last < 3000 && firstDecodedFrameAt > 0) {
+                    val lastRender = sink.lastRenderAtMs
+                    if (lastRender > 0 && now - lastRender > 3000) {
+                        if (now - lastKeyframeRequestAt > 5000) {
+                            lastKeyframeRequestAt = now
+                            renderStallStrikes++
+                            stats.value.keyframeRequests++
+                            if (renderStallStrikes >= 3) {
+                                // 关键帧请求多次仍无渲染：解码器已死锁/内部损坏，强制释放重建
+                                renderStallStrikes = 0
+                                statusDetail.value = "视频解码无响应，正在重建解码器…"
+                                runCatching { sink.reset() }
+                            }
+                            runCatching { connection.sendText("REQUEST_KEYFRAME") }
+                        }
+                    } else if (lastRender > 0 && now - lastRender < 1500) {
+                        renderStallStrikes = 0
+                    }
+                }
                 if (last > 0 && now - last > 3000) {
                     if (now - lastKeyframeRequestAt > 5000) {
                         lastKeyframeRequestAt = now
@@ -1461,6 +1607,17 @@ class SelkiesSession(
         if (!s.clipboardAutoSend || !s.clipboardBinaryEnabled) return
         ioScope.launch {
             runCatching { sendClipboardChunked(png, "image/png") }
+                .onSuccess { clipboardNotice.value = "本地图片已发送到远程剪贴板（${png.size / 1024} KB）" }
+                .onFailure { clipboardNotice.value = "发送图片到远程失败：${it.message ?: it.javaClass.simpleName}" }
+        }
+    }
+
+    /** v2.7.5：手动发送图像到远程剪贴板（面板按钮/相册导入；不受自动发送开关限制） */
+    fun sendClipboardImageNow(png: ByteArray) {
+        ioScope.launch {
+            runCatching { sendClipboardChunked(png, "image/png") }
+                .onSuccess { clipboardNotice.value = "已发送图片到远程剪贴板（${png.size / 1024} KB）——远程 Ctrl+V 即可粘贴" }
+                .onFailure { clipboardNotice.value = "发送图片失败：${it.message ?: it.javaClass.simpleName}" }
         }
     }
 
@@ -1495,6 +1652,7 @@ class SelkiesSession(
         runCatching {
             val bytes = Base64.getDecoder().decode(b64)
             if (mime == "text/plain" || mime.startsWith("text/")) {
+                remoteClipboardImage.value = null
                 val text = bytes.toString(Charsets.UTF_8)
                 // v2.7.0：去重防护——内容与上次完全相同（轮询拉取的未变更响应）时静默跳过，
                 // 不重复写本地剪贴板/不刷提示（否则 5s 轮询会反复覆盖与弹提示）
@@ -1525,6 +1683,8 @@ class SelkiesSession(
                 // 二进制载荷（图片等）：拉取成本高，暂停轮询 60s
                 clipboardPollBackoffUntil = System.currentTimeMillis() + 60_000
                 remoteClipboard.value = null to mime
+                // v2.7.5：图像字节直接暴露给 UI（预览/保存相册/本机粘贴）
+                remoteClipboardImage.value = if (mime.startsWith("image/")) bytes else null
                 onClipboardFromRemote(null, mime)
                 clipboardNotice.value = "远程剪贴板收到 $mime 内容（${bytes.size / 1024} KB）"
                 if (!isReply && settings().clipboardAutoReceive && settings().clipboardBinaryEnabled) {
@@ -1584,12 +1744,12 @@ class SelkiesSession(
                 cameraDevices.value = platform.enumerateCameras()
                 speakerDevices.value = platform.enumerateSpeakers()
                 // 初始化选中状态：优先服务器条目保存的偏好
+                // v2.7.5【默认设备省心】：无保存偏好时不再自动挑第一个设备——空选择 = 系统默认
+                //   （麦克风走系统默认输入；旧版自动选第一个 = 用户困惑「设备名都一样该选哪个」）
                 if (selectedMicIds.value.isEmpty()) {
                     val pref = server.preferredMicIds.split(',').filter { it.isNotBlank() }
                         .filter { id -> micDevices.value.any { it.id == id } }
-                    selectedMicIds.value = pref.ifEmpty {
-                        micDevices.value.firstOrNull()?.let { listOf(it.id) } ?: emptyList()
-                    }
+                    selectedMicIds.value = pref
                 }
                 if (selectedCameraId.value.isBlank()) {
                     val pref = server.preferredCameraId
@@ -1678,8 +1838,9 @@ class SelkiesSession(
             micActive.value = false
             return false
         }
-        if (micActive.value || micCapture.active) { micActive.value = true; return true }
+        if (micActive.value || micCapture.active) { micActive.value = true; micWanted = true; return true }
         micActive.value = true
+        micWanted = true
         if (!serverMicEnabled.value) {
             notices.value = "服务器麦克风默认关闭，已按需开启上行"
         }
@@ -1705,6 +1866,7 @@ class SelkiesSession(
 
     fun stopMicUplink() {
         micActive.value = false
+        micWanted = false
         runCatching { micCapture.stop() }
     }
 
@@ -1715,8 +1877,9 @@ class SelkiesSession(
             webcamActive.value = false
             return false
         }
-        if (webcamActive.value || webcamCapture.active) { webcamActive.value = true; return true }
+        if (webcamActive.value || webcamCapture.active) { webcamActive.value = true; webcamWanted = true; return true }
         webcamActive.value = true
+        webcamWanted = true
         webcamCapture.start(
             encoder = server.webcamEncoder,
             deviceId = selectedCameraId.value,
@@ -1744,6 +1907,7 @@ class SelkiesSession(
 
     fun stopWebcamUplink() {
         webcamActive.value = false
+        webcamWanted = false
         runCatching { webcamCapture.stop() }
     }
 

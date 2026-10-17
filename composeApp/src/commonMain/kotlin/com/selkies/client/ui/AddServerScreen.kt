@@ -14,6 +14,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -39,6 +41,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.selkies.client.AppState
 import com.selkies.client.Screen
@@ -143,19 +146,39 @@ fun AddServerScreen(state: AppState, serverId: String?) {
                 Checkbox(checked = useToken, onCheckedChange = { useToken = it })
                 Text("使用令牌（Token）认证")
             }
+            // v2.7.5：密码/令牌眼睛图标切换显示（用户要求；默认隐藏防肩窥）
+            var showToken by remember { mutableStateOf(false) }
+            var showPassword by remember { mutableStateOf(false) }
             if (useToken) {
                 OutlinedTextField(value = token, onValueChange = { token = it },
                     label = { Text("会话令牌") }, modifier = Modifier.fillMaxWidth(),
-                    visualTransformation = PasswordVisualTransformation())
+                    singleLine = true,
+                    visualTransformation = if (showToken) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(onClick = { showToken = !showToken }) {
+                            Icon(if (showToken) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                if (showToken) "隐藏令牌" else "显示令牌")
+                        }
+                    })
                 Text("提示：令牌模式下按角色连接（controller/viewer）。", style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
                 OutlinedTextField(value = username, onValueChange = { username = it },
-                    label = { Text("用户名（Basic Auth）") }, modifier = Modifier.fillMaxWidth())
+                    label = { Text("用户名（Basic Auth）") }, modifier = Modifier.fillMaxWidth(),
+                    singleLine = true)
                 OutlinedTextField(value = password, onValueChange = { password = it },
                     label = { Text("密码") }, modifier = Modifier.fillMaxWidth(),
-                    visualTransformation = PasswordVisualTransformation())
+                    singleLine = true,
+                    visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(onClick = { showPassword = !showPassword }) {
+                            Icon(if (showPassword) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                if (showPassword) "隐藏密码" else "显示密码")
+                        }
+                    })
             }
+            Text("未填写时连接遇认证要求会自动弹出输入窗口，输入后可保存到此处。",
+                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(checked = allowUntrusted, onCheckedChange = { allowUntrusted = it })
                 Text("允许不受信任的 TLS 证书")

@@ -541,13 +541,21 @@ fun CompleteKeyboard(
     //   ① fitFullScale()：高度方向能容纳全部 6 行的最大 scale（chrome=头部行+内边距保守 66dp）
     //   ② 打开/切到完整模式时自动把 scale clamp 到 fit（打开即完整可见；用户仍可手动放大，配合③滚动查看）
     //   ③ 键区加 verticalScroll + Surface 高度上限——即使内容超高也不再裁切，可上下滚动
+    //【v2.7.5 修复·竖屏键盘右半被裁】用户截图实证：手机竖屏（宽 ~360dp）下 23 单位宽网格
+    //   在 scale=0.7 时宽 547dp > 屏宽 → 右侧（回车/Shift/小键盘）被裁掉；旧版仅按高度适配的
+    //   fitFullScale 在竖屏返回 2.0 → clamp 完全失效。现在同时适配宽度：
+    //   fit = min(高度适配, 宽度适配)，宽度适配 = (屏宽-8)/782（23 单位 × 34dp + 8dp）。
+    //   竖屏自动缩到全键盘可见（~0.45），放大后配合横向滚动仍可达全部按键。
     fun fitFullScale(): Float {
         if (parentSize == IntSize.Zero) return 2f
         val hDp = with(density) { parentSize.height.toDp().value }
+        val wDp = with(density) { parentSize.width.toDp().value }
         // 完整模式 6 行键 + 5 间隙 ≈ (6×34 + 5×2.8)×scale ≈ 218×scale；头部行/内边距保守 66dp
         val availH = hDp * 0.92f - 66f
-        if (availH <= 60f) return 0.3f   // 极矮屏：交由纵向滚动兜底
-        return (availH / 218f).coerceIn(0.3f, 2f)
+        val heightFit = if (availH <= 60f) 0.3f else (availH / 218f)
+        // v2.7.5：宽度方向——23 单位 × 34dp + 8dp = 782dp 满宽
+        val widthFit = ((wDp - 8f) / 782f).coerceAtLeast(0.3f)
+        return minOf(heightFit, widthFit).coerceIn(0.3f, 2f)
     }
 
     fun doScale(f: Float) {

@@ -53,6 +53,13 @@ class DesktopVideoSink : VideoSink {
     override val avgPresentMs: Double get() = emaPresentMs
     override val framesDropped: Long get() = droppedFrames
 
+    // ---- v2.7.5：渲染进度 + 解码端关键帧请求（与 AndroidVideoSink 同语义，会话看门狗消费） ----
+    @Volatile private var lastRenderAt = 0L
+    override val lastRenderAtMs: Long get() = lastRenderAt
+    @Volatile private var needKf = false
+    override val needsKeyframe: Boolean get() = needKf
+    override fun clearNeedsKeyframe() { needKf = false }
+
     /** 最新解码帧（UI 观察绘制） */
     val bitmapFlow = MutableStateFlow<ImageBitmap?>(null)
 
@@ -135,9 +142,11 @@ class DesktopVideoSink : VideoSink {
         val copy = data.copyOfRange(offset, length)
         if (!queue.offer(FrameBuf(header, copy, System.nanoTime()))) {
             droppedFrames++
+            needKf = true  // v2.7.5：溢出后参考链已断，请求关键帧
             queue.clear()
             queue.offer(FrameBuf(header, copy, System.nanoTime()))
         }
+        if (header.keyframe) needKf = false
     }
 
     override fun onJpegStripe(frameId: Int, stripeY: Int, data: ByteArray, offset: Int, length: Int) {
@@ -325,6 +334,7 @@ class DesktopVideoSink : VideoSink {
         bmp.setImmutable()
         bitmapFlow.value = bmp.asComposeImageBitmap()
         diagFramesPublished++
+        lastRenderAt = System.currentTimeMillis()  // v2.7.5：会话看门狗渲染停滞判定依据
         if (!firstFrameRendered.value) firstFrameRendered.value = true
     }
 
