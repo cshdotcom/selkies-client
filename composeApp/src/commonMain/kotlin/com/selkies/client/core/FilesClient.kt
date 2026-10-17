@@ -132,6 +132,33 @@ class FilesClient(private val session: SelkiesSession) {
         }
     }
 
+    /** 【v2.7.7】上传内存字节（剪贴板图片 → 远程文件；remotePath 含文件名的相对路径） */
+    fun uploadBytes(bytes: ByteArray, remotePath: String, displayName: String) {
+        val task = TransferTask(
+            id = UUID.randomUUID().toString(),
+            fileName = displayName,
+            filePath = remotePath,
+            totalBytes = bytes.size.toLong(),
+            upload = true
+        )
+        addTask(task)
+        scope.launch {
+            try {
+                task.status = "running"
+                updateTask(task)
+                val (code, msg) = session.connection.apiUploadChunk(remotePath, bytes, 0, bytes.size.toLong(), null, false)
+                if (code !in 200..299) throw IllegalStateException("上传失败($code): ${msg.take(120)}")
+                task.status = "done"
+                task.sentBytes = task.totalBytes
+                updateTask(task)
+            } catch (e: Exception) {
+                task.status = "error"
+                task.message = e.message ?: e.toString()
+                updateTask(task)
+            }
+        }
+    }
+
     /**
      * 流式下载远程文件到本地（带认证，进度回报）。
      * remotePath 为编码形式的相对路径（RemoteFileEntry.path）。

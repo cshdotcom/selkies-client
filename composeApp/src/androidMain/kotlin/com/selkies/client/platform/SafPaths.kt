@@ -20,17 +20,19 @@ object SafPaths {
     const val SUB_DOWNLOADS = "Downloads"
 
     /** 纯解析：DocumentsContract 树 docId → 绝对路径（不触碰 Android API，便于单测）
-     *  docId 形如 "primary:Foo/Bar"（主存储）或 "XXXX-YYYY:Foo/Bar"（SD/USB 卷） */
+     *  docId 形如 "primary:Foo/Bar"（主存储）或 "XXXX-YYYY:Foo/Bar"（SD/USB 卷）。
+     *  【v2.7.7】选根目录（"primary:"/"XXXX-YYYY:"，path 为空）→ 返回卷根绝对路径（旧版返 null
+     *  → 展示回退 "SAF:primary:"，用户无法认知选的哪里） */
     fun docIdToAbsolutePath(docId: String, primaryRoot: String): String? {
         val idx = docId.indexOf(':')
         if (idx <= 0) return null
         val volume = docId.substring(0, idx)
         val path = docId.substring(idx + 1).trimEnd('/')
-        if (path.isEmpty()) return null
         val volumeRoot = when (volume) {
             "primary" -> primaryRoot
             else -> "/storage/$volume"
         }
+        if (path.isEmpty()) return volumeRoot
         return "$volumeRoot/$path"
     }
 

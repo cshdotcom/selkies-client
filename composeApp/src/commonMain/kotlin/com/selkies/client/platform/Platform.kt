@@ -41,6 +41,9 @@ interface VideoSink {
     val avgPresentMs: Double get() = 0.0
     /** 因队列溢出丢弃的帧数（累计）——frames_not_shown */
     val framesDropped: Long get() = 0L
+    /** 【v2.7.7】解码问题上报（队列溢出/解码异常）→ 会话层强制 REQUEST_KEYFRAME 自愈黑屏。
+     *  平台实现（DesktopVideoSink/AndroidVideoSink）覆盖为真实字段；桩实现保持默认空操作。 */
+    var onDecodeIssue: ((String) -> Unit)? get() = null; set(@Suppress("UNUSED_PARAMETER") value) {}
 }
 
 /** 平台音频播放器（下行 Opus 48kHz） */
@@ -167,6 +170,10 @@ interface MediaStoreBridge {
     fun listMedia(): List<com.selkies.client.model.SavedMediaEntry>
     /** 删除一条媒体 */
     fun deleteMedia(entry: com.selkies.client.model.SavedMediaEntry): Boolean
+    /** 【v2.7.7】自定义存储位置是否真正生效（设置页「验证写入」显示；默认未知=false） */
+    val customRootActive: Boolean get() = false
+    /** 【v2.7.7】存储诊断说明（未生效原因；null=正常/无诊断） */
+    fun storageDiagnostic(): String? = null
 }
 
 /** 文件选择/保存结果 */

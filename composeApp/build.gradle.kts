@@ -92,8 +92,8 @@ android {
         applicationId = "com.selkies.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 20706
-        versionName = "2.7.6"
+        versionCode = 20707
+        versionName = "2.7.7"
         ndkVersion = ""
     }
     signingConfigs {
@@ -148,7 +148,7 @@ val desktopFatJar = tasks.register<Jar>("desktopFatJar") {
     manifest {
         attributes["Main-Class"] = "com.selkies.client.MainKt"
         attributes["Implementation-Title"] = "Selkies Desktop Client"
-        attributes["Implementation-Version"] = "2.7.6"
+        attributes["Implementation-Version"] = "2.7.7"
     }
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
     exclude("META-INF/versions/**/module-info.class")
@@ -281,6 +281,17 @@ tasks.register<JavaExec>("probeV276") {
     group = "verification"
     description = "v2.7.6 无头综合验证：viewer DISABLED 恢复链 + 键盘宽度公式 + csd拆分 + 把手淡出 + 门控/剪贴板回归"
     mainClass.set("com.selkies.client.tools.V276Probe")
+    val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
+    classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
+    for (k in listOf("probeUrl", "probeUser", "probePass")) {
+        if (project.hasProperty(k)) systemProperty(k, project.property(k).toString())
+    }
+}
+
+tasks.register<JavaExec>("probeV277") {
+    group = "verification"
+    description = "v2.7.7 无头综合验证：viewer+slot 手柄控制端 + 认证弹窗链路 + 解码停滞看门狗 + switchRole + 剪贴板图片"
+    mainClass.set("com.selkies.client.tools.V277Probe")
     val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
     classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
     for (k in listOf("probeUrl", "probeUser", "probePass")) {

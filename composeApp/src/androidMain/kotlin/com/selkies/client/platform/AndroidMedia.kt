@@ -54,18 +54,38 @@ class AndroidMediaStoreBridge(
     /** 当前生效的 SAF 目录树（无授权/无效 → null = 走默认 MediaStore） */
     private fun safTree(): Uri? {
         val s = treeUriProvider().trim()
-        if (s.isEmpty() || !s.startsWith("content://")) return null
-        val uri = runCatching { Uri.parse(s) }.getOrNull() ?: return null
+        if (s.isEmpty() || !s.startsWith("content://")) {
+            diagReason = if (s.isEmpty()) null else "存储配置不是有效的 SAF 目录（$s）"
+            return null
+        }
+        val uri = runCatching { Uri.parse(s) }.getOrNull() ?: run {
+            diagReason = "SAF 目录地址解析失败"
+            return null
+        }
         // 持久写权限仍在？（系统最多保留 512 个；被回收/目录删除 → 回退默认）
         val granted = runCatching {
             ctx.contentResolver.persistedUriPermissions.any {
                 it.uri == uri && it.isWritePermission
             }
         }.getOrDefault(false)
-        if (!granted) return null
+        if (!granted) {
+            // 【v2.7.7】关键透明化：旧版静默回退 = 用户「改了存储位置没生效」却毫无提示
+            diagReason = "SAF 写入授权已失效（系统回收/目录被删/重启后未持久）——已回退默认位置，请重新选择目录"
+            return null
+        }
         // 目录树仍可访问（docId 可解析）
-        return runCatching { SafPaths.treeRootDocUri(uri) }.getOrNull()
+        val tree = runCatching { SafPaths.treeRootDocUri(uri) }.getOrNull() ?: run {
+            diagReason = "SAF 目录树无法访问（docId 解析失败）"
+            return null
+        }
+        diagReason = null
+        return tree
     }
+
+    /** 【v2.7.7】诊断：自定义目录未生效原因（设置页显示；null=正常） */
+    private var diagReason: String? = null
+    override val customRootActive: Boolean get() { safTree(); return diagReason == null && treeUriProvider().trim().isNotEmpty() && safTree() != null }
+    override fun storageDiagnostic(): String? = diagReason
 
     /** SAF 根 → {根}/Selkies（不存在则创建） */
     private fun safTopDir(tree: Uri): Uri? =

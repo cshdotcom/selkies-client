@@ -38,6 +38,9 @@ class DesktopVideoSink : VideoSink {
 
     override val firstFrameRendered = MutableStateFlow(false)
 
+    /** 【v2.7.7】解码问题上报（队列溢出/解码失败）→ 会话层强制 REQUEST_KEYFRAME（黑屏自愈） */
+    @Volatile override var onDecodeIssue: ((String) -> Unit)? = null
+
     /** 诊断计数（无头验证用） */
     @Volatile var diagFramesIn: Long = 0
     @Volatile var diagDecodeErrors: Long = 0
@@ -136,6 +139,8 @@ class DesktopVideoSink : VideoSink {
         if (!queue.offer(FrameBuf(header, copy, System.nanoTime()))) {
             droppedFrames++
             queue.clear()
+            // 【v2.7.7】溢出消空队列 → 参考链必断 → 立即上报（会话层强制关键帧）
+            onDecodeIssue?.invoke("queue-overflow")
             queue.offer(FrameBuf(header, copy, System.nanoTime()))
         }
     }
@@ -289,6 +294,7 @@ class DesktopVideoSink : VideoSink {
             }.onFailure {
                 diagDecodeErrors++
                 diagLastError = "${it.javaClass.simpleName}: ${it.message}"
+                onDecodeIssue?.invoke("decode-error:${it.javaClass.simpleName}")
                 reset()
             }
             // 计时（EMA）

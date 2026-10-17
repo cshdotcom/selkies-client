@@ -35,6 +35,9 @@ class AndroidVideoSink : VideoSink {
     /** 解码错误/不可用 → 会话层提示（无可用解码器时告知用户切换编码） */
     var onDecodeError: ((String) -> Unit)? = null
 
+    /** 【v2.7.7】解码问题上报（队列溢出/解码异常）→ 会话层强制 REQUEST_KEYFRAME（黑屏自愈） */
+    @Volatile override var onDecodeIssue: ((String) -> Unit)? = null
+
     private var running = true
     private var decodeThread: Thread? = null
     private val queue = LinkedBlockingQueue<FrameBuf>(240)
@@ -98,9 +101,10 @@ class AndroidVideoSink : VideoSink {
         if (length <= offset) return
         val copy = data.copyOfRange(offset, length)
         if (!queue.offer(FrameBuf(header, copy, System.nanoTime()))) {
-            // 队列满：丢帧并请求关键帧由上层处理
+            // 【v2.7.7】队列满：消空后参考链必断 → 立即上报强制关键帧（旧版只丢帧不自愈 = 黑屏）
             droppedFrames++
             queue.clear()
+            onDecodeIssue?.invoke("queue-overflow")
             queue.offer(FrameBuf(header, copy, System.nanoTime()))
         }
     }
@@ -315,11 +319,12 @@ class AndroidVideoSink : VideoSink {
                     emaPresentMs = emaPresentMs * 0.9 + presentMs * 0.1
                     emaDecodeMs = emaDecodeMs * 0.9 + decodeMs * 0.1
                 }
-            } catch (_: Throwable) {
+            } catch (t: Throwable) {
                 // v2.7.0：解码错误防线收严到 Throwable（MediaCodec native 层可抛 Error 而非 Exception，
                 // 旧版仅捕 Exception → 解码线程直接死亡 = 后续视频永久黑屏/闪退风险）
                 // v2.7.6：连续异常也计入失败升级（触发软件解码回退）
                 consecutiveFailures++
+                onDecodeIssue?.invoke("decode-exception:${t.javaClass.simpleName}")
                 if (consecutiveFailures >= 3 && !usingSoftwareDecoder) {
                     usingSoftwareDecoder = true
                     notifyDecodeErrorOnce("硬件解码器异常，已切换软件解码（兼容模式）")

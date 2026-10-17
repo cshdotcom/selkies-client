@@ -36,6 +36,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -178,7 +179,6 @@ fun SettingsScreen(state: AppState) {
                 var storageRoot by remember { mutableStateOf(settings.storageRoot) }
                 // v2.7.5：选择器回填（settings 更新时同步文本框）
                 LaunchedEffect(settings.storageRoot) { storageRoot = settings.storageRoot }
-                var pickingDir by remember { mutableStateOf(false) }
                 OutlinedTextField(
                     value = storageRoot,
                     onValueChange = { storageRoot = it },
@@ -197,6 +197,10 @@ fun SettingsScreen(state: AppState) {
                     }
                 )
                 // v2.7.5：系统目录选择器（安卓 SAF / 桌面文件选择器）——选绝对路径，免手输
+                // 【v2.7.7】+「验证写入」：真实写探针文件并报告实际落盘位置（旧版 SAF 失败静默回退无从知晓）
+                var pickingDir by remember { mutableStateOf(false) }
+                var verifying by remember { mutableStateOf(false) }
+                var verifyResult by remember { mutableStateOf<String?>(null) }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     androidx.compose.material3.OutlinedButton(
                         onClick = {
@@ -226,6 +230,42 @@ fun SettingsScreen(state: AppState) {
                             }
                         }
                     ) { Text("恢复默认") }
+                    // 【v2.7.7】验证写入：用户反馈「修改默认存储位置后似乎没有生效」——
+                    // 验证按钮给出铁证（实际落盘路径 + 未生效原因）
+                    androidx.compose.material3.OutlinedButton(
+                        onClick = {
+                            if (verifying) return@OutlinedButton
+                            verifying = true
+                            verifyResult = null
+                            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                                val bridge = state.platform.mediaStore()
+                                val probe = "selkies_probe_${System.currentTimeMillis()}.txt"
+                                val path = runCatching {
+                                    bridge.saveDownload(probe, "Selkies 存储位置验证文件，可安全删除。".toByteArray())
+                                }.getOrNull()
+                                val diag = runCatching { bridge.storageDiagnostic() }.getOrNull()
+                                val active = runCatching { bridge.customRootActive }.getOrDefault(false)
+                                verifyResult = when {
+                                    path == null -> "写入失败——目录不可写或空间不足" +
+                                            (diag?.let { "\n原因：$it" } ?: "")
+                                    active -> "已生效。探针文件写入：$path"
+                                    else -> "已保存，但落在了默认位置（自定义目录未生效）。\n实际路径：$path" +
+                                            (diag?.let { "\n原因：$it" } ?: "\n建议重新「选择目录…」获取授权")
+                                }
+                                verifying = false
+                            }                        },
+                        enabled = !verifying
+                    ) { Text(if (verifying) "验证中…" else "验证写入") }
+                }
+                // 【v2.7.7】验证结果（绿=已生效 / 红=未生效+原因）
+                verifyResult?.let { vr ->
+                    Text(
+                        vr,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (vr.startsWith("已生效")) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.error,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
+                    )
                 }
                 Text(
                     "自动分类：截图 → ${state.platform.mediaStore().screenshotsDir()}\n录屏 → ${state.platform.mediaStore().recordingsDir()}\n下载 → ${state.platform.mediaStore().downloadsDir()}\n文件名自动带时间戳，避免覆盖。" +
@@ -261,8 +301,10 @@ fun SettingsScreen(state: AppState) {
                 var order by remember(settings.toolbarOrder) {
                     mutableStateOf(
                         run {
-                            val saved = settings.toolbarOrder.split(',').filter { it.isNotBlank() }
-                            com.selkies.client.ui.ToolbarDefaults.ALL.filter { it in saved } +
+                            // 【v2.7.7】与 SessionScreen 同步修复：保存的顺序优先（旧版只过滤不重排）
+                            val saved = settings.toolbarOrder.split(',').map { it.trim() }
+                                .filter { it.isNotBlank() && it in com.selkies.client.ui.ToolbarDefaults.ALL }
+                            saved.distinct() +
                                     com.selkies.client.ui.ToolbarDefaults.ALL.filter { it !in saved }
                         }
                     )

@@ -98,9 +98,19 @@ object GamepadBridge {
         pads[deviceId]?.let { return it }
         val dev = InputDevice.getDevice(deviceId) ?: return null
         if (!isGamepad(deviceId)) return null
+        // 【v2.7.7】viewer 连接：js 只能驱动自持槽位（官方 gamepad_slot_denied）——
+        // viewer 只允许一副物理手柄，index = slot-1；controller 不受限（服务器默认放行全部 index）
+        val viewerSlot = session?.gamepadSlot?.value
+        if (session?.role?.value == "viewer") {
+            if (viewerSlot == null || viewerSlot !in 2..4) return null  // viewer 无槽位：服务器拒收任何 js
+            if (pads.isNotEmpty()) return null  // viewer 只驱动这一副
+        }
         // 服务器只有 4 个槽位：超出不再连接
         if (pads.values.count { it.connected } >= MAX_PADS) return null
-        val pad = PadState(nextIndex.getAndIncrement())
+        val pad = PadState(
+            if (session?.role?.value == "viewer") (viewerSlot!! - 1)
+            else nextIndex.getAndIncrement()
+        )
         pads[deviceId] = pad
         pad.deviceId = deviceId
         // 首次事件即连接：id 用设备名 base64（官方格式）

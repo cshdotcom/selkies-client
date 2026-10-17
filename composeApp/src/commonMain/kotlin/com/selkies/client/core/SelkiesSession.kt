@@ -8,6 +8,7 @@ import com.selkies.client.model.SavedMediaEvent
 import com.selkies.client.model.ServerEntry
 import com.selkies.client.model.StatsInfo
 import com.selkies.client.model.StreamHealth
+import com.selkies.client.model.TakeoverEvent
 import com.selkies.client.platform.PlatformServices
 import com.selkies.client.platform.PrintBridge
 import com.selkies.client.platform.VideoSink
@@ -22,7 +23,10 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
+import java.text.SimpleDateFormat
 import java.util.Base64
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 import java.util.zip.GZIPInputStream
 
@@ -37,7 +41,7 @@ class SelkiesSession(
     private val onPrintDocument: (name: String, sizeBytes: Long) -> Unit = { _, _ -> }
 ) : SelkiesConnection.Listener {
 
-    enum class Status { IDLE, CONNECTING, CONNECTED, RECONNECTING, FAILED, CLOSED }
+    enum class Status { IDLE, CONNECTING, CONNECTED, RECONNECTING, FAILED, CLOSED, AUTH_REQUIRED }
 
     /** 会话协程作用域（剪贴板面板等的轻量延迟任务；主作用域仍为 private） */
     internal val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -53,6 +57,15 @@ class SelkiesSession(
     val realizedResolution = MutableStateFlow<Pair<Int, Int>?>(null)
     val apps = MutableStateFlow<List<Pair<String, String>>>(emptyList())
     val role = MutableStateFlow("controller")
+
+    // ---- v2.7.7：只读模式手柄控制端 / 顶替事件 / 认证 ----
+    /** 本连接的手柄槽位（官方 AUTH_SUCCESS/ROLE_UPDATE 携带；legacy viewer = 自请求的 slot）。
+     *  null = 不占槽位（纯观看/未受限 controller）。js 输入目标 index = slot-1。 */
+    val gamepadSlot = MutableStateFlow<Int?>(null)
+    /** 【v2.7.7】被新主客户端顶替（KILL primary）事件——UI 弹「切换到只读（带槽位选择）」 */
+    val takeoverEvent = MutableStateFlow<TakeoverEvent?>(null)
+    /** 服务器拒绝只读槽位时的提示（如 slot 已被占用/enable_playerN 关闭 → 服务器 KILL） */
+    val viewerSlotNotice = MutableStateFlow<String?>(null)
     val realizedResolutionFlow: StateFlow<Pair<Int, Int>?> get() = realizedResolution
 
     /** 本地回显的远程光标位置（流坐标）——绝对移动置位、相对移动累加 */
@@ -132,6 +145,8 @@ class SelkiesSession(
         set(value) {
             field?.let { old -> if (value !== old) old.close() }
             field = value
+            // 【v2.7.7】解码问题上报接线：溢出/解码异常 → 强制关键帧（黑屏自愈核心防线之一）
+            value?.onDecodeIssue = { reason -> onSinkDecodeIssue(reason) }
             watchSinkFirstFrame(value)
         }
 
@@ -142,14 +157,32 @@ class SelkiesSession(
     private var firstDecodedFrameAt = 0L
     private var firstFrameArrivedAt = 0L
     private var decodeStallKeyframeAt = 0L
+    /** 【v2.7.7 黑屏根因修复】最近一次解码输出时刻：首帧成功后持续监测——
+     *  帧持续到达但解码输出停源（参考链断裂/队列溢出丢关键帧/分辨率变化重置解码器）
+     *  时旧版看门狗两头都不触发（帧在到达不视为停滞；首帧已解码不再要关键帧）= 永久黑屏。
+     *  服务器默认无限 GOP（keyframe_interval=0），唯一恢复手段就是 REQUEST_KEYFRAME。 */
+    @Volatile private var lastDecodedFrameAt = 0L
+    @Volatile private var decodeOutputStallKeyframeAt = 0L
+    /** 【v2.7.7】解码器主动上报错误/溢出（sink → session）：立即强制关键帧，不等看门狗周期 */
+    @Volatile private var sinkReportedDecodeIssueAt = 0L
+    internal fun onSinkDecodeIssue(reason: String) {
+        val now = System.currentTimeMillis()
+        if (now - sinkReportedDecodeIssueAt < 1500) return  // 限流
+        sinkReportedDecodeIssueAt = now
+        println("[Selkies][看门狗] 解码器报告问题（$reason）→ 强制请求关键帧")
+        forceKeyframe()
+    }
     private fun watchSinkFirstFrame(sink: VideoSink?) {
-        if (sink == null) { firstDecodedFrameAt = 0; return }
+        if (sink == null) { firstDecodedFrameAt = 0; lastDecodedFrameAt = 0; return }
         scope.launch {
             runCatching {
                 sink.firstFrameRendered.collect { rendered ->
-                    if (rendered && firstDecodedFrameAt == 0L) {
-                        firstDecodedFrameAt = System.currentTimeMillis()
-                        println("[Selkies][看门狗] 首帧解码成功，解码停滞检测解除")
+                    if (rendered) {
+                        if (firstDecodedFrameAt == 0L) {
+                            firstDecodedFrameAt = System.currentTimeMillis()
+                            println("[Selkies][看门狗] 首帧解码成功，解码停滞检测解除")
+                        }
+                        lastDecodedFrameAt = System.currentTimeMillis()
                     }
                 }
             }
@@ -290,7 +323,8 @@ class SelkiesSession(
     // =====================================================================
 
     fun connect() {
-        if (status.value != Status.IDLE && status.value != Status.FAILED && status.value != Status.CLOSED) return
+        if (status.value != Status.IDLE && status.value != Status.FAILED && status.value != Status.CLOSED &&
+            status.value != Status.AUTH_REQUIRED) return
         userClosed = false
         reconnectAttempts = 0
         startVideoAttempts = 0
@@ -315,7 +349,12 @@ class SelkiesSession(
         lastReceivedFrameAt = 0L
         firstFrameArrivedAt = 0L
         decodeStallKeyframeAt = 0L
+        lastDecodedFrameAt = 0L
+        decodeOutputStallKeyframeAt = 0L
         connection = SelkiesConnection(server, this)
+        // 【v2.7.7】会话中切换的角色/槽位传递给新连接（运行时覆盖，不写回持久配置）
+        connection.roleViewOnlyOverride = roleSwitchViewOnly
+        connection.roleSlotOverride = if (roleSwitchViewOnly == true) roleSwitchSlot else 0
         connection.start()
         startStallWatchdog()
     }
@@ -377,6 +416,17 @@ class SelkiesSession(
         statusDetail.value = "连接已建立，等待服务器模式..."
         lastError.value = null
         reconnectAttempts = 0
+        // 【v2.7.7】legacy 模式服务器不发 AUTH_SUCCESS——viewer 身份/槽位由本端回填
+        //   （secure/token 模式随后 AUTH_SUCCESS 到达会覆盖为服务器权威值）
+        role.value = if (connection.effectiveViewOnly) "viewer" else "controller"
+        gamepadSlot.value = if (connection.effectiveViewOnly) {
+            connection.effectiveViewerSlot.takeIf { it in 2..4 }
+        } else null
+        if (role.value == "viewer") {
+            statusDetail.value = if (gamepadSlot.value != null) {
+                "以查看者身份连接（手柄玩家 ${gamepadSlot.value} 位）"
+            } else "以查看者身份连接"
+        }
         ioScope.launch {
             // gzip 能力宣告
             connection.sendText("_gz,1")
@@ -630,12 +680,18 @@ class SelkiesSession(
                 val reason = text.substring(5)
                 userClosed = true
                 status.value = Status.CLOSED
+                println("[Selkies] 收到 KILL：$reason")
                 // 被新客户端顶替是服务器的单主人策略：给出友好解释而非原始英文
-                val friendly = if (reason.contains("new primary client") || reason.contains("primary")) {
+                val isTakeover = reason.contains("new primary client") || reason.contains("primary")
+                val friendly = if (isTakeover) {
                     "另一个客户端接管了此会话（服务器单主人策略）。若要夺回控制权，请点击重试重连。"
                 } else "服务器断开：$reason"
                 statusDetail.value = friendly
                 lastError.value = friendly
+                // 【v2.7.7】顶替事件单独上报——UI 弹「切换到只读继续观看（可选手柄槽位）」选择器
+                if (isTakeover) {
+                    takeoverEvent.value = TakeoverEvent(reason)
+                }
             }
             text == "_gz,1" -> { gzRxEnabled = true }
             // ---- 剪贴板 ----
@@ -698,6 +754,9 @@ class SelkiesSession(
                         // 查看者模式：无键鼠输入权限
                         statusDetail.value = "以查看者身份连接"
                     }
+                    // 【v2.7.7】slot 字段（官方 AUTH_SUCCESS/ROLE_UPDATE 携带；legacy 模式不回——由本端自请求值回填）
+                    val s = (json["slot"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull()
+                    gamepadSlot.value = s
                     // 【v2.7.6】重夺控制权（viewer → controller）：自动恢复之前开启的麦克风/摄像头上行。
                     //   降级期间服务器丢弃上行帧并发 *_DISABLED（micActive 已复位但 micWanted 保留）；
                     //   旧版恢复控制权后按钮状态错乱、永远发不出去 = 「突然无法发送无法恢复」。
@@ -1138,7 +1197,8 @@ class SelkiesSession(
             return
         }
         if (code == 4001 || reason.contains("auth", ignoreCase = true)) {
-            status.value = Status.FAILED
+            // 【v2.7.7】token 模式认证失败（服务器主动关 4001）→ 走认证弹窗而非判死
+            status.value = Status.AUTH_REQUIRED
             lastError.value = "连接被服务器关闭（$code）：$reason"
             statusDetail.value = "认证或权限问题"
             return
@@ -1152,16 +1212,85 @@ class SelkiesSession(
         lastError.value = userMessage
         lastErrorTechnical.value = technical
         if (userClosed) return
+        // 【v2.7.7 认证模式】401 且当前凭据为空/未保存 → 弹认证输入框（保存后重连）而非直接判死；
+        //   凭据已填过但错 → 仍弹窗让用户改（预填已有值）
+        val auth401 = technical.contains("401") || userMessage.contains("401")
+        if (auth401) {
+            status.value = Status.AUTH_REQUIRED
+            statusDetail.value = if (server.useTokenAuth) "服务器要求令牌认证" else "服务器要求用户名密码认证（HTTP Basic）"
+            return
+        }
         // 认证/路径/模式错误不自动重连
-        val fatal = technical.contains("401") || technical.contains("403") ||
+        val fatal = technical.contains("403") ||
                 technical.contains("409") || technical.contains("no ws endpoint") ||
                 technical.contains("redirect loop")
         if (fatal) {
             status.value = Status.FAILED
-            statusDetail.value = if (technical.contains("401")) "认证失败——请编辑服务器条目校验账号密码" else "连接失败"
+            statusDetail.value = "连接失败"
             return
         }
         scheduleReconnect(userMessage)
+    }
+
+    // =====================================================================
+    // 【v2.7.7】角色切换（控制 ↔ 只读）+ 只读手柄槽位
+    // =====================================================================
+
+    /**
+     * 中途切换角色：内部断开重连（官方 legacy 协议角色在连接时由 query 参数决定）。
+     * @param viewOnly true=只读（viewer）；false=控制（controller）
+     * @param slot 只读时的手柄槽位（2..4；0=纯观看不占槽位）。仅 viewOnly=true 时生效。
+     */
+    fun switchRole(viewOnly: Boolean, slot: Int = 0) {
+        if (userClosed) return
+        // 会话内切换状态（运行时；不写回 ServerEntry 避免污染用户持久偏好）
+        roleSwitchViewOnly = viewOnly
+        roleSwitchSlot = if (viewOnly) slot else 0
+        takeoverEvent.value = null
+        // ⚠️ 状态立即离开 CONNECTED（UI/探针据此等待重连完成；旧版延迟 700ms 才变 → 竞态读旧值）
+        userClosed = false
+        reconnectAttempts = 0
+        startVideoAttempts = 0
+        status.value = Status.CONNECTING
+        statusDetail.value = if (viewOnly) {
+            if (slot in 2..4) "正在以只读观看者连接（手柄玩家 $slot 位）…" else "正在以只读观看者连接…"
+        } else "正在以控制模式重连…"
+        // 断开当前连接 → 过服务器 RECONNECT_DEBOUNCE（500ms）→ 以新角色重连
+        scope.launch {
+            runCatching { connection.close() }
+            delay(700)
+            openConnection()
+        }
+    }
+
+    /** 会话内角色切换状态（运行时；不写回 ServerEntry 避免污染用户持久偏好） */
+    @Volatile private var roleSwitchViewOnly: Boolean? = null
+    @Volatile private var roleSwitchSlot: Int = 0
+
+    /** 当前生效的只读状态（含会话中切换）：UI 与连接层都以此为准 */
+    val effectiveViewOnly: Boolean
+        get() = roleSwitchViewOnly ?: server.viewOnly
+
+    /** 当前生效的手柄槽位（0=无） */
+    val effectiveViewerSlot: Int
+        get() = if (roleSwitchViewOnly == true) roleSwitchSlot else server.viewerSlot
+
+    // ---- v2.7.7 认证弹窗支持 ----
+
+    /** 认证弹窗「取消」：转 FAILED（用户可重试/返回；不再弹认证框） */
+    fun cancelAuth() {
+        status.value = Status.FAILED
+        statusDetail.value = "未提供认证信息"
+    }
+
+    /** 认证弹窗「连接」：凭据已写入 server 条目（内存）→ 立即重连 */
+    fun retryWithCredentials() {
+        if (userClosed) userClosed = false
+        reconnectAttempts = 0
+        startVideoAttempts = 0
+        status.value = Status.CONNECTING
+        statusDetail.value = "正在使用输入的认证信息重连…"
+        openConnection()
     }
 
     private fun scheduleReconnect(reason: String) {
@@ -1439,6 +1568,33 @@ class SelkiesSession(
                     lastKeyframeRequestAt = now
                     println("[Selkies][看门狗] 帧到达但未解码 → 请求关键帧（首帧到达于 ${now - firstFrameArrivedAt}ms 前）")
                     runCatching { connection.sendText("REQUEST_KEYFRAME") }
+                    // 【v2.7.7】③升级：关键帧要了 30s 仍解不出首帧（服务器管线卡死/持续污染流）→
+                    // 重建连接（v2.7.5 实测：同服务器新 WS 连接立即可取流；旧连接永远拿不到可解的帧）。
+                    // 旧版无限刷 REQUEST_KEYFRAME 不升级 = 用户「黑屏不自愈」的另一形态。
+                    if (now - firstFrameArrivedAt > 30_000) {
+                        println("[Selkies][看门狗] 首帧 30s 未解码 → 重建连接（服务器管线疑似卡死）")
+                        statusDetail.value = "视频流异常，自动重建连接…"
+                        runCatching { connection.close() }
+                        openConnection()
+                    }
+                }
+                // ④【v2.7.7 黑屏根因修复】帧在到达、首帧也解过、但解码输出已停滞 ≥6s：
+                //    参考链断裂（丢帧/溢出/分辨率切换清了解码器）→ 要关键帧重建参考链。
+                //    旧版此处无任何检测 = 用户「动不动黑屏且不自愈」的直接根因（网页版有 GOP 兜底不受影响）。
+                if (firstDecodedFrameAt > 0 && lastReceivedFrameAt > 0 && lastDecodedFrameAt > 0 &&
+                    now - lastReceivedFrameAt < 4000 &&            // 帧仍在到达
+                    now - lastDecodedFrameAt > 6000 &&             // 但解码输出停滞
+                    now - decodeOutputStallKeyframeAt > 4000       // 限流
+                ) {
+                    decodeOutputStallKeyframeAt = now
+                    println("[Selkies][看门狗] 解码输出停滞 ${now - lastDecodedFrameAt}ms（帧仍在到达）→ 请求关键帧重建参考链")
+                    forceKeyframe()
+                    // 连续两轮（≥12s）仍无解码输出 → 重建解码器（reset 后关键帧重新配置）
+                    if (now - lastDecodedFrameAt > 12000) {
+                        println("[Selkies][看门狗] 解码输出长期停滞 → 重置解码器等待关键帧重配置")
+                        videoSink?.reset()
+                        firstDecodedFrameAt = 0
+                    }
                 }
             }
         }
@@ -1577,8 +1733,10 @@ class SelkiesSession(
                 // 二进制载荷（图片等）：拉取成本高，暂停轮询 60s
                 clipboardPollBackoffUntil = System.currentTimeMillis() + 60_000
                 remoteClipboard.value = null to mime
+                // 【v2.7.7】保留图片字节供剪贴板面板预览/复制/保存/上传（旧版只发通知丢弃数据）
+                remoteClipboardImage.value = if (mime.startsWith("image/")) bytes else null
                 onClipboardFromRemote(null, mime)
-                clipboardNotice.value = "远程剪贴板收到 $mime 内容（${bytes.size / 1024} KB）"
+                clipboardNotice.value = "远程剪贴板收到 $mime 内容（${bytes.size / 1024} KB）——可在剪贴板面板预览/保存/上传"
                 if (!isReply && settings().clipboardAutoReceive && settings().clipboardBinaryEnabled) {
                     if (mime == "image/png") {
                         applyRemoteClipboardLocally {
@@ -1621,6 +1779,49 @@ class SelkiesSession(
     fun sendClipboardTextNow(text: String) {
         ioScope.launch {
             runCatching { sendClipboardChunked(text.toByteArray(Charsets.UTF_8), "text/plain") }
+        }
+    }
+
+    // ---- v2.7.7 剪贴板图片（面板预览/手动发送/上传远程文件） ----
+    /** 远程剪贴板最新图片字节（null = 无图；面板预览/复制/保存/上传用） */
+    val remoteClipboardImage = MutableStateFlow<ByteArray?>(null)
+
+    /** 手动发送图片到远程剪贴板（cb,image/png 分块） */
+    fun sendClipboardImageNow(png: ByteArray) {
+        ioScope.launch {
+            runCatching {
+                sendClipboardChunked(png, "image/png")
+                clipboardNotice.value = "已发送图片到远程剪贴板（${png.size / 1024} KB）"
+            }.onFailure {
+                clipboardNotice.value = "发送图片到远程剪贴板失败：${it.message ?: it.javaClass.simpleName}"
+            }
+        }
+    }
+
+    /** 远程剪贴板图片复制到本机剪贴板 */
+    fun copyRemoteImageToLocal() {
+        val bytes = remoteClipboardImage.value ?: return
+        applyRemoteClipboardLocally {
+            platform.clipboard().setImagePng(bytes)
+        }
+        clipboardNotice.value = "已复制远程图片到本机剪贴板（可在本机粘贴）"
+    }
+
+    /** 远程剪贴板图片保存到本地媒体库 */
+    fun saveRemoteImageLocally() {
+        val bytes = remoteClipboardImage.value ?: return
+        ioScope.launch {
+            runCatching {
+                val name = "clipboard_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.png"
+                val path = platform.mediaStore().saveScreenshot(bytes, name)
+                if (path != null) {
+                    savedMediaEvent.value = SavedMediaEvent("screenshot", path, name, "${bytes.size / 1024} KB")
+                } else {
+                    clipboardNotice.value = "图片保存失败"
+                }
+            }.onFailure {
+                clipboardNotice.value = "图片保存失败：${it.message}"
+            }
         }
     }
 
