@@ -8,10 +8,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.VolumeOff
@@ -28,6 +30,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -173,22 +176,60 @@ fun SettingsScreen(state: AppState) {
                     toggle { it.recordingNotifyOnSave = !it.recordingNotifyOnSave }
                 }
                 var storageRoot by remember { mutableStateOf(settings.storageRoot) }
+                // v2.7.5：选择器回填（settings 更新时同步文本框）
+                LaunchedEffect(settings.storageRoot) { storageRoot = settings.storageRoot }
+                var pickingDir by remember { mutableStateOf(false) }
                 OutlinedTextField(
                     value = storageRoot,
                     onValueChange = { storageRoot = it },
-                    label = { Text("存储位置（留空 = 默认）") },
+                    label = { Text("默认存储位置（留空 = 平台默认）") },
                     placeholder = { Text(state.platform.mediaStore().let { "截图 ${it.screenshotsDir()}" }) },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                     trailingIcon = {
                         androidx.compose.material3.TextButton(onClick = {
-                            settings.storageRoot = storageRoot.trim()
-                            state.store.saveSettings()
+                            state.store.updateSettings {
+                                it.storageRoot = storageRoot.trim()
+                                // 手输路径 = 桌面直用；Android 手输无法持久授权 → 清 SAF 句柄走默认
+                                if (storageRoot.trim().isNotEmpty()) it.storageRootTreeUri = ""
+                            }
                         }) { Text("保存") }
                     }
                 )
+                // v2.7.5：系统目录选择器（安卓 SAF / 桌面文件选择器）——选绝对路径，免手输
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    androidx.compose.material3.OutlinedButton(
+                        onClick = {
+                            if (pickingDir) return@OutlinedButton
+                            pickingDir = true
+                            state.platform.pickDirectory { picked ->
+                                pickingDir = false
+                                if (picked != null) {
+                                    state.store.updateSettings {
+                                        it.storageRoot = picked.displayPath
+                                        it.storageRootTreeUri = picked.treeUri
+                                    }
+                                }
+                            }
+                        },
+                        enabled = !pickingDir
+                    ) {
+                        Icon(Icons.Filled.FolderOpen, null, Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(if (pickingDir) "选择中…" else "选择目录…")
+                    }
+                    androidx.compose.material3.OutlinedButton(
+                        onClick = {
+                            state.store.updateSettings {
+                                it.storageRoot = ""
+                                it.storageRootTreeUri = ""
+                            }
+                        }
+                    ) { Text("恢复默认") }
+                }
                 Text(
-                    "自动分类：截图 → ${state.platform.mediaStore().screenshotsDir()}\n录屏 → ${state.platform.mediaStore().recordingsDir()}\n下载 → ${state.platform.mediaStore().downloadsDir()}\n文件名自动带时间戳，避免覆盖。",
+                    "自动分类：截图 → ${state.platform.mediaStore().screenshotsDir()}\n录屏 → ${state.platform.mediaStore().recordingsDir()}\n下载 → ${state.platform.mediaStore().downloadsDir()}\n文件名自动带时间戳，避免覆盖。" +
+                            if (settings.storageRootTreeUri.isNotBlank()) "\n安卓 SAF 目录已授权：重启后仍可写入。" else "",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

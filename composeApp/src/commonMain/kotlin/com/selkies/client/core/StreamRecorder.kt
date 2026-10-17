@@ -205,7 +205,8 @@ class StreamRecorder(
             flushJpegFrame()
             try {
                 muxer?.let { m ->
-                    path = m.outputPath
+                    // v2.7.5：优先用 realPath（Android SAF 录屏 = 用户可读的真实绝对路径）
+                    path = if (m.realPath.isNotBlank()) m.realPath else m.outputPath
                     val ok = m.close()
                     if (!ok) error = "封装失败"
                 }

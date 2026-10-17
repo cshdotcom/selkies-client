@@ -230,9 +230,14 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     var showZoomControls by remember { mutableStateOf(false) }
 
     // v2.7.0：服务器能力（麦克风/摄像头/音频是否被服务器禁用；UI 据此禁用入口）
+    // v2.7.5【麦克风「点不了」根因修复】：补收 locked 状态——官方语义（websockets_mode.py 实证）
+    //   仅 (value=false 且 locked=true) 才是真禁用；未锁定的 false 只是默认关，客户端上行数据即开启。
+    //   旧版工具栏按钮只看 value 一律拦截 = 「网页能用麦克风、App 点不了」的真正根因（v2.7.3 漏修此处）。
     val serverMicEnabled by session.serverMicEnabled.collectAsState()
     val serverWebcamEnabled by session.serverWebcamEnabled.collectAsState()
     val serverAudioEnabled by session.serverAudioEnabled.collectAsState()
+    val serverMicLocked by session.serverMicLocked.collectAsState()
+    val serverWebcamLocked by session.serverWebcamLocked.collectAsState()
     val audioStallNotice by session.audioStallNotice.collectAsState()
     // v2.7.4：音频警告用户已关闭标记（新警告出现时重置；同一警告不再打扰）
     var audioNoticeDismissed by remember { mutableStateOf(false) }
@@ -1207,24 +1212,28 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                 if (micSessionOn) Icons.Filled.Mic else Icons.Filled.MicOff, "麦克风",
                                 tint = when {
                                     micSessionOn -> Color(0xFF4ADE80)
-                                    !serverMicEnabled -> Color(0xFF6B7280)
+                                    // v2.7.5：仅锁定禁用才置灰；默认关（未锁定）保持白色可点
+                                    !serverMicEnabled && serverMicLocked -> Color(0xFF6B7280)
                                     else -> Color.White
                                 }
                             ) {
-                                if (!serverMicEnabled) {
-                                    toast = "服务器已禁用麦克风（microphone_enabled=false），无法上行"
+                                // v2.7.5：与官方 web 客户端对齐——未锁定的默认关直接开启上行
+                                //   （服务器 0x02 门控只拒 locked 的 false；数据到达即视为开启）
+                                if (!serverMicEnabled && serverMicLocked) {
+                                    toast = "服务器已锁定禁用麦克风（microphone_enabled 锁定为关），无法上行"
                                 } else if (micSessionOn) session.stopMicUplink() else session.startMicUplink()
                             }
                             "camera" -> ToolButton(
                                 if (camSessionOn) Icons.Filled.Videocam else Icons.Filled.VideocamOff, "摄像头",
                                 tint = when {
                                     camSessionOn -> Color(0xFF4ADE80)
-                                    !serverWebcamEnabled -> Color(0xFF6B7280)
+                                    !serverWebcamEnabled && serverWebcamLocked -> Color(0xFF6B7280)
                                     else -> Color.White
                                 }
                             ) {
-                                if (!serverWebcamEnabled) {
-                                    toast = "服务器已禁用摄像头（webcam_enabled=false），无法上行"
+                                // v2.7.5：同麦克风——仅锁定禁用才拒绝（未锁定的 false = 默认关可开启）
+                                if (!serverWebcamEnabled && serverWebcamLocked) {
+                                    toast = "服务器已锁定禁用摄像头（webcam_enabled 锁定为关），无法上行"
                                 } else if (camSessionOn) session.stopWebcamUplink() else session.startWebcamUplink()
                             }
                             "hardware" -> ToolButton(Icons.Filled.DevicesOther, "硬件") { panel = if (panel == SessionPanel.HARDWARE) SessionPanel.NONE else SessionPanel.HARDWARE }

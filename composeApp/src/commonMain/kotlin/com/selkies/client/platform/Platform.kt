@@ -127,6 +127,8 @@ interface PrintBridge {
  */
 interface StreamMuxer {
     val outputPath: String
+    /** v2.7.5：实际保存的可读路径（Android SAF 录屏 = 解析后的真实绝对路径；默认 = outputPath） */
+    val realPath: String get() = outputPath
     /** 添加视频轨（codecId 与 0x04 帧头一致：1=h264 2=vp8 3=vp9 4=av1 5=h265） */
     fun addVideoTrack(codecId: Int, width: Int, height: Int): Boolean
     /** 添加 Opus 音频轨 */
@@ -170,6 +172,14 @@ interface MediaStoreBridge {
 /** 文件选择/保存结果 */
 data class PickedFile(val name: String, val path: String, val size: Long)
 
+/** v2.7.5：「默认存储位置」选择器结果——用户在系统选择器选定的目录 */
+data class PickedDirectory(
+    /** 展示用可读路径（桌面=绝对路径；Android 主存储=真实绝对路径，其他卷尽量解析、拿不到时为可读描述） */
+    val displayPath: String,
+    /** 桌面 = displayPath 同值；Android = SAF tree URI（content://…，持久授权后可跨重启读写） */
+    val treeUri: String
+)
+
 /** v2.7.4：「另存为」目标——用户在系统选择器选定的可写位置 */
 data class PickedSaveTarget(
     /** 展示名（含扩展） */
@@ -200,6 +210,10 @@ interface PlatformServices {
         mime: String,
         onResult: (PickedSaveTarget?) -> Unit
     )
+    /** v2.7.5：弹出系统「选择目录」选择器，选默认存储位置（截图/录屏/下载的根目录）。
+     *  Android=SAF OpenDocumentTree（持久授权 + 尽量解析真实绝对路径）；Desktop=JFileChooser 目录模式。
+     *  用户取消时 onResult(null)。默认实现立即回 null（测试桩/不支持的平台）。 */
+    fun pickDirectory(onResult: (PickedDirectory?) -> Unit) { onResult(null) }
     fun makeVideoSink(): VideoSink
     fun makeAudioPlayer(): AudioPlayer
     fun makeMicCapture(): MicCapture

@@ -158,6 +158,9 @@ data class AppSettings(
     var toolbarOrder: String = "",
     // 截图/录屏/下载 存储位置（空 = 平台默认：Android 公共 Pictures/Videos/Download 下的 Selkies 子目录；桌面 ~/Pictures/Selkies 等）
     var storageRoot: String = "",
+    // v2.7.5 Android SAF 目录树句柄（content://…；用户经系统选择器选定的默认存储位置，跨重启持久授权）。
+    // 桌面恒空（桌面直接用 storageRoot 绝对路径）。
+    var storageRootTreeUri: String = "",
     // 录屏
     var recordingIncludeAudio: Boolean = true,
     var recordingNotifyOnSave: Boolean = true,
