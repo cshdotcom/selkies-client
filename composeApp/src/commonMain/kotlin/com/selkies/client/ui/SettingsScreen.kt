@@ -8,10 +8,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.VolumeOff
@@ -28,11 +30,13 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -173,22 +177,99 @@ fun SettingsScreen(state: AppState) {
                     toggle { it.recordingNotifyOnSave = !it.recordingNotifyOnSave }
                 }
                 var storageRoot by remember { mutableStateOf(settings.storageRoot) }
+                // v2.7.5：选择器回填（settings 更新时同步文本框）
+                LaunchedEffect(settings.storageRoot) { storageRoot = settings.storageRoot }
                 OutlinedTextField(
                     value = storageRoot,
                     onValueChange = { storageRoot = it },
-                    label = { Text("存储位置（留空 = 默认）") },
+                    label = { Text("默认存储位置（留空 = 平台默认）") },
                     placeholder = { Text(state.platform.mediaStore().let { "截图 ${it.screenshotsDir()}" }) },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                     trailingIcon = {
                         androidx.compose.material3.TextButton(onClick = {
-                            settings.storageRoot = storageRoot.trim()
-                            state.store.saveSettings()
+                            state.store.updateSettings {
+                                it.storageRoot = storageRoot.trim()
+                                // 手输路径 = 桌面直用；Android 手输无法持久授权 → 清 SAF 句柄走默认
+                                if (storageRoot.trim().isNotEmpty()) it.storageRootTreeUri = ""
+                            }
                         }) { Text("保存") }
                     }
                 )
+                // v2.7.5：系统目录选择器（安卓 SAF / 桌面文件选择器）——选绝对路径，免手输
+                // 【v2.7.7】+「验证写入」：真实写探针文件并报告实际落盘位置（旧版 SAF 失败静默回退无从知晓）
+                var pickingDir by remember { mutableStateOf(false) }
+                var verifying by remember { mutableStateOf(false) }
+                var verifyResult by remember { mutableStateOf<String?>(null) }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    androidx.compose.material3.OutlinedButton(
+                        onClick = {
+                            if (pickingDir) return@OutlinedButton
+                            pickingDir = true
+                            state.platform.pickDirectory { picked ->
+                                pickingDir = false
+                                if (picked != null) {
+                                    state.store.updateSettings {
+                                        it.storageRoot = picked.displayPath
+                                        it.storageRootTreeUri = picked.treeUri
+                                    }
+                                }
+                            }
+                        },
+                        enabled = !pickingDir
+                    ) {
+                        Icon(Icons.Filled.FolderOpen, null, Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(if (pickingDir) "选择中…" else "选择目录…")
+                    }
+                    androidx.compose.material3.OutlinedButton(
+                        onClick = {
+                            state.store.updateSettings {
+                                it.storageRoot = ""
+                                it.storageRootTreeUri = ""
+                            }
+                        }
+                    ) { Text("恢复默认") }
+                    // 【v2.7.7】验证写入：用户反馈「修改默认存储位置后似乎没有生效」——
+                    // 验证按钮给出铁证（实际落盘路径 + 未生效原因）
+                    androidx.compose.material3.OutlinedButton(
+                        onClick = {
+                            if (verifying) return@OutlinedButton
+                            verifying = true
+                            verifyResult = null
+                            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                                val bridge = state.platform.mediaStore()
+                                val probe = "selkies_probe_${System.currentTimeMillis()}.txt"
+                                val path = runCatching {
+                                    bridge.saveDownload(probe, "Selkies 存储位置验证文件，可安全删除。".toByteArray())
+                                }.getOrNull()
+                                val diag = runCatching { bridge.storageDiagnostic() }.getOrNull()
+                                val active = runCatching { bridge.customRootActive }.getOrDefault(false)
+                                verifyResult = when {
+                                    path == null -> "写入失败——目录不可写或空间不足" +
+                                            (diag?.let { "\n原因：$it" } ?: "")
+                                    active -> "已生效。探针文件写入：$path"
+                                    else -> "已保存，但落在了默认位置（自定义目录未生效）。\n实际路径：$path" +
+                                            (diag?.let { "\n原因：$it" } ?: "\n建议重新「选择目录…」获取授权")
+                                }
+                                verifying = false
+                            }                        },
+                        enabled = !verifying
+                    ) { Text(if (verifying) "验证中…" else "验证写入") }
+                }
+                // 【v2.7.7】验证结果（绿=已生效 / 红=未生效+原因）
+                verifyResult?.let { vr ->
+                    Text(
+                        vr,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (vr.startsWith("已生效")) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.error,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
+                    )
+                }
                 Text(
-                    "自动分类：截图 → ${state.platform.mediaStore().screenshotsDir()}\n录屏 → ${state.platform.mediaStore().recordingsDir()}\n下载 → ${state.platform.mediaStore().downloadsDir()}\n文件名自动带时间戳，避免覆盖。",
+                    "自动分类：截图 → ${state.platform.mediaStore().screenshotsDir()}\n录屏 → ${state.platform.mediaStore().recordingsDir()}\n下载 → ${state.platform.mediaStore().downloadsDir()}\n文件名自动带时间戳，避免覆盖。" +
+                            if (settings.storageRootTreeUri.isNotBlank()) "\n安卓 SAF 目录已授权：重启后仍可写入。" else "",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -220,8 +301,10 @@ fun SettingsScreen(state: AppState) {
                 var order by remember(settings.toolbarOrder) {
                     mutableStateOf(
                         run {
-                            val saved = settings.toolbarOrder.split(',').filter { it.isNotBlank() }
-                            com.selkies.client.ui.ToolbarDefaults.ALL.filter { it in saved } +
+                            // 【v2.7.7】与 SessionScreen 同步修复：保存的顺序优先（旧版只过滤不重排）
+                            val saved = settings.toolbarOrder.split(',').map { it.trim() }
+                                .filter { it.isNotBlank() && it in com.selkies.client.ui.ToolbarDefaults.ALL }
+                            saved.distinct() +
                                     com.selkies.client.ui.ToolbarDefaults.ALL.filter { it !in saved }
                         }
                     )

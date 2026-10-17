@@ -515,18 +515,22 @@ fun CompleteKeyboard(
     // 缩放：分类模式 0.55–1.6（作用于自动键高），完整模式 0.3–2.0（作用于单位宽度）
     // 【v2.6.0 修复】两种模式各自持久化（keyboardScale / keyboardFullScale）：
     //   旧版共用一个值——在完整模式缩小后切回分类模式键盘变微型，反之亦然。
-    // 【v2.7.4】完整模式默认 scale 提高：旧版 autoScaleHint（屏宽恰好容纳 23 单位）在手机上
-    //   ≈0.45（每键 15dp）→「太小了团在一起」。现在默认 = max(autoScaleHint, 0.7)——
-    //   键更大更舒展（超屏部分横向滚动可达），用户仍可 -/+ 或捏合调整。
+    // 【v2.7.6 修复】完整模式默认 = 宽度恰好适配容器（fitFullWidth）。
+    //   v2.7.4 的 max(autoScaleHint, 0.7) 在窄容器（竖屏手机 ~360dp / 快捷键管理页 ~340dp）上
+    //   把 23 单位键盘撑到 ~550dp > 容器宽 → 右侧 ~40%（F8-F12 / I O P / 回车 / 退格）被裁掉
+    //   = 用户「键盘布局有问题」（截图实证：键盘只显示到 U/J/N）。键偏小可拉滑杆放大
+    //   （超宽部分横向滚动可达），但默认必须「全部键可见」。
     var scale by remember(savedScale, savedFullScale, fullMode) {
         mutableStateOf(
             if (fullMode) {
-                if (savedFullScale > 0f) savedFullScale else autoScaleHint.coerceIn(0.7f, 1.2f)
+                if (savedFullScale > 0f) savedFullScale else autoScaleHint.coerceIn(0.3f, 1.2f)
             } else {
                 if (savedScale > 0f) savedScale else 1f
             }
         )
     }
+    // 【v2.7.6】用户手动调整过（滑杆/-/+/捏合）→ 尺寸就绪后不再自动纠正，尊重用户选择
+    var userAdjustedScale by remember(fullMode) { mutableStateOf(false) }
     var repaint by remember { mutableStateOf(0) }   // 触发修饰键高亮重绘
 
     var offset by remember { mutableStateOf(IntOffset.Zero) }
@@ -558,7 +562,15 @@ fun CompleteKeyboard(
         return minOf(heightFit, widthFit).coerceIn(0.3f, 2f)
     }
 
+    /** 【v2.7.6】宽度适配：让 23 单位（23×34=782dp@scale1）键盘恰好放进容器宽度——全部键可见。
+     *  边距精确核算（GUI 实测校准）：Surface 内层 Column padding 3dp×2 + 键区 Column padding 2dp×2 + 余量 → -20dp */
+    fun fitFullWidthScale(): Float {
+        if (kbWidthDp <= 0f) return 0f
+        return ((kbWidthDp - 20f) / 782f).coerceIn(0.3f, 2f)
+    }
+
     fun doScale(f: Float) {
+        userAdjustedScale = true
         scale = (scale * f).coerceIn(if (fullMode) 0.3f else 0.55f, if (fullMode) 2.0f else 1.6f)
         onScaleChange(scale)
     }
@@ -567,10 +579,20 @@ fun CompleteKeyboard(
     // 同样把 scale clamp 到高度适配值——保证「打开即 6 行全部可见」，不再出现顶部行被裁。
     LaunchedEffect(fullMode, parentSize) {
         if (fullMode && parentSize != IntSize.Zero) {
-            val fit = fitFullScale()
-            if (scale > fit) {
-                scale = fit
-                onScaleChange(fit)
+            // 【v2.7.6】无保存偏好且未手动调整：宽度适配优先（右半键盘可见性 > 键大小）。
+            //   拿到真实容器宽后一次性纠正；不调 onScaleChange（默认值推导，非用户意图，不写盘）。
+            if (!userAdjustedScale && savedFullScale <= 0f) {
+                val fitW = fitFullWidthScale()
+                if (fitW > 0f) {
+                    val target = minOf(fitW, fitFullScale())
+                    if (kotlin.math.abs(scale - target) > 0.01f) scale = target
+                }
+            } else {
+                val fit = fitFullScale()
+                if (scale > fit) {
+                    scale = fit
+                    onScaleChange(fit)
+                }
             }
         }
     }
@@ -661,6 +683,7 @@ fun CompleteKeyboard(
                             if (zoom != 1f) {
                                 val ns = (scale * zoom).coerceIn(if (fullMode) 0.3f else 0.55f, if (fullMode) 2.0f else 1.6f)
                                 if (kotlin.math.abs(ns - scale) > 0.004f) {
+                                    userAdjustedScale = true   // v2.7.6：捏合=手动调整
                                     scale = ns
                                     onScaleChange(scale)
                                 }
@@ -740,8 +763,13 @@ fun CompleteKeyboard(
                             tab = if (fullMode) KbTab.FULL else KbTab.MAIN
                             // 【v2.7.1】切到完整模式：scale 超出高度适配值时自动降到 fit（打开即 6 行全可见）
                             if (fullMode) {
-                                val fit = fitFullScale()
-                                if (scale > fit) { scale = fit; onScaleChange(fit) }
+                                val fitW = fitFullWidthScale()
+                                if (!userAdjustedScale && savedFullScale <= 0f && fitW > 0f) {
+                                    scale = minOf(fitW, fitFullScale())   // v2.7.6：宽度适配默认
+                                } else {
+                                    val fit = fitFullScale()
+                                    if (scale > fit) { scale = fit; onScaleChange(fit) }
+                                }
                             }
                             onFullModeChange(fullMode)
                         }
@@ -764,6 +792,7 @@ fun CompleteKeyboard(
                         androidx.compose.material3.Slider(
                             value = scale,
                             onValueChange = {
+                                userAdjustedScale = true   // v2.7.6：手动调整后不再自动纠正
                                 scale = it.coerceIn(if (fullMode) 0.3f else 0.55f, if (fullMode) 2.0f else 1.6f)
                             },
                             onValueChangeFinished = { onScaleChange(scale) },

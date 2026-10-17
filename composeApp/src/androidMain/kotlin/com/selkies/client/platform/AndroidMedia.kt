@@ -22,6 +22,7 @@ import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.provider.MediaStore
+import android.provider.DocumentsContract
 import android.view.Surface
 import com.selkies.client.MainActivity
 import com.selkies.client.model.SavedMediaEntry
@@ -36,24 +37,103 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Android 媒体存储（v2.5.0）：截图 → Pictures/Selkies；录屏 → Movies/Selkies；下载 → Download/Selkies。
  * API 29+ 经 MediaStore 免存储权限；API 26-28 回退公共目录（需 WRITE_EXTERNAL_STORAGE，未授权时回退应用外部私有目录）。
+ *
+ * v2.7.5【默认存储位置选择器】：用户经系统 SAF 选择器选定目录后（treeUriProvider 非空且有效），
+ * 全部保存改走 SAF：{所选根}/Selkies/{Screenshots|Recordings|Downloads}，跨重启持久授权、支持 U 盘/SD 卡/任意目录。
+ * treeUri 失效（系统回收授权/目录被删）时自动回退默认 MediaStore 行为。
  */
-class AndroidMediaStoreBridge(private val ctx: Context) : MediaStoreBridge {
+class AndroidMediaStoreBridge(
+    private val ctx: Context,
+    private val treeUriProvider: () -> String = { "" }
+) : MediaStoreBridge {
 
     private fun q29(): Boolean = Build.VERSION.SDK_INT >= 29
 
+    // ---------------- v2.7.5 SAF 目录支持 ----------------
+
+    /** 当前生效的 SAF 目录树（无授权/无效 → null = 走默认 MediaStore） */
+    private fun safTree(): Uri? {
+        val s = treeUriProvider().trim()
+        if (s.isEmpty() || !s.startsWith("content://")) {
+            diagReason = if (s.isEmpty()) null else "存储配置不是有效的 SAF 目录（$s）"
+            return null
+        }
+        val uri = runCatching { Uri.parse(s) }.getOrNull() ?: run {
+            diagReason = "SAF 目录地址解析失败"
+            return null
+        }
+        // 持久写权限仍在？（系统最多保留 512 个；被回收/目录删除 → 回退默认）
+        val granted = runCatching {
+            ctx.contentResolver.persistedUriPermissions.any {
+                it.uri == uri && it.isWritePermission
+            }
+        }.getOrDefault(false)
+        if (!granted) {
+            // 【v2.7.7】关键透明化：旧版静默回退 = 用户「改了存储位置没生效」却毫无提示
+            diagReason = "SAF 写入授权已失效（系统回收/目录被删/重启后未持久）——已回退默认位置，请重新选择目录"
+            return null
+        }
+        // 目录树仍可访问（docId 可解析）
+        val tree = runCatching { SafPaths.treeRootDocUri(uri) }.getOrNull() ?: run {
+            diagReason = "SAF 目录树无法访问（docId 解析失败）"
+            return null
+        }
+        diagReason = null
+        return tree
+    }
+
+    /** 【v2.7.7】诊断：自定义目录未生效原因（设置页显示；null=正常） */
+    private var diagReason: String? = null
+    override val customRootActive: Boolean get() { safTree(); return diagReason == null && treeUriProvider().trim().isNotEmpty() && safTree() != null }
+    override fun storageDiagnostic(): String? = diagReason
+
+    /** SAF 根 → {根}/Selkies（不存在则创建） */
+    private fun safTopDir(tree: Uri): Uri? =
+        SafPaths.findOrCreateDir(ctx, tree, SafPaths.TOP_DIR)
+
+    /** SAF 子目录：{根}/Selkies/{sub} */
+    private fun safSubDir(tree: Uri, sub: String): Uri? {
+        val top = safTopDir(tree) ?: return null
+        return SafPaths.findOrCreateDir(ctx, top, sub)
+    }
+
+    /** SAF 展示根路径（真实绝对路径，解析不出时为可读描述） */
+    private fun safDisplayRoot(tree: Uri): String =
+        SafPaths.resolveDisplayPath(ctx, tree)
+
+    /** SAF 创建文件文档 → (docUri, 展示真实绝对路径)；失败 null */
+    private fun safCreate(fileName: String, mime: String, sub: String): Pair<Uri, String>? {
+        val tree = safTree() ?: return null
+        val dir = safSubDir(tree, sub) ?: return null
+        val docUri = runCatching {
+            DocumentsContract.createDocument(ctx.contentResolver, dir, mime, fileName)
+        }.getOrNull() ?: return null
+        val display = SafPaths.fileDocIdToAbsolutePath(ctx, DocumentsContract.getDocumentId(docUri))
+            ?: docUri.toString()
+        return docUri to display
+    }
+
     override fun screenshotsDir(): String =
-        if (q29()) "Pictures/Selkies"
-        else legacyDir(Environment.DIRECTORY_PICTURES).absolutePath
+        safTree()?.let { "${safDisplayRoot(it)}/${SafPaths.TOP_DIR}/${SafPaths.SUB_SCREENSHOTS}" }
+            ?: if (q29()) "Pictures/Selkies"
+            else legacyDir(Environment.DIRECTORY_PICTURES).absolutePath
 
     override fun recordingsDir(): String =
-        if (q29()) "Movies/Selkies"
-        else legacyDir(Environment.DIRECTORY_MOVIES).absolutePath
+        safTree()?.let { "${safDisplayRoot(it)}/${SafPaths.TOP_DIR}/${SafPaths.SUB_RECORDINGS}" }
+            ?: if (q29()) "Movies/Selkies"
+            else legacyDir(Environment.DIRECTORY_MOVIES).absolutePath
 
     override fun downloadsDir(): String =
-        if (q29()) "Download/Selkies"
-        else legacyDir(Environment.DIRECTORY_DOWNLOADS).absolutePath
+        safTree()?.let { "${safDisplayRoot(it)}/${SafPaths.TOP_DIR}/${SafPaths.SUB_DOWNLOADS}" }
+            ?: if (q29()) "Download/Selkies"
+            else legacyDir(Environment.DIRECTORY_DOWNLOADS).absolutePath
 
     override fun saveScreenshot(png: ByteArray, fileName: String): String? = runCatching {
+        // v2.7.5：SAF 自定义目录优先
+        safCreate(fileName, "image/png", SafPaths.SUB_SCREENSHOTS)?.let { (docUri, display) ->
+            ctx.contentResolver.openOutputStream(docUri)?.use { it.write(png) } ?: return null
+            return display
+        }
         if (q29()) {
             val cv = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
@@ -63,7 +143,10 @@ class AndroidMediaStoreBridge(private val ctx: Context) : MediaStoreBridge {
             val uri = ctx.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
                 ?: return null
             ctx.contentResolver.openOutputStream(uri)?.use { it.write(png) }
-            uri.toString()
+            // 【v2.7.6】返回真实绝对路径而非 content:// URI（用户反馈「文件位置显示有问题」：
+            //   保存引导弹窗/媒体库直接展示 content://media/external/images/media/71191 对用户
+            //   不可认知也无法打开。与下载路径修复对齐：查 DATA 列，失败回退构造可读路径）
+            mediaStoreRealPath(uri, "/storage/emulated/0/Pictures/Selkies/$fileName")
         } else {
             val dir = legacyDir(Environment.DIRECTORY_PICTURES)
             val f = uniqueFile(dir, fileName)
@@ -74,6 +157,11 @@ class AndroidMediaStoreBridge(private val ctx: Context) : MediaStoreBridge {
     }.getOrNull()
 
     override fun saveDownload(fileName: String, bytes: ByteArray): String? = runCatching {
+        // v2.7.5：SAF 自定义目录优先
+        safCreate(fileName, mimeOf(fileName), SafPaths.SUB_DOWNLOADS)?.let { (docUri, display) ->
+            ctx.contentResolver.openOutputStream(docUri)?.use { it.write(bytes) } ?: return null
+            return display
+        }
         if (q29()) {
             val cv = ContentValues().apply {
                 put(MediaStore.Downloads.DISPLAY_NAME, fileName)
@@ -83,7 +171,8 @@ class AndroidMediaStoreBridge(private val ctx: Context) : MediaStoreBridge {
             val uri = ctx.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
                 ?: return null
             ctx.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-            uri.toString()
+            // 【v2.7.6】真实绝对路径（同 saveScreenshot 修复）
+            mediaStoreRealPath(uri, "/storage/emulated/0/Download/Selkies/$fileName")
         } else {
             val dir = legacyDir(Environment.DIRECTORY_DOWNLOADS)
             val f = uniqueFile(dir, fileName)
@@ -94,6 +183,15 @@ class AndroidMediaStoreBridge(private val ctx: Context) : MediaStoreBridge {
     }.getOrNull()
 
     override fun openDownloadStream(fileName: String): OutputStreamHandle? = runCatching {
+        // v2.7.5：SAF 自定义目录优先（流式写入用户选定目录；返回真实绝对路径）
+        safCreate(fileName, mimeOf(fileName), SafPaths.SUB_DOWNLOADS)?.let { (docUri, display) ->
+            val os = ctx.contentResolver.openOutputStream(docUri) ?: return null
+            return object : OutputStreamHandle {
+                override val path: String = display
+                override fun write(bytes: ByteArray, off: Int, len: Int) = os.write(bytes, off, len)
+                override fun close() = os.close()
+            }
+        }
         if (q29()) {
             val cv = ContentValues().apply {
                 put(MediaStore.Downloads.DISPLAY_NAME, fileName)
@@ -130,11 +228,43 @@ class AndroidMediaStoreBridge(private val ctx: Context) : MediaStoreBridge {
         }
     }.getOrNull()
 
-    override fun createRecordingFile(fileName: String): String? = "selkies-pending://$fileName"
+    override fun createRecordingFile(fileName: String): String? {
+        // v2.7.5：SAF 自定义目录 → 复用器惰性创建文档（首帧才建文件）
+        safTree()?.let { tree ->
+            return "${SafMarker.PREFIX}${tree}|$fileName"
+        }
+        return "selkies-pending://$fileName"
+    }
 
     override fun listMedia(): List<SavedMediaEntry> {
         val out = ArrayList<SavedMediaEntry>()
         runCatching {
+            // v2.7.5：SAF 自定义目录优先（仅列出该目录下的媒体；不再扫 MediaStore）
+            val tree = safTree()
+            if (tree != null) {
+                val top = safTopDir(tree)
+                if (top != null) {
+                    listOf(
+                        SafPaths.SUB_SCREENSHOTS to "screenshot",
+                        SafPaths.SUB_RECORDINGS to "recording",
+                        SafPaths.SUB_DOWNLOADS to "download"
+                    ).forEach { (sub, kind) ->
+                        val dir = SafPaths.findChildDir(ctx, top, sub) ?: return@forEach
+                        SafPaths.listFiles(ctx, dir).forEach { row ->
+                            out.add(
+                                SavedMediaEntry(
+                                    path = DocumentsContract.buildDocumentUriUsingTree(tree, row.documentId).toString(),
+                                    name = row.displayName,
+                                    kind = kind,
+                                    sizeBytes = row.sizeBytes,
+                                    modifiedAt = row.modifiedAt
+                                )
+                            )
+                        }
+                    }
+                }
+                return out.sortedByDescending { it.modifiedAt }
+            }
             if (q29()) {
                 listOf(
                     MediaStore.Images.Media.EXTERNAL_CONTENT_URI to "screenshot",
@@ -188,7 +318,14 @@ class AndroidMediaStoreBridge(private val ctx: Context) : MediaStoreBridge {
 
     override fun deleteMedia(entry: SavedMediaEntry): Boolean = runCatching {
         if (entry.path.startsWith("content://")) {
-            ctx.contentResolver.delete(Uri.parse(entry.path), null, null) > 0
+            val uri = Uri.parse(entry.path)
+            if (uri.authority == "media") {
+                // MediaStore 集合 URI
+                ctx.contentResolver.delete(uri, null, null) > 0
+            } else {
+                // v2.7.5：SAF 文档 URI（tree 文档）
+                DocumentsContract.deleteDocument(ctx.contentResolver, uri)
+            }
         } else {
             File(entry.path).delete()
         }
@@ -220,6 +357,19 @@ class AndroidMediaStoreBridge(private val ctx: Context) : MediaStoreBridge {
         }
     }
 
+    /**
+     * 【v2.7.6】MediaStore URI → 真实绝对路径（用户可认知的 /storage/emulated/0/... 形态）。
+     * 查询 DATA 列；查不到（部分 ROM 返回空）回退 [fallback]（按 RELATIVE_PATH 规则构造的可读路径）。
+     * 修复：截图/录屏保存后弹窗与媒体库显示 content://media/external/images/media/71191。
+     */
+    private fun mediaStoreRealPath(uri: Uri, fallback: String): String {
+        return runCatching {
+            ctx.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DATA), null, null, null)?.use { c ->
+                if (c.moveToFirst()) c.getString(0)?.takeIf { it.isNotBlank() } else null
+            }
+        }.getOrNull() ?: fallback
+    }
+
     private fun mimeOf(name: String): String = when {
         name.endsWith(".png", true) -> "image/png"
         name.endsWith(".jpg", true) || name.endsWith(".jpeg", true) -> "image/jpeg"
@@ -233,6 +383,21 @@ class AndroidMediaStoreBridge(private val ctx: Context) : MediaStoreBridge {
     }
 }
 
+/** v2.7.5：SAF 录屏标记（携带 treeUri，复用器惰性建文件时用） */
+object SafMarker {
+    const val PREFIX = "selkies-saf://"
+    fun parse(outputPath: String): Pair<Uri, String>? {
+        if (!outputPath.startsWith(PREFIX)) return null
+        val rest = outputPath.removePrefix(PREFIX)
+        val sep = rest.indexOf('|')
+        if (sep <= 0) return null
+        val tree = runCatching { Uri.parse(rest.substring(0, sep)) }.getOrNull() ?: return null
+        val name = rest.substring(sep + 1)
+        if (name.isBlank()) return null
+        return tree to name
+    }
+}
+
 /**
  * Android 流复用器（MediaMuxer）：
  * - H.264/H.265 → MP4（Annex-B→AVCC + SPS/PPS/VPS→csd，首关键帧就绪才建轨启动）
@@ -243,12 +408,17 @@ class AndroidMediaStoreBridge(private val ctx: Context) : MediaStoreBridge {
 class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
 
     private var realMuxer: MediaMuxer? = null
-    var realPath: String? = null
+    // v2.7.5：接口化真实保存路径（SAF 录屏 = 解析后的真实绝对路径；建文件前 = outputPath 占位）
+    override var realPath: String = outputPath
         private set
+    /** v2.7.5：创建的媒体文档（MediaStore 或 SAF）——空内容时清理用 */
+    private var docUri: Uri? = null
     private var pfd: ParcelFileDescriptor? = null
     private var videoTrackIdx = -1
     private var audioTrackIdx = -1
     private var muxerStarted = false
+    // 【v2.7.6】close 结果缓存（close 幂等语义：重复调用返回上次结果而非 muxerStarted 已被置 false）
+    private var lastCloseOk = false
     private var containerMp4 = true
 
     // 视频 codec（1=h264 2=vp8 3=vp9 5=h265）
@@ -339,12 +509,14 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
                 }
                 return true
             }
+            // 【v2.7.6】本地引用快照（close() 并发置空防护）
+            val m = realMuxer ?: return false
             if (audioTrackIdx < 0) return false // 启动时无音频数据 → 不再补轨
             if (ptsUs <= lastAudioPts) return true
             val buf = ByteBuffer.allocate(data.size)
             buf.put(data); buf.flip()
             val info = MediaCodec.BufferInfo().apply { set(0, data.size, ptsUs, 0) }
-            val ok = runCatching { realMuxer!!.writeSampleData(audioTrackIdx, buf, info) }.isSuccess
+            val ok = runCatching { m.writeSampleData(audioTrackIdx, buf, info) }.isSuccess
             if (ok) { lastAudioPts = ptsUs; audioSamplesWritten++ }
             return ok
         }
@@ -383,10 +555,17 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
 
     override fun close(): Boolean {
         synchronized(lock) {
-            if (closed) return muxerStarted
+            if (closed) return lastCloseOk
             closed = true
+            // 【v2.7.6】录屏结束闪退根因修复（use-after-free 竞态）：
+            //   旧版顺序 = jpegEncoder.release()（join 仅 800ms，超时即放弃）→ MediaMuxer.stop()/
+            //   release() → 但编码器 drain 线程可能仍活着并调 writeSampleData() → 对已释放的
+            //   native muxer 写入 = SIGSEGV 原生崩溃（Java runCatching 拦不住）。
+            //   新顺序：①先置 muxerStarted=false（writeSample 立即拒新）②彻底等编码器线程退出
+            //   ③才 stop/release muxer ④置空引用（漏网写入碰 null 检查而非悬垂 native 指针）。
+            muxerStarted = false
             var ok = false
-            if (muxerStarted && realMuxer != null) {
+            if (realMuxer != null) {
                 runCatching { jpegEncoder?.release() }
                 runCatching {
                     realMuxer!!.stop()
@@ -399,14 +578,23 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
                 runCatching { realMuxer?.release() }
                 pfd?.close()
                 // 未启动（无有效内容）：删除空条目
-                realPath?.let { p ->
+                // v2.7.5：统一按 docUri 清理（MediaStore=resolver.delete；SAF=deleteDocument；旧版文件路径=File.delete）
+                val ctx0 = AndroidPlatform.appCtx()
+                val u = docUri
+                if (u != null && ctx0 != null) {
                     runCatching {
-                        if (p.startsWith("content://")) {
-                            AndroidPlatform.appCtx()?.contentResolver?.delete(Uri.parse(p), null, null)
-                        } else File(p).delete()
+                        if (u.authority == "media") ctx0.contentResolver.delete(u, null, null)
+                        else DocumentsContract.deleteDocument(ctx0.contentResolver, u)
                     }
+                } else if (realPath != outputPath) {
+                    runCatching { File(realPath).delete() }
                 }
             }
+            // 【v2.7.6】置空引用：任何残留写入（编码器线程漏网帧）碰 null 检查而非悬垂 native 对象
+            realMuxer = null
+            videoTrackIdx = -1
+            audioTrackIdx = -1
+            lastCloseOk = ok
             return ok
         }
     }
@@ -414,6 +602,39 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
     private fun ensureMuxer(): Boolean {
         if (realMuxer != null) return true
         val ctx = AndroidPlatform.appCtx() ?: return false
+        // v2.7.5：SAF 自定义存储目录——{所选根}/Selkies/Recordings 下建文档，FD 写入
+        SafMarker.parse(outputPath)?.let { (tree, name) ->
+            val baseName = name.substringBeforeLast('.', name)
+            val fileName = baseName + if (containerMp4) ".mp4" else ".webm"
+            return try {
+                val root = SafPaths.treeRootDocUri(tree)
+                val top = SafPaths.findOrCreateDir(ctx, root, SafPaths.TOP_DIR)
+                    ?: return false
+                val dir = SafPaths.findOrCreateDir(ctx, top, SafPaths.SUB_RECORDINGS)
+                    ?: return false
+                val uri = DocumentsContract.createDocument(
+                    ctx.contentResolver, dir,
+                    if (containerMp4) "video/mp4" else "video/webm", fileName
+                ) ?: return false
+                docUri = uri
+                val fd = ctx.contentResolver.openFileDescriptor(uri, "rw") ?: return false
+                pfd = fd
+                realPath = SafPaths.fileDocIdToAbsolutePath(ctx, DocumentsContract.getDocumentId(uri))
+                    ?: uri.toString()
+                realMuxer = MediaMuxer(
+                    fd.fileDescriptor,
+                    if (containerMp4) MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
+                    else MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM
+                )
+                true
+            } catch (_: Throwable) {
+                runCatching { pfd?.close() }
+                pfd = null
+                runCatching { docUri?.let { DocumentsContract.deleteDocument(ctx.contentResolver, it) } }
+                docUri = null
+                false
+            }
+        }
         val name = outputPath.removePrefix("selkies-pending://")
         val baseName = name.substringBeforeLast('.', name)
         val fileName = baseName + if (containerMp4) ".mp4" else ".webm"
@@ -426,7 +647,14 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
                     put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Selkies")
                 }
                 val uri = ctx.contentResolver.insert(collection, cv) ?: return false
-                realPath = uri.toString()
+                docUri = uri
+                // v2.7.5：MediaStore 录屏也解析真实绝对路径（对齐下载修复）
+                // 【v2.7.6】回退构造可读路径而非 uri.toString()（content:// 对用户不可认知）
+                realPath = runCatching {
+                    ctx.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DATA), null, null, null)?.use { c ->
+                        if (c.moveToFirst()) c.getString(0) else null
+                    }
+                }.getOrNull() ?: "/storage/emulated/0/Movies/Selkies/$fileName"
                 pfd = ctx.contentResolver.openFileDescriptor(uri, "rw")
                 realMuxer = MediaMuxer(
                     pfd!!.fileDescriptor,
@@ -494,6 +722,8 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
     }
 
     private fun writeSample(sample: ByteArray, keyframe: Boolean, ptsUs: Long): Boolean {
+        // 【v2.7.6】本地引用快照（close() 可能并发置空 realMuxer）+ muxerStarted 拒新
+        val m = realMuxer ?: return false
         if (!muxerStarted || videoTrackIdx < 0) return false
         if (ptsUs <= lastVideoPts) return true
         val buf = ByteBuffer.allocate(sample.size)
@@ -501,7 +731,7 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
         val info = MediaCodec.BufferInfo().apply {
             set(0, sample.size, ptsUs, if (keyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
         }
-        val ok = runCatching { realMuxer!!.writeSampleData(videoTrackIdx, buf, info) }.isSuccess
+        val ok = runCatching { m.writeSampleData(videoTrackIdx, buf, info) }.isSuccess
         if (ok) lastVideoPts = ptsUs
         return ok
     }
@@ -721,13 +951,23 @@ private class JpegH264Encoder(
     }
 
     fun release() {
+        // 【v2.7.6】彻底等 drain 线程退出（旧版 join 仅 800ms——超时后 muxer 被释放而线程
+        //   还在跑 = 录屏结束闪退根因；native writeSampleData 悬垂指针无法被 Java 捕获）
         running.set(false)
         runCatching { codec?.signalEndOfInputStream() }
-        runCatching { thread?.join(800) }
+        val t = thread
+        if (t != null && t.isAlive) {
+            runCatching { t.join(2500) }
+            if (t.isAlive) {
+                // 二次等待：编码器清尾缓冲可能慢；期间 writeSample 已被 muxerStarted=false 拦新
+                runCatching { t.join(1500) }
+            }
+        }
         runCatching { inputSurface?.release() }
         runCatching { codec?.stop(); codec?.release() }
         codec = null
         inputSurface = null
+        thread = null
     }
 }
 

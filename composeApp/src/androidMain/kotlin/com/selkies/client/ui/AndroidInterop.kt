@@ -26,6 +26,12 @@ import com.selkies.client.video.AndroidVideoSink
 actual fun VideoSurface(session: SelkiesSession, modifier: Modifier) {
     val sink = remember(session) { (session.videoSink as? AndroidVideoSink) ?: AndroidVideoSink().also { session.videoSink = it } }
 
+    // 【v2.7.6】解码器错误/不可用 → 会话通知（无解码器时告知用户切换编码，不再静默黑屏）
+    remember(session) {
+        sink.onDecodeError = { msg -> session.notices.value = msg }
+        true
+    }
+
     AndroidView(
         factory = { ctx ->
             TextureView(ctx).apply {

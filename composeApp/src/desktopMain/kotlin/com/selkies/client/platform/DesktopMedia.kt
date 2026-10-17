@@ -22,6 +22,25 @@ import java.util.Locale
  */
 class DesktopMediaStoreBridge(private val rootProvider: () -> String) : MediaStoreBridge {
 
+    /** 【v2.7.7】自定义根是否生效（storageRoot 非空且可写） */
+    override val customRootActive: Boolean
+        get() {
+            val custom = rootProvider().trim()
+            if (custom.isEmpty()) return false
+            return runCatching { File(custom).apply { mkdirs() }.canWrite() }.getOrDefault(false)
+        }
+
+    override fun storageDiagnostic(): String? {
+        val custom = rootProvider().trim()
+        if (custom.isEmpty()) return null
+        val f = File(custom)
+        return when {
+            !f.exists() && !runCatching { f.mkdirs() }.getOrDefault(false) -> "自定义目录不存在且无法创建：$custom"
+            !f.canWrite() -> "自定义目录不可写（权限？）：$custom"
+            else -> null
+        }
+    }
+
     private fun root(): File {
         val custom = rootProvider().trim()
         return if (custom.isNotEmpty()) File(custom) else File(System.getProperty("user.home"), "Selkies")

@@ -89,6 +89,9 @@ object AndroidPlatform : PlatformServices {
     // v2.7.4：另存为选择器（SAF CreateDocument，按 MIME 分类型）
     private var savePickerLauncher: androidx.activity.result.ActivityResultLauncher<String>? = null
     private var pendingSaveTarget: ((PickedSaveTarget?) -> Unit)? = null
+    // v2.7.5：默认存储位置选择器（SAF OpenDocumentTree + 持久授权）
+    private var dirPickerLauncher: androidx.activity.result.ActivityResultLauncher<android.net.Uri?>? = null
+    private var pendingDirPick: ((PickedDirectory?) -> Unit)? = null
 
     private val clipboardBridge = AndroidClipboardBridge()
 
@@ -147,6 +150,22 @@ object AndroidPlatform : PlatformServices {
                 displayPath = uri.toString()
             )
             cb?.invoke(target)
+        }
+        // v2.7.5：默认存储位置选择器——SAF 目录树选择，持久授权后跨重启可读写
+        dirPickerLauncher = activity.registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            val cb = pendingDirPick
+            pendingDirPick = null
+            if (uri == null) { cb?.invoke(null); return@registerForActivityResult }
+            runCatching {
+                // 持久授权（重启后仍可读写该目录树）
+                activity.contentResolver.takePersistableUriPermission(
+                    uri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                            android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            }
+            val display = SafPaths.resolveDisplayPath(activity, uri)
+            cb?.invoke(PickedDirectory(displayPath = display, treeUri = uri.toString()))
         }
         permLauncher = activity.registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
             val cb = pendingPerm
@@ -364,6 +383,20 @@ object AndroidPlatform : PlatformServices {
         android.os.Handler(android.os.Looper.getMainLooper()).post {
             pendingSaveTarget = onResult
             launcher.launch(suggestedName)
+        }
+    }
+
+    /** v2.7.5：选择默认存储目录（SAF OpenDocumentTree；返回 treeUri + 尽量解析的真实绝对路径） */
+    override fun pickDirectory(onResult: (PickedDirectory?) -> Unit) {
+        val launcher = dirPickerLauncher
+        val act = activityRef
+        if (launcher == null || act == null) { onResult(null); return }
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            pendingDirPick = onResult
+            runCatching { launcher.launch(null) }.onFailure {
+                pendingDirPick = null
+                onResult(null)
+            }
         }
     }
 
@@ -688,7 +721,17 @@ object AndroidPlatform : PlatformServices {
                 override fun listMedia() = emptyList<com.selkies.client.model.SavedMediaEntry>()
                 override fun deleteMedia(entry: com.selkies.client.model.SavedMediaEntry) = false
             }
-        return AndroidMediaStoreBridge(ctx)
+        // v2.7.5：每次读取最新设置（storageRootTreeUri 热生效）：settings.json → storageRootTreeUri 字段
+        //   （与桌面端 storageRoot 的读法一致；SAF 授权失效时桥内部自动回退默认 MediaStore）
+        val treeUri = runCatching {
+            val f = File(configDir(), "settings.json")
+            if (f.exists()) {
+                val txt = f.readText()
+                val m = Regex("\"storageRootTreeUri\"\\s*:\\s*\"([^\"]*)\"").find(txt)
+                m?.groupValues?.get(1) ?: ""
+            } else ""
+        }.getOrDefault("")
+        return AndroidMediaStoreBridge(ctx) { treeUri }
     }
 
     override fun makeStreamMuxer(outputPath: String): StreamMuxer = AndroidStreamMuxer(outputPath)

@@ -67,6 +67,9 @@ fun AddServerScreen(state: AppState, serverId: String?) {
     var viewOnly by remember { mutableStateOf(existing?.viewOnly ?: false) }
     var allowUntrusted by remember { mutableStateOf(existing?.allowUntrustedCert ?: false) }
     var useToken by remember { mutableStateOf(existing?.useTokenAuth ?: false) }
+    // 【v2.7.7】密码/令牌显示切换（眼睛图标）+ 只读手柄槽位
+    var showSecret by remember { mutableStateOf(false) }
+    var viewerSlot by remember { mutableStateOf(existing?.viewerSlot ?: 0) }
     var token by remember { mutableStateOf(existing?.token ?: "") }
     var framerate by remember { mutableFloatStateOf((existing?.framerate ?: 60).toFloat()) }
     var videoBitrate by remember { mutableFloatStateOf((existing?.videoBitrate ?: 8000).toFloat()) }
@@ -190,6 +193,17 @@ fun AddServerScreen(state: AppState, serverId: String?) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(checked = viewOnly, onCheckedChange = { viewOnly = it })
                 Text("仅查看（View-only）")
+            }
+            // 【v2.7.7】只读手柄控制端：官方共享模式 viewer 可持玩家槽位发手柄（最多 4 位玩家同时玩）
+            if (viewOnly) {
+                Text("只读手柄槽位（官方支持 4 位只读手柄玩家，多人各选一位互不冲突）",
+                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    FilterChip(selected = viewerSlot == 0, onClick = { viewerSlot = 0 }, label = { Text("纯观看") })
+                    FilterChip(selected = viewerSlot == 2, onClick = { viewerSlot = 2 }, label = { Text("玩家2") })
+                    FilterChip(selected = viewerSlot == 3, onClick = { viewerSlot = 3 }, label = { Text("玩家3") })
+                    FilterChip(selected = viewerSlot == 4, onClick = { viewerSlot = 4 }, label = { Text("玩家4") })
+                }
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(checked = audioEnabled, onCheckedChange = { audioEnabled = it })
@@ -424,7 +438,8 @@ fun AddServerScreen(state: AppState, serverId: String?) {
                             scalingDpi = if (dpi >= 96f) dpi.toInt() else 0,
                             preset = preset,
                             useTokenAuth = useToken, token = token,
-                            allowUntrustedCert = allowUntrusted
+                            allowUntrustedCert = allowUntrusted,
+                            viewerSlot = viewerSlot
                         )
                         val result = withContext(Dispatchers.IO) {
                             testConnection(entry)
@@ -475,7 +490,8 @@ fun AddServerScreen(state: AppState, serverId: String?) {
                         scalingDpi = if (dpi >= 96f) dpi.toInt() else 0,
                         preset = preset,
                         useTokenAuth = useToken, token = token,
-                        allowUntrustedCert = allowUntrusted
+                        allowUntrustedCert = allowUntrusted,
+                        viewerSlot = viewerSlot
                     )
                     state.store.upsertServer(entry)
                     state.navigate(Screen.ServerList)

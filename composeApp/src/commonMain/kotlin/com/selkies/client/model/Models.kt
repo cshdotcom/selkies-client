@@ -53,7 +53,11 @@ data class ServerEntry(
     var preset: String = "balanced",
     var useTokenAuth: Boolean = false,
     var token: String = "",
-    var allowUntrustedCert: Boolean = false
+    var allowUntrustedCert: Boolean = false,
+    // ---- v2.7.7 只读模式手柄控制端（官方共享模式：viewer 可持 1 个手柄槽位） ----
+    // 0 = 不占手柄位（纯观看）；2/3/4 = 以该玩家槽位连接（js 输入目标 = slot-1）。
+    // 官方 legacy 协议：?role=viewer&slot=N（N∈2..4）；controller 不受限（slot 由本地手柄序决定）。
+    var viewerSlot: Int = 0
 ) {
     /** 归一化的基础 URL（scheme://host[:port]） */
     fun baseUrl(): String {
@@ -158,12 +162,19 @@ data class AppSettings(
     var virtualGamepadEnabled: Boolean = false,
     /** 虚拟手柄模式：full = 全键布局 / simple = 精简布局 / wheel = 赛车风格 */
     var virtualGamepadMode: String = "full",
+    /** v2.7.7 虚拟手柄默认槽位（0-3；controller 连接时生效。viewer 连接由 viewerSlot 决定） */
+    var virtualGamepadSlot: Int = 0,
+    /** v2.7.7 虚拟手柄触感反馈（按键/摇杆到位振动；Android） */
+    var virtualGamepadHaptics: Boolean = true,
     /** v2.6.0 竖屏时自动旋转远端分辨率填充屏幕（可开关） */
     var autoRotatePortraitRes: Boolean = true,
     /** v2.6.0 工具栏按钮自定义顺序（逗号分隔功能键；空 = 默认顺序） */
     var toolbarOrder: String = "",
     // 截图/录屏/下载 存储位置（空 = 平台默认：Android 公共 Pictures/Videos/Download 下的 Selkies 子目录；桌面 ~/Pictures/Selkies 等）
     var storageRoot: String = "",
+    // v2.7.5 Android SAF 目录树句柄（content://…；用户经系统选择器选定的默认存储位置，跨重启持久授权）。
+    // 桌面恒空（桌面直接用 storageRoot 绝对路径）。
+    var storageRootTreeUri: String = "",
     // 录屏
     var recordingIncludeAudio: Boolean = true,
     var recordingNotifyOnSave: Boolean = true,
@@ -374,3 +385,9 @@ data class CursorShape(
 )
 
 enum class ThemeMode { SYSTEM, LIGHT, DARK }
+
+/** 【v2.7.7】被新主客户端顶替事件（服务器 KILL "new primary client"）——UI 弹切换选择器 */
+data class TakeoverEvent(
+    val reason: String,
+    val at: Long = System.currentTimeMillis()
+)

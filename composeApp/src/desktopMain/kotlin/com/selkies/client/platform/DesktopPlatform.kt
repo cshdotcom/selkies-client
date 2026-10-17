@@ -168,6 +168,33 @@ object DesktopPlatform : PlatformServices {
         }.apply { isDaemon = true }.start()
     }
 
+    /** v2.7.5：选择默认存储目录——JFileChooser 目录模式，返回真实绝对路径 */
+    override fun pickDirectory(onResult: (PickedDirectory?) -> Unit) {
+        Thread {
+            runCatching {
+                val chooser = JFileChooser()
+                chooser.dialogTitle = "选择默认存储位置（截图 / 录屏 / 下载的根目录）"
+                chooser.fileSelectionMode = JFileChooser.DIRECTORIES_ONLY
+                chooser.isMultiSelectionEnabled = false
+                // 起始目录：当前 storageRoot 有效时从它开始，否则用户主目录
+                runCatching {
+                    val cur = mediaStore().downloadsDir().substringBeforeLast("/Downloads")
+                    val f = File(cur)
+                    if (f.isDirectory) chooser.currentDirectory = f
+                }
+                val r = chooser.showOpenDialog(windowFrame)
+                if (r == JFileChooser.APPROVE_OPTION) {
+                    val dir = chooser.selectedFile
+                    if (dir != null && dir.isDirectory) {
+                        onResult(PickedDirectory(displayPath = dir.absolutePath, treeUri = dir.absolutePath))
+                        return@runCatching
+                    }
+                }
+                onResult(null)
+            }.onFailure { onResult(null) }
+        }.apply { isDaemon = true; name = "dir-picker" }.start()
+    }
+
     override fun makeAudioPlayer(): AudioPlayer = com.selkies.client.audio.DesktopAudioPlayer()
 
     override fun makeMicCapture(): MicCapture = com.selkies.client.audio.DesktopMicCapture()

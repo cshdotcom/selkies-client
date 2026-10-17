@@ -61,6 +61,12 @@ import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VideocamOff
 import androidx.compose.material.icons.filled.VideogameAsset
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.ZoomIn
@@ -208,6 +214,21 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     var toolbarVisible by remember { mutableStateOf(true) }
     // v2.7.0：全屏工具栏自动隐藏（不遮挡远程控制区；边缘唤出）
     var toolbarShowAt by remember { mutableStateOf(System.currentTimeMillis()) }
+    // 【v2.7.6】工具栏唤出把手不再常驻：隐藏工具栏后只显示 4 秒即自动淡出（零遮挡）。
+    //   用户截图实证：「显示工具栏」胶囊常驻顶部挡住远程 Edge 标签栏/关闭按钮。
+    //   恢复工具栏三条路径：①顶/底边缘向内滑 >28px（v2.7.6 起不限全屏）②鼠标移近顶/底边缘
+    //   （桌面）③顶部边缘轻触 → 把手闪现 4s 可点击。每次隐藏/闪现 epoch+1 重启计时。
+    var handleVisible by remember { mutableStateOf(false) }
+    var handleEpoch by remember { mutableStateOf(0) }
+    androidx.compose.runtime.LaunchedEffect(handleEpoch, toolbarVisible) {
+        if (toolbarVisible) {
+            handleVisible = false
+        } else {
+            handleVisible = true
+            kotlinx.coroutines.delay(4000)
+            handleVisible = false
+        }
+    }
     var floatingKb by remember { mutableStateOf(false) }
     // v2.7.2：悬浮键盘文本合成条焦点（false = 键盘打开但无文本框聚焦 → 桌面物理键直通远程）
     var kbTextFocused by remember { mutableStateOf(false) }
@@ -232,6 +253,35 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     var showVirtualPad by remember { mutableStateOf(false) }
     var virtualPadKbMap by remember { mutableStateOf(false) }
     val virtualEngine = remember(session) { com.selkies.client.ui.panels.VirtualGamepadEngine(session) }
+    // 【v2.7.7】手柄触感反馈（按键振动；Android 真机生效，桌面空操作）
+    androidx.compose.runtime.DisposableEffect(virtualEngine) {
+        virtualEngine.onHaptic = {
+            if (state.store.settings.value.virtualGamepadHaptics) platform.vibrate(12)
+        }
+        onDispose { virtualEngine.onHaptic = null }
+    }
+
+    // ============ v2.7.7：角色切换 / 顶替应对 / 认证弹窗状态 ============
+    var showRoleSwitcher by remember { mutableStateOf(false) }
+    var roleSwitchSlot by remember { mutableStateOf(2) }   // 只读时的手柄槽位选择（2..4）
+    val takeoverEvent by session.takeoverEvent.collectAsState()
+    var authDialogShown by remember { mutableStateOf(false) }  // 防止 AUTH_REQUIRED 重复弹
+    var authUser by remember { mutableStateOf(server.username) }
+    var authPass by remember { mutableStateOf(server.password) }
+    var authToken by remember { mutableStateOf(server.token) }
+    var authShowPass by remember { mutableStateOf(false) }
+    var authRemember by remember { mutableStateOf(true) }
+
+    // 【测试钩子】-Dselkies.testtakeover：连接后 8s 自动注入顶替事件（GUI 自动化验证弹窗渲染/交互）
+    LaunchedEffect(Unit) {
+        if (System.getProperty("selkies.testtakeover") != null) {
+            delay(8000)
+            if (session.status.value == SelkiesSession.Status.CONNECTED) {
+                session.takeoverEvent.value = com.selkies.client.model.TakeoverEvent("test-injected")
+                println("[Selkies][测试] 已注入顶替事件（testtakeover）")
+            }
+        }
+    }
 
     // v2.6.0：本地缩放/放大镜（只改本地显示，不动远程分辨率）
     var localZoom by remember { mutableStateOf(1f) }
@@ -239,9 +289,14 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     var showZoomControls by remember { mutableStateOf(false) }
 
     // v2.7.0：服务器能力（麦克风/摄像头/音频是否被服务器禁用；UI 据此禁用入口）
+    // v2.7.5【麦克风「点不了」根因修复】：补收 locked 状态——官方语义（websockets_mode.py 实证）
+    //   仅 (value=false 且 locked=true) 才是真禁用；未锁定的 false 只是默认关，客户端上行数据即开启。
+    //   旧版工具栏按钮只看 value 一律拦截 = 「网页能用麦克风、App 点不了」的真正根因（v2.7.3 漏修此处）。
     val serverMicEnabled by session.serverMicEnabled.collectAsState()
     val serverWebcamEnabled by session.serverWebcamEnabled.collectAsState()
     val serverAudioEnabled by session.serverAudioEnabled.collectAsState()
+    val serverMicLocked by session.serverMicLocked.collectAsState()
+    val serverWebcamLocked by session.serverWebcamLocked.collectAsState()
     val audioStallNotice by session.audioStallNotice.collectAsState()
     // v2.7.4：音频警告用户已关闭标记（新警告出现时重置；同一警告不再打扰）
     var audioNoticeDismissed by remember { mutableStateOf(false) }
@@ -251,10 +306,13 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     }
 
     // v2.6.0：工具栏自定义顺序
+    // 【v2.7.7 修复】旧版 ToolbarDefaults.ALL.filter { it in order } 只做“包含过滤”——顺序仍是默认序，
+    //   用户的自定义排序从未生效（设置页拖什么顺序工具栏都不变）。改为：保存的顺序优先 +
+    //   未列出的键按默认顺序补齐。
     val toolbarOrder = remember(state.store.settings.value.toolbarOrder) {
-        val order = state.store.settings.value.toolbarOrder
-            .split(',').filter { it.isNotBlank() }
-        ToolbarDefaults.ALL.filter { it in order } + ToolbarDefaults.ALL.filter { it !in order }
+        val saved = state.store.settings.value.toolbarOrder
+            .split(',').map { it.trim() }.filter { it.isNotBlank() && it in ToolbarDefaults.ALL }
+        saved.distinct() + ToolbarDefaults.ALL.filter { it !in saved }
     }
 
     // 视口几何
@@ -322,7 +380,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     val acc = remember { ScrollAccumulator() }
     val scope = rememberCoroutineScope()
 
-    val viewOnly = server.viewOnly || role == "viewer"
+    // 【v2.7.7】含会话中切换（switchRole 运行时覆盖）的只读状态；role==viewer 是服务器/自请求确认
+    val viewOnly = session.effectiveViewOnly || role == "viewer"
 
     // 提示自动消失
     LaunchedEffect(toast) {
@@ -345,7 +404,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     //   根层 ESC 不消费，继续作为远程按键直通（游戏内 ESC 语义保持）；
     //   Android 真返回键恒启用（根层弹出退出确认，行为与旧版一致）
     val hasDismissibleLayer = panel != SessionPanel.NONE || showVolumePopup || showZoomControls ||
-            showVirtualPad || floatingKb || quickBar || showModeSelector || showInputPicker || fullscreen
+            showVirtualPad || floatingKb || quickBar || showModeSelector || showInputPicker || fullscreen ||
+            showRoleSwitcher
     PlatformBackHandler(enabled = hasDismissibleLayer || platform.isTouchDevice()) {
         when {
             panel != SessionPanel.NONE -> panel = SessionPanel.NONE
@@ -356,6 +416,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             quickBar -> quickBar = false
             showModeSelector -> showModeSelector = false
             showInputPicker -> showInputPicker = false
+            showRoleSwitcher -> showRoleSwitcher = false
             fullscreen -> fullscreen = false
             else -> if (platform.isTouchDevice()) exitConfirm = true
         }
@@ -764,8 +825,9 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                     }
                                     PointerEventType.Move -> {
                                         val pos = changes.first().position
-                                        // v2.7.0：全屏时鼠标移到顶部/底部边缘 → 唤出工具栏
-                                        if (fullscreen && !toolbarVisible &&
+                                        // 【v2.7.6】鼠标移到顶部/底部边缘 → 唤出工具栏（不再限全屏：
+                                        //   非全屏隐藏工具栏后同样可唤回，把手已非常驻必须留唤出途径）
+                                        if (!toolbarVisible &&
                                             (pos.y <= edgeRevealPx || pos.y >= viewSize.height - edgeRevealPx)
                                         ) {
                                             toolbarShowAt = System.currentTimeMillis()
@@ -828,6 +890,11 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                             pressPos.y <= 12f -> -1
                                             pressPos.y >= viewSize.height - 12f -> 1
                                             else -> 0
+                                        }
+                                        // 【v2.7.6】顶部/底部边缘轻触（未滑动）→ 闪现把手 4s（可发现性；
+                                        //   把手已不常驻，用户需要入口提示；触摸照常发送远程不受影响）
+                                        if (pressFromEdge != 0 && !toolbarVisible) {
+                                            handleEpoch++
                                         }
                                         touchMoved = false
                                         longFired = false
@@ -900,7 +967,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                         // >28px 才唤出工具栏；任何缩放状态均可用（v2.7.0 旧逻辑错嵌在放大镜
                                         // 分支内，未放大时不生效，且「移动到边缘即唤出」会误触——点击远程画面
                                         // 顶部标签栏/任务栏时把工具栏唤出来挡住，正是用户报的「阻挡部分触屏」）。
-                                        if (fullscreen && !toolbarVisible && pressFromEdge != 0) {
+                                        // 【v2.7.6】不再限全屏：非全屏隐藏工具栏后同样可边缘唤回（把手不常驻了）。
+                                        if (!toolbarVisible && pressFromEdge != 0) {
                                             val inward = if (pressFromEdge < 0) pos.y - pressOrigin.y else pressOrigin.y - pos.y
                                             if (inward > 28f) {
                                                 toolbarShowAt = System.currentTimeMillis()
@@ -1051,6 +1119,24 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     Text(statusDetail.ifBlank { "正在连接服务器…" }, color = Color.White)
                 }
             }
+        } else if (status == SelkiesSession.Status.AUTH_REQUIRED) {
+            // 【v2.7.7】认证弹窗背景层（弹窗本身在下方渲染）
+            Surface(modifier = Modifier.fillMaxSize(), color = Color.Black.copy(alpha = 0.6f)) {
+                Column(
+                    modifier = Modifier.fillMaxSize(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    androidx.compose.material3.Icon(
+                        androidx.compose.material.icons.Icons.Filled.Lock,
+                        null, tint = Color.White, modifier = Modifier.size(34.dp)
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text("需要认证", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(6.dp))
+                    Text(statusDetail, color = Color.White.copy(alpha = 0.8f), fontSize = 13.sp)
+                }
+            }
         } else if (status == SelkiesSession.Status.FAILED || status == SelkiesSession.Status.CLOSED) {
             Surface(modifier = Modifier.fillMaxSize(), color = Color.Black.copy(alpha = 0.82f)) {
                 Column(
@@ -1137,34 +1223,13 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                             color = Color.White.copy(alpha = 0.7f), fontSize = 11.sp
                         )
                     }
-                    // v2.7.5：连接中途切换 控制 ↔ 只读（重连实现——服务器角色绑定在连接上）
-                    var confirmModeSwitch by remember { mutableStateOf(false) }
-                    IconButton(onClick = { confirmModeSwitch = true }) {
+                    // 【v2.7.7】控制/只读切换入口（顶栏角色徽章：点击弹模式选择器）
+                    IconButton(onClick = { showRoleSwitcher = true }) {
                         Icon(
-                            if (viewOnly) Icons.Filled.Lock else Icons.Filled.LockOpen,
-                            if (viewOnly) "切换到控制模式" else "切换到只读模式",
-                            tint = if (viewOnly) Color(0xFFF59E0B) else Color.White
-                        )
-                    }
-                    if (confirmModeSwitch) {
-                        AlertDialog(
-                            onDismissRequest = { confirmModeSwitch = false },
-                            title = { Text(if (viewOnly) "切换到控制模式？" else "切换到只读模式？") },
-                            text = {
-                                Text(
-                                    if (viewOnly) "将获得键鼠控制权（原控制端会被顶替）。切换需要重新连接，约 1~2 秒。"
-                                    else "只观察远程画面（不发送键鼠输入，可在控制端被占用时旁观）。切换需要重新连接，约 1~2 秒。"
-                                )
-                            },
-                            confirmButton = {
-                                TextButton(onClick = {
-                                    confirmModeSwitch = false
-                                    session.switchViewOnly(!viewOnly)
-                                }) { Text("切换") }
-                            },
-                            dismissButton = {
-                                TextButton(onClick = { confirmModeSwitch = false }) { Text("取消") }
-                            }
+                            if (viewOnly) Icons.Filled.LockOpen else Icons.Filled.Lock,
+                            if (viewOnly) "只读模式（点击切换）" else "控制模式（点击切换）",
+                            tint = if (viewOnly) Color(0xFFFBBF24) else Color(0xFF4ADE80),
+                            modifier = Modifier.size(20.dp)
                         )
                     }
                     IconButton(onClick = { toolbarVisible = false }) {
@@ -1174,22 +1239,23 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             }
         }
 
-        // 隐藏工具栏后的唤出按钮
-        // v2.7.1：全屏时缩成小把手（84×20dp、低透明度）——大胶囊本身也挡远程画面顶部触屏；
-        // 全屏主要靠「边缘内滑」唤出，把手只是提示入口；非全屏保持原尺寸
-        if (!toolbarVisible && status == SelkiesSession.Status.CONNECTED) {
+        // 隐藏工具栏后的唤出把手
+        // 【v2.7.6】不再常驻遮挡：仅出现 4 秒自动淡出（修「显示工具栏还是有遮挡」）；
+        // 顶/底边缘内滑（全模式）、鼠标移近边缘（桌面）、顶/底边缘轻触闪现——三条唤出途径。
+        androidx.compose.animation.AnimatedVisibility(
+            visible = handleVisible && !toolbarVisible && status == SelkiesSession.Status.CONNECTED,
+            enter = androidx.compose.animation.fadeIn(),
+            exit = androidx.compose.animation.fadeOut(animationSpec = androidx.compose.animation.core.tween(600)),
+            modifier = Modifier.align(Alignment.TopCenter)
+        ) {
             Box(
                 modifier = Modifier
-                    .align(Alignment.TopCenter)
                     .statusBarsPadding()
-                    .padding(top = 4.dp)
-                    .size(
-                        width = if (fullscreen) 84.dp else 120.dp,
-                        height = if (fullscreen) 20.dp else 26.dp
-                    )
+                    .padding(top = 2.dp)
+                    .size(width = 78.dp, height = 18.dp)
                     .background(
-                        Color.Black.copy(alpha = if (fullscreen) 0.22f else 0.35f),
-                        RoundedCornerShape(if (fullscreen) 10.dp else 13.dp)
+                        Color.Black.copy(alpha = if (fullscreen) 0.22f else 0.32f),
+                        RoundedCornerShape(9.dp)
                     )
                     .clickable {
                         toolbarShowAt = System.currentTimeMillis()
@@ -1198,9 +1264,9 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    if (fullscreen) "▼ 工具栏" else "显示工具栏",
-                    color = Color.White.copy(alpha = if (fullscreen) 0.75f else 1f),
-                    fontSize = 10.sp,
+                    "▼ 工具栏",
+                    color = Color.White.copy(alpha = if (fullscreen) 0.75f else 0.9f),
+                    fontSize = 9.sp,
                     modifier = Modifier.padding(2.dp)
                 )
             }
@@ -1256,24 +1322,28 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                 if (micSessionOn) Icons.Filled.Mic else Icons.Filled.MicOff, "麦克风",
                                 tint = when {
                                     micSessionOn -> Color(0xFF4ADE80)
-                                    !serverMicEnabled -> Color(0xFF6B7280)
+                                    // v2.7.5：仅锁定禁用才置灰；默认关（未锁定）保持白色可点
+                                    !serverMicEnabled && serverMicLocked -> Color(0xFF6B7280)
                                     else -> Color.White
                                 }
                             ) {
-                                if (!serverMicEnabled) {
-                                    toast = "服务器已禁用麦克风（microphone_enabled=false），无法上行"
+                                // v2.7.5：与官方 web 客户端对齐——未锁定的默认关直接开启上行
+                                //   （服务器 0x02 门控只拒 locked 的 false；数据到达即视为开启）
+                                if (!serverMicEnabled && serverMicLocked) {
+                                    toast = "服务器已锁定禁用麦克风（microphone_enabled 锁定为关），无法上行"
                                 } else if (micSessionOn) session.stopMicUplink() else session.startMicUplink()
                             }
                             "camera" -> ToolButton(
                                 if (camSessionOn) Icons.Filled.Videocam else Icons.Filled.VideocamOff, "摄像头",
                                 tint = when {
                                     camSessionOn -> Color(0xFF4ADE80)
-                                    !serverWebcamEnabled -> Color(0xFF6B7280)
+                                    !serverWebcamEnabled && serverWebcamLocked -> Color(0xFF6B7280)
                                     else -> Color.White
                                 }
                             ) {
-                                if (!serverWebcamEnabled) {
-                                    toast = "服务器已禁用摄像头（webcam_enabled=false），无法上行"
+                                // v2.7.5：同麦克风——仅锁定禁用才拒绝（未锁定的 false = 默认关可开启）
+                                if (!serverWebcamEnabled && serverWebcamLocked) {
+                                    toast = "服务器已锁定禁用摄像头（webcam_enabled 锁定为关），无法上行"
                                 } else if (camSessionOn) session.stopWebcamUplink() else session.startWebcamUplink()
                             }
                             "hardware" -> ToolButton(Icons.Filled.DevicesOther, "硬件") { panel = if (panel == SessionPanel.HARDWARE) SessionPanel.NONE else SessionPanel.HARDWARE }
@@ -1618,8 +1688,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             }
         }
 
-        // ============ v2.6.0 虚拟手柄悬浮面板（屏上手柄：完整/精简/赛车模式 + 只读 + 键盘映射） ============
-        if (!viewOnly && status == SelkiesSession.Status.CONNECTED) {
+        // ============ v2.6.0 虚拟手柄悬浮面板（v2.7.7：只读模式也可用——官方允许 viewer 持槽位发手柄） ============
+        if (status == SelkiesSession.Status.CONNECTED) {
             Box(Modifier.align(Alignment.BottomCenter).padding(bottom = 70.dp)) {
                 VirtualGamepadOverlay(
                     engine = virtualEngine,
@@ -1690,27 +1760,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             )
         }
 
-        // ============ v2.7.5：认证对话框（连接遇 401 且未配置凭据 → 弹窗输入） ============
-        val authPrompt by session.authPromptEvent.collectAsState()
-        authPrompt?.let { prompt ->
-            AuthDialog(
-                prompt = prompt,
-                presetUsername = server.username,
-                presetToken = server.token,
-                onSubmit = { user, pass, remember ->
-                    // 回填服务器条目（连接立即使用）；勾选「保存」才持久化到配置
-                    session.applyCredentialsAndReconnect(user, pass)
-                    if (remember) state.store.saveServers()
-                },
-                onSubmitToken = { token, remember ->
-                    session.applyTokenAndReconnect(token)
-                    if (remember) state.store.saveServers()
-                },
-                onDismiss = {
-                    session.dismissAuthPrompt()
-                }
-            )
-        }
+
 
         // ============ v2.7.0：音频流状态提示（服务器音频管线无数据时自动恢复/透明化） ============
         // 【v2.7.4】可关闭（✕）+ 20s 无新内容自动收起——修「警告无法关闭遮挡视线」；
@@ -1879,6 +1929,196 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             )
         }
 
+        // ============ v2.7.7：认证弹窗（连接发现需要认证时自动弹出） ============
+        // 用户要求：配置没填认证信息时，连接遇到 401 自动弹窗输入；
+        // 支持保存（写回服务器配置，下次自动填入）——密码带眼睛图标可显示/隐藏。
+        if (status == SelkiesSession.Status.AUTH_REQUIRED && !authDialogShown) {
+            authDialogShown = true
+            authUser = server.username
+            authPass = server.password
+            authToken = server.token
+        }
+        if (status == SelkiesSession.Status.AUTH_REQUIRED) {
+            AlertDialog(
+                onDismissRequest = {
+                    // 允许取消 → 回失败页（可重试/返回）
+                    session.cancelAuth()
+                },
+                title = { Text(if (server.useTokenAuth) "需要访问令牌" else "服务器要求认证") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            "连接 ${server.url} 需要认证" +
+                                    (lastError?.let { "\n$it" } ?: ""),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        if (server.useTokenAuth) {
+                            OutlinedTextField(
+                                value = authToken,
+                                onValueChange = { authToken = it },
+                                label = { Text("访问令牌（Bearer）") },
+                                singleLine = true,
+                                visualTransformation = if (authShowPass)
+                                    androidx.compose.ui.text.input.PasswordVisualTransformation()
+                                else androidx.compose.ui.text.input.VisualTransformation.None,
+                                trailingIcon = {
+                                    IconButton(onClick = { authShowPass = !authShowPass }) {
+                                        Icon(
+                                            if (authShowPass) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                            if (authShowPass) "隐藏令牌" else "显示令牌"
+                                        )
+                                    }
+                                }
+                            )
+                        } else {
+                            OutlinedTextField(
+                                value = authUser,
+                                onValueChange = { authUser = it },
+                                label = { Text("用户名") },
+                                singleLine = true
+                            )
+                            OutlinedTextField(
+                                value = authPass,
+                                onValueChange = { authPass = it },
+                                label = { Text("密码") },
+                                singleLine = true,
+                                visualTransformation = if (authShowPass)
+                                    androidx.compose.ui.text.input.PasswordVisualTransformation()
+                                else androidx.compose.ui.text.input.VisualTransformation.None,
+                                trailingIcon = {
+                                    IconButton(onClick = { authShowPass = !authShowPass }) {
+                                        Icon(
+                                            if (authShowPass) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                            if (authShowPass) "隐藏密码" else "显示密码"
+                                        )
+                                    }
+                                }
+                            )
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            androidx.compose.material3.Checkbox(
+                                checked = authRemember,
+                                onCheckedChange = { authRemember = it }
+                            )
+                            Text("记住密码（保存到服务器配置，下次自动填入）", style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(onClick = {
+                        // 写回服务器条目（记住密码）→ 立即重连
+                        server.username = authUser.trim()
+                        server.password = if (server.useTokenAuth) server.password else authPass
+                        server.token = if (server.useTokenAuth) authToken.trim() else server.token
+                        if (authRemember) {
+                            state.store.upsertServer(server)
+                            toast = if (authRemember) "认证信息已保存到服务器配置" else ""
+                        } else {
+                            // 不记住：仅本次连接使用（运行时生效，不落盘）
+                            toast = "已使用输入的认证信息重连（未保存）"
+                        }
+                        authDialogShown = false
+                        session.retryWithCredentials()
+                    }) { Text("连接") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        authDialogShown = false
+                        session.cancelAuth()
+                    }) { Text("取消") }
+                }
+            )
+        }
+
+        // ============ v2.7.7：被顶替 → 「切换到只读继续观看」选择器（含手柄槽位） ============
+        takeoverEvent?.let { tk ->
+            AlertDialog(
+                onDismissRequest = { session.takeoverEvent.value = null },
+                title = { Text("会话被其他客户端接管") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            "服务器单主人策略：新的主客户端接管了此会话。\n\n" +
+                                    "可切换到只读模式继续观看画面（多人同看互不干扰）；" +
+                                    "选择手柄玩家槽位后还能在只读下继续用手柄玩游戏（官方共享手柄控制端，最多 4 位玩家）。",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Text("手柄槽位（可稍后在手柄面板更改）", style = MaterialTheme.typography.labelMedium)
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            SlotChip("纯观看", roleSwitchSlot == 0) { roleSwitchSlot = 0 }
+                            SlotChip("玩家2", roleSwitchSlot == 2) { roleSwitchSlot = 2 }
+                            SlotChip("玩家3", roleSwitchSlot == 3) { roleSwitchSlot = 3 }
+                            SlotChip("玩家4", roleSwitchSlot == 4) { roleSwitchSlot = 4 }
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(onClick = {
+                        session.takeoverEvent.value = null
+                        session.switchRole(viewOnly = true, slot = roleSwitchSlot)
+                    }) { Text("切只读观看") }
+                },
+                dismissButton = {
+                    Row {
+                        TextButton(onClick = {
+                            session.takeoverEvent.value = null
+                            session.connect()   // 重连夺回控制权
+                        }) { Text("重连夺回") }
+                        TextButton(onClick = {
+                            session.takeoverEvent.value = null
+                            state.navigate(com.selkies.client.Screen.ServerList)
+                        }) { Text("返回列表") }
+                    }
+                }
+            )
+        }
+
+        // ============ v2.7.7：会话中切换 控制模式 ↔ 只读模式 ============
+        if (showRoleSwitcher) {
+            AlertDialog(
+                onDismissRequest = { showRoleSwitcher = false },
+                title = { Text("切换连接模式") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        ModeOption(
+                            "控制模式（当前${if (viewOnly) "：否" else "：是"}）",
+                            "完整键鼠/触控权限 + 全部手柄槽位。多人时会顶替其他控制端（服务器单主人）。",
+                            !viewOnly
+                        ) {
+                            showRoleSwitcher = false
+                            if (viewOnly) {
+                                session.switchRole(viewOnly = false)
+                                toast = "正在切换到控制模式…"
+                            }
+                        }
+                        ModeOption(
+                            "只读模式（观看）",
+                            "无键鼠权限，只收画面/声音；多人同看互不干扰。官方支持 4 个只读手柄控制端——选玩家槽位即可在只读下玩游戏。",
+                            viewOnly
+                        ) {
+                            // 直接选只读（默认带当前槽位选择）
+                        }
+                        Text("只读模式手柄槽位", style = MaterialTheme.typography.labelMedium)
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            SlotChip("纯观看", roleSwitchSlot == 0) { roleSwitchSlot = 0 }
+                            SlotChip("玩家2", roleSwitchSlot == 2) { roleSwitchSlot = 2 }
+                            SlotChip("玩家3", roleSwitchSlot == 3) { roleSwitchSlot = 3 }
+                            SlotChip("玩家4", roleSwitchSlot == 4) { roleSwitchSlot = 4 }
+                        }
+                        Button(onClick = {
+                            showRoleSwitcher = false
+                            session.switchRole(viewOnly = true, slot = roleSwitchSlot)
+                            toast = if (roleSwitchSlot in 2..4)
+                                "正在切换到只读模式（手柄玩家 $roleSwitchSlot 位）…"
+                            else "正在切换到只读模式…"
+                        }) { Text("切换到只读模式") }
+                    }
+                },
+                confirmButton = {},
+                dismissButton = { TextButton(onClick = { showRoleSwitcher = false }) { Text("取消") } }
+            )
+        }
+
         // ============ 返回确认 ============
         if (exitConfirm) {
             AlertDialog(
@@ -1964,6 +2204,27 @@ private fun CursorOverlay(
     }
 }
 
+/** v2.7.7 手柄玩家槽位选择芯片（纯观看 / 玩家2/3/4） */
+@Composable
+private fun SlotChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+        modifier = Modifier
+            .width(76.dp)
+            .clickable { onClick() }
+    ) {
+        Box(Modifier.padding(horizontal = 8.dp, vertical = 8.dp), contentAlignment = Alignment.Center) {
+            Text(
+                label,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface
+            )
+        }
+    }
+}
+
 @Composable
 private fun ModeOption(title: String, desc: String, selected: Boolean, onClick: () -> Unit) {
     Surface(
@@ -2040,105 +2301,3 @@ object ToolbarDefaults {
     )
 }
 
-/**
- * v2.7.5：认证对话框——连接遇 401 时弹出，输入用户名/密码（或令牌），
- * 提交后自动回填服务器配置并重连；密码/令牌带眼睛图标切换显示。
- * 「记住」即回填配置（下次连接自动携带、编辑配置可见）。
- */
-@Composable
-fun AuthDialog(
-    prompt: com.selkies.client.model.AuthPrompt,
-    presetUsername: String,
-    presetToken: String,
-    onSubmit: (username: String, password: String, remember: Boolean) -> Unit,
-    onSubmitToken: (token: String, remember: Boolean) -> Unit,
-    onDismiss: () -> Unit
-) {
-    var username by remember { mutableStateOf(if (prompt.rejected) presetUsername else "") }
-    var password by remember { mutableStateOf("") }
-    var token by remember { mutableStateOf(if (prompt.rejected) presetToken else "") }
-    var showPassword by remember { mutableStateOf(false) }
-    var showToken by remember { mutableStateOf(false) }
-    var useToken by remember { mutableStateOf(prompt.tokenMode) }
-    var remember by remember { mutableStateOf(true) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(if (prompt.rejected) "认证失败" else "服务器需要认证") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(
-                    "${prompt.serverName}\n${prompt.message}" +
-                            if (prompt.rejected) "\n请重新输入后重试" else "",
-                    style = MaterialTheme.typography.bodySmall
-                )
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    androidx.compose.material3.Checkbox(checked = useToken, onCheckedChange = { useToken = it })
-                    Text("使用令牌（Token）", style = MaterialTheme.typography.bodyMedium)
-                }
-                if (useToken) {
-                    OutlinedTextField(
-                        value = token,
-                        onValueChange = { token = it },
-                        label = { Text("会话令牌") },
-                        singleLine = true,
-                        visualTransformation = if (showToken) VisualTransformation.None else PasswordVisualTransformation(),
-                        trailingIcon = {
-                            IconButton(onClick = { showToken = !showToken }) {
-                                Icon(
-                                    if (showToken) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                                    if (showToken) "隐藏令牌" else "显示令牌"
-                                )
-                            }
-                        }
-                    )
-                } else {
-                    OutlinedTextField(
-                        value = username,
-                        onValueChange = { username = it },
-                        label = { Text("用户名") },
-                        singleLine = true
-                    )
-                    OutlinedTextField(
-                        value = password,
-                        onValueChange = { password = it },
-                        label = { Text("密码") },
-                        singleLine = true,
-                        visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
-                        trailingIcon = {
-                            IconButton(onClick = { showPassword = !showPassword }) {
-                                Icon(
-                                    if (showPassword) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                                    if (showPassword) "隐藏密码" else "显示密码"
-                                )
-                            }
-                        }
-                    )
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    androidx.compose.material3.Checkbox(checked = remember, onCheckedChange = { remember = it })
-                    Text("保存到配置（下次自动登录）", style = MaterialTheme.typography.bodySmall)
-                }
-                if (!remember) {
-                    Text(
-                        "不保存：本次连接使用，配置中不保留密码",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = {
-                if (useToken) {
-                    if (token.isNotBlank()) onSubmitToken(token, remember)
-                } else {
-                    if (username.isNotBlank() && password.isNotEmpty()) onSubmit(username, password, remember)
-                }
-            }) { Text("连接") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("取消") }
-        }
-    )
-}

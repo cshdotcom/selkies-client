@@ -128,8 +128,8 @@ android {
         applicationId = "com.selkies.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 20705
-        versionName = "2.7.5"
+        versionCode = 20708
+        versionName = "2.7.8"
         ndkVersion = ""
     }
     // v2.7.5：FFmpeg 原生库压缩存储（APK ~26MB 而非 ~48MB；安装时解压到本地）
@@ -178,7 +178,7 @@ compose.desktop {
         mainClass = "com.selkies.client.MainKt"
         nativeDistributions {
             packageName = "Selkies-Desktop"
-            packageVersion = "2.7.5"
+            packageVersion = "2.7.8"
             description = "Selkies 远程桌面原生客户端"
             vendor = "Selkies Client"
         }
@@ -195,7 +195,7 @@ val desktopFatJar = tasks.register<Jar>("desktopFatJar") {
     manifest {
         attributes["Main-Class"] = "com.selkies.client.MainKt"
         attributes["Implementation-Title"] = "Selkies Desktop Client"
-        attributes["Implementation-Version"] = "2.7.5"
+        attributes["Implementation-Version"] = "2.7.8"
     }
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
     exclude("META-INF/versions/**/module-info.class")
@@ -315,8 +315,41 @@ tasks.register<JavaExec>("probeV274") {
 
 tasks.register<JavaExec>("probeV275") {
     group = "verification"
-    description = "v2.7.5 无头综合验证：认证闭环 + 渲染停滞看门狗 + 剪贴板图像 + 分辨率关键帧 + 只读切换 + 麦克风恢复 + 音频计量"
+    description = "v2.7.5 无头综合验证：麦克风工具栏门控回归 + 自定义存储根 + SAF路径解析 + 剪贴板"
     mainClass.set("com.selkies.client.tools.V275Probe")
+    val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
+    classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
+    for (k in listOf("probeUrl", "probeUser", "probePass")) {
+        if (project.hasProperty(k)) systemProperty(k, project.property(k).toString())
+    }
+}
+
+tasks.register<JavaExec>("probeV278") {
+    group = "verification"
+    description = "v2.7.8 无头综合验证：认证闭环 + 渲染停滞看门狗 + 剪贴板图像 + 分辨率关键帧 + 只读切换 + 麦克风恢复 + 音频计量"
+    mainClass.set("com.selkies.client.tools.V278Probe")
+    val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
+    classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
+    for (k in listOf("probeUrl", "probeUser", "probePass")) {
+        if (project.hasProperty(k)) systemProperty(k, project.property(k).toString())
+    }
+}
+
+tasks.register<JavaExec>("probeV276") {
+    group = "verification"
+    description = "v2.7.6 无头综合验证：viewer DISABLED 恢复链 + 键盘宽度公式 + csd拆分 + 把手淡出 + 门控/剪贴板回归"
+    mainClass.set("com.selkies.client.tools.V276Probe")
+    val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
+    classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
+    for (k in listOf("probeUrl", "probeUser", "probePass")) {
+        if (project.hasProperty(k)) systemProperty(k, project.property(k).toString())
+    }
+}
+
+tasks.register<JavaExec>("probeV277") {
+    group = "verification"
+    description = "v2.7.7 无头综合验证：viewer+slot 手柄控制端 + 认证弹窗链路 + 解码停滞看门狗 + switchRole + 剪贴板图片"
+    mainClass.set("com.selkies.client.tools.V277Probe")
     val desktopCompilation = kotlin.targets.getByName("desktop").compilations.getByName("main")
     classpath = desktopCompilation.output.allOutputs + configurations.getByName("desktopRuntimeClasspath")
     for (k in listOf("probeUrl", "probeUser", "probePass")) {

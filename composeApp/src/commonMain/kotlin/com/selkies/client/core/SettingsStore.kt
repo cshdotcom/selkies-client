@@ -41,7 +41,11 @@ class SettingsStore(private val configDir: String) {
         runCatching {
             if (settingsFile().exists()) {
                 settings.value = json.decodeFromString(AppSettings.serializer(), settingsFile().readText())
+                // v2.7.7 测试可观测：加载结果（自动化验证配置生效）
+                println("[Selkies][设置] 已加载 settings.json：toolbarOrder=${settings.value.toolbarOrder.take(40)} virtualGamepad=${settings.value.virtualGamepadEnabled}")
             }
+        }.onFailure {
+            println("[Selkies][设置] settings.json 解析失败：${it.message}")
         }
         runCatching {
             if (hotkeysFile().exists()) {

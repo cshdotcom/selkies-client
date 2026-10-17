@@ -72,6 +72,20 @@ class SelkiesConnection(
     @Volatile
     private var closing = false
 
+    /** 【v2.7.7】运行时手柄槽位覆盖（0=不覆盖，用 server.viewerSlot）：中途「切换到只读（玩家N）」时由会话层注入 */
+    @Volatile
+    var roleSlotOverride: Int = 0
+
+    /** 【v2.7.7】运行时角色覆盖（null=不覆盖，用 server.viewOnly）：会话中切换控制/只读 */
+    @Volatile
+    var roleViewOnlyOverride: Boolean? = null
+
+    /** 生效的只读状态（覆盖优先） */
+    internal val effectiveViewOnly: Boolean get() = roleViewOnlyOverride ?: server.viewOnly
+
+    /** 生效的 viewer 手柄槽位（覆盖优先；0=无） */
+    internal val effectiveViewerSlot: Int get() = if (roleSlotOverride in 2..4) roleSlotOverride else server.viewerSlot
+
     private val sendMutex = Mutex()
 
     val authHeader: String?
@@ -261,12 +275,19 @@ class SelkiesConnection(
     /**
      * 建立 WebSocket 连接（挂起直到连接结束）。返回 false 时已通过 onError 报告原因。
      * 只读模式追加 ?role=viewer：官方共享模式下的旁观通道，服务器不授予键鼠权限（非控制通道）。
+     * 【v2.7.7】viewer&slot=N（N∈2..4）：官方只读手柄控制端——viewer 持有该玩家槽位即可
+     * 发送 js,* 手柄输入（VIEWER_ALLOWED_PREFIXES 含 "js,"），实现多端各自操控一个手柄。
      */
     suspend fun connectOnce(): Boolean {
         closing = false
         val wsUrl = resolveWsUrl() ?: return false
-        val viewerSuffix = if (server.viewOnly) {
-            if (wsUrl.contains('?')) "&role=viewer" else "?role=viewer"
+        val viewerSuffix = if (effectiveViewOnly) {
+            val slot = effectiveViewerSlot
+            val slotPart = if (slot in 2..4) "&slot=$slot" else ""
+            buildString {
+                append(if (wsUrl.contains('?')) "&role=viewer" else "?role=viewer")
+                append(slotPart)
+            }
         } else ""
         val url = Url(toWsUrl(wsUrl) + viewerSuffix)
         try {

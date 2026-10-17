@@ -27,6 +27,13 @@ import java.util.concurrent.ConcurrentLinkedQueue
  *
  * 【v2.7.5·默认设备】空选择 = 系统默认输出（扬声器 ↔ 耳机自动跟随系统路由，无需手动选择）；
  *  明确多选时才按设备路由（setPreferredDevice）。设备热插拔自动重建输出。
+ *
+ * 【v2.7.6 并入】三重加固：
+ *  A. 解码器按可靠度创建：c2.android.opus.decoder（软件标准）→ OMX.google.opus.decoder
+ *     （旧软件）→ createDecoderByType 兜底（createDecoderByType 可能选中厂商坏「硬件」Opus 解码器）。
+ *  B. 单帧/解码器异常只丢帧+自动重建（最多 5 次），不再让整条音频线程死亡。
+ *  C. 输出重建 2s 退避（防每帧 new AudioTrack 风暴）。
+ *  D. bufferLevelMs = 20ms/帧（服务器 audio_frame_duration_ms 默认 20，旧版误写 10）。
  */
 class AndroidAudioPlayer : AudioPlayer {
 
@@ -52,6 +59,9 @@ class AndroidAudioPlayer : AudioPlayer {
     @Volatile private var ffmpegDecoder: Any? = null   // AndroidFfmpegOpusDecoder（反射隔离：无原生库时类加载不炸）
     @Volatile private var ffmpegFailed = false          // 软解初始化/解码失败（不再重试）
     @Volatile private var mcRecreateAt = 0L             // MediaCodec 重建节流
+    // v2.7.6 并入：解码器容错重建计数（单帧异常不再杀死音频线程）
+    private var decoderRebuilds = 0
+    private val maxDecoderRebuilds = 5
     @Volatile private var startedAt = 0L
     @Volatile private var renderedPcm = 0L
     @Volatile private var framesFed = 0L
@@ -76,7 +86,7 @@ class AndroidAudioPlayer : AudioPlayer {
     private var deviceCallback: AudioDeviceCallback? = null
 
     override val bufferLevelMs: Int
-        get() = pending.size * 10
+        get() = pending.size * 20   // v2.7.6：服务器 audio_frame_duration_ms 默认 20ms
 
     override fun start(sampleRate: Int, channels: Int) {
         this.sampleRate = sampleRate
@@ -252,12 +262,19 @@ class AndroidAudioPlayer : AudioPlayer {
         }
     }
 
+    /** v2.7.6 并入：输出重建 2s 退避（防每帧 new AudioTrack 风暴） */
+    @Volatile private var lastOutsRebuildAt = 0L
+
     /** 输出集合维护（解码线程独占；wantedOutputs/采样率/声道变化时重建） */
     private fun ensureOuts(sr: Int, ch: Int): Boolean {
         val sig = "$sr x $ch | " +
                 wantedOutputs.entries.sortedBy { it.key }.joinToString("|") { (k, v) -> "$k=${"%.2f".format(v)}" }
         if (sig != outsSig || outs.isEmpty()) {
+            if (outs.isEmpty() && System.currentTimeMillis() - lastOutsRebuildAt < 2000) {
+                return false  // 全失败后的退避（1 次/2s）
+            }
             rebuildOuts(sr, ch)
+            lastOutsRebuildAt = System.currentTimeMillis()
             outsSig = if (outs.isNotEmpty()) sig else ""
         }
         return outs.isNotEmpty()
@@ -311,13 +328,24 @@ class AndroidAudioPlayer : AudioPlayer {
 
             // ---- 主引擎：MediaCodec Opus ----
             var mcReady = false
+            // v2.7.6 并入：按可靠度顺序创建（c2 软件 → OMX 旧软件 → 按类型兜底）——
+            // createDecoderByType 可能选中厂商注册但实际无输出的 Opus「硬件」解码器
+            fun createOpusDecoder(): MediaCodec? {
+                if (android.os.Build.VERSION.SDK_INT >= 29) {
+                    runCatching { MediaCodec.createByCodecName("c2.android.opus.decoder") }.getOrNull()?.let { return it }
+                }
+                if (android.os.Build.VERSION.SDK_INT >= 21) {
+                    runCatching { MediaCodec.createByCodecName("OMX.google.opus.decoder") }.getOrNull()?.let { return it }
+                }
+                return runCatching { MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS) }.getOrNull()
+            }
             fun ensureMediaCodec(): Boolean {
                 if (mcReady && codec != null) return true
                 runCatching { codec?.stop(); codec?.release() }
                 val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, sampleRate, channels)
                 // csd-0：OpusHead —— 没有它多数设备的 Opus 解码器完全无输出
                 format.setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(opusHead(channels)))
-                val c = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS)
+                val c = createOpusDecoder() ?: return false
                 c.configure(format, null, null, 0)
                 c.start()
                 codec = c
@@ -360,29 +388,52 @@ class AndroidAudioPlayer : AudioPlayer {
                             useFfmpeg = false // 软解已失效 → 回主引擎
                         }
                     } else {
-                        val c = codec
-                        if (c != null) {
-                            var idx = c.dequeueInputBuffer(50_000) // 50ms
-                            if (idx >= 0) {
-                                val buf = c.getInputBuffer(idx)
-                                if (buf != null) {
-                                    buf.clear()
-                                    buf.put(opus)
-                                    c.queueInputBuffer(idx, 0, opus.size, System.nanoTime() / 1000, 0)
+                        // v2.7.6 并入：单帧异常只丢帧+重建（最多5次），不让音频线程死亡
+                        try {
+                            val c = codec
+                            if (c != null) {
+                                val idx = c.dequeueInputBuffer(50_000) // 50ms
+                                if (idx >= 0) {
+                                    val buf = c.getInputBuffer(idx)
+                                    if (buf != null) {
+                                        buf.clear()
+                                        buf.put(opus)
+                                        c.queueInputBuffer(idx, 0, opus.size, System.nanoTime() / 1000, 0)
+                                    }
+                                } else {
+                                    // v2.7.5：输入缓冲繁忙 → 挂起下轮重试（旧版直接丢帧 = 断续根因）
+                                    carry = opus
+                                    framesFed--
                                 }
-                            } else {
-                                // v2.7.5：输入缓冲繁忙 → 挂起下轮重试（旧版直接丢帧 = 断续根因）
-                                carry = opus
-                                framesFed--
+                            }
+                        } catch (e: Exception) {
+                            carry = null
+                            if (decoderRebuilds < maxDecoderRebuilds) {
+                                decoderRebuilds++
+                                runCatching { codec?.stop(); codec?.release() }
+                                codec = null
+                                mcReady = false
+                                ensureMediaCodec()
                             }
                         }
                     }
                 }
 
-                // MediaCodec 输出排空（v2.7.5：有输入时给 2ms 而非 0ms——解码器需要喘息出帧）
+                // MediaCodec 输出排空（v2.7.5：有输入时给 2ms 而非 0ms——解码器需要喘息出帧；
+                //  v2.7.6 并入：排空异常同样容错重建，不杀线程）
                 if (!useFfmpeg && codec != null) {
                     val c = codec!!
-                    var outIdx = c.dequeueOutputBuffer(info, if (carry != null || opus != null) 2_000 else 10_000)
+                    var outIdx = try {
+                        c.dequeueOutputBuffer(info, if (carry != null || opus != null) 2_000 else 10_000)
+                    } catch (e: Exception) {
+                        if (decoderRebuilds < maxDecoderRebuilds) {
+                            decoderRebuilds++
+                            runCatching { codec?.stop(); codec?.release() }
+                            codec = null
+                            mcReady = false
+                        }
+                        -1
+                    }
                     while (outIdx >= 0 || outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                             // 解码器实际输出格式（声道/采样率）可能与配置不同：跟随并重配输出
@@ -406,8 +457,8 @@ class AndroidAudioPlayer : AudioPlayer {
                                 if (ensureOuts(sampleRate, channels)) writeOut(pcm)
                             }
                         }
-                        c.releaseOutputBuffer(outIdx, false)
-                        outIdx = c.dequeueOutputBuffer(info, 0)
+                        runCatching { c.releaseOutputBuffer(outIdx, false) }
+                        outIdx = runCatching { c.dequeueOutputBuffer(info, 0) }.getOrDefault(-1)
                     }
                 }
 

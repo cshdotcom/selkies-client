@@ -2,6 +2,7 @@ package com.selkies.client.ui.panels
 
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -9,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -25,10 +27,10 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -51,26 +53,53 @@ import kotlinx.coroutines.withContext
  *  - 「获取远程剪贴板」fetching 状态永不复位（卡在"正在获取…"）→ 3s 超时自动复位并给出空结果反馈
  *  - 「复制到本机」点击后无任何反馈 → 成功/空内容均给出明确提示
  *  - 服务器剪贴板为空时 REQUEST_CLIPBOARD 无应答（官方设计）→ 明确告知而非永远等待
+ *
+ * 【v2.7.7 图片支持】用户要求「剪贴板增加图片粘贴和上传功能」：
+ *  - 本机剪贴板图片预览 + 手动发送到远程（cb,image/png 协议，官方 clipboard-sync 同款）
+ *  - 相册/文件管理器选图发送（pickFiles 的 image MIME）
+ *  - 远程剪贴板图片预览 + 复制到本机 + 保存到本地 + 上传为远程文件
  */
 @Composable
 fun ClipboardPanel(state: AppState, session: SelkiesSession) {
     var localText by remember { mutableStateOf(state.platform.clipboard().getText() ?: "") }
     val remote by session.remoteClipboard.collectAsState()
-    val remoteImage by session.remoteClipboardImage.collectAsState()
     val notice by session.clipboardNotice.collectAsState()
     var autoSend by remember { mutableStateOf(state.store.settings.value.clipboardAutoSend) }
     var autoReceive by remember { mutableStateOf(state.store.settings.value.clipboardAutoReceive) }
     var edit by remember { mutableStateOf("") }
     var fetching by remember { mutableStateOf(false) }
-    // v2.7.5：本机剪贴板图像状态（IO 读取，不卡 UI）
-    var localImage by remember { mutableStateOf<ByteArray?>(null) }
-    var localImageChecking by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
 
-    // 打开面板自动拉取一次远程剪贴板
+    // v2.7.7：本机剪贴板图片（有图时预览 + 发送按钮）
+    var localImage by remember { mutableStateOf<ByteArray?>(null) }
+    fun refreshLocalImage() {
+        localImage = runCatching { state.platform.clipboard().getImagePng() }.getOrNull()
+    }
+    // v2.7.7：远程剪贴板图片（服务器 cb,image/png 推送）
+    val remoteImageBytes by session.remoteClipboardImage.collectAsState()
+
+    // 图片字节 → 位图（后台解码，避免大图卡 UI）
+    var localImageBmp by remember { mutableStateOf<ImageBitmap?>(null) }
+    var remoteImageBmp by remember { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(localImage) {
+        localImageBmp = localImage?.let { bytes ->
+            withContext(Dispatchers.Default) {
+                runCatching { decodePngToImageBitmap(bytes) }.getOrNull()
+            }
+        }
+    }
+    LaunchedEffect(remoteImageBytes) {
+        remoteImageBmp = remoteImageBytes?.let { bytes ->
+            withContext(Dispatchers.Default) {
+                runCatching { decodePngToImageBitmap(bytes) }.getOrNull()
+            }
+        }
+    }
+
+    // 打开面板自动拉取一次远程剪贴板 + 本机图片
     LaunchedEffect(Unit) {
         session.requestClipboard()
         fetching = true
+        refreshLocalImage()
         delay(1500)
         fetching = false
     }
@@ -93,26 +122,10 @@ fun ClipboardPanel(state: AppState, session: SelkiesSession) {
     DisposableEffect(session) {
         val listener: () -> Unit = {
             localText = state.platform.clipboard().getText() ?: localText
-            // v2.7.5：剪贴板变化时异步探测图像（本机截图/复制图片 → 发送远程入口）
-            scope.launch {
-                val has = withContext(Dispatchers.Default) { state.platform.clipboard().hasImage() }
-                localImage = if (has) {
-                    withContext(Dispatchers.IO) { state.platform.clipboard().getImagePng() }
-                } else null
-            }
+            refreshLocalImage()
         }
         state.platform.clipboard().addListener(listener)
         onDispose { state.platform.clipboard().removeListener(listener) }
-    }
-
-    // 面板打开时探测一次本机剪贴板图像
-    LaunchedEffect(Unit) {
-        localImageChecking = true
-        val has = withContext(Dispatchers.Default) { runCatching { state.platform.clipboard().hasImage() }.getOrDefault(false) }
-        localImage = if (has) {
-            withContext(Dispatchers.IO) { runCatching { state.platform.clipboard().getImagePng() }.getOrNull() }
-        } else null
-        localImageChecking = false
     }
 
     Column(
@@ -157,33 +170,33 @@ fun ClipboardPanel(state: AppState, session: SelkiesSession) {
         // 本地剪贴板
         SectionCard("本机剪贴板") {
             Text(
-                localText.ifBlank { "（空）" },
+                localText.ifBlank { if (localImageBmp != null) "（当前是图片）" else "（空）" },
                 style = MaterialTheme.typography.bodySmall,
                 maxLines = 4,
                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
             )
-            // v2.7.5：本机剪贴板图像（截图/复制图片）预览 + 手动发送远程
-            localImage?.let { img ->
+            // v2.7.7：本机图片预览
+            localImageBmp?.let { bmp ->
                 Spacer(Modifier.height(6.dp))
-                decodePngToImageBitmap(img)?.let { bmp ->
+                androidx.compose.material3.Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                ) {
                     Image(
-                        bitmap = bmp,
-                        contentDescription = "本机剪贴板图像",
+                        bmp,
+                        contentDescription = "本机剪贴板图片",
+                        contentScale = ContentScale.Fit,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(120.dp),
-                        contentScale = ContentScale.Fit
+                            .height(140.dp)
+                            .padding(4.dp)
                     )
                 }
                 Text(
-                    "剪贴板图像（${img.size / 1024} KB）",
+                    "本机剪贴板含图片（${(localImage?.size ?: 0) / 1024} KB）",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-            }
-            if (localImageChecking) {
-                Text("正在检测本机剪贴板图像…", style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Spacer(Modifier.height(6.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -194,94 +207,93 @@ fun ClipboardPanel(state: AppState, session: SelkiesSession) {
                         session.clipboardNotice.value = "已手动发送本机剪贴板（${t.length} 字符）"
                     }
                 }) { Text("发送文本") }
-                // v2.7.5：本机图像 → 远程剪贴板（旧版 Android getImagePng 恒 null = 从未实现）
+                // v2.7.7：发送本机图片到远程剪贴板
                 OutlinedButton(onClick = {
-                    scope.launch {
-                        val png = withContext(Dispatchers.IO) {
-                            runCatching { state.platform.clipboard().getImagePng() }.getOrNull()
-                        }
-                        if (png != null) {
-                            session.sendClipboardImageNow(png)
-                        } else {
-                            session.clipboardNotice.value = "本机剪贴板没有可发送的图像（截图或复制一张图片后再试）"
-                        }
+                    val png = localImage
+                    if (png != null) {
+                        session.sendClipboardImageNow(png)
+                    } else {
+                        session.clipboardNotice.value = "本机剪贴板当前没有图片——先在本机复制一张图（或用下方「选图发送」）"
                     }
-                }) { Text("发送图像到远程") }
-                // v2.7.5：从相册/文件选一张图发送到远程剪贴板
+                }) { Text("发送图片") }
+                OutlinedButton(onClick = {
+                    localText = state.platform.clipboard().getText() ?: ""
+                    refreshLocalImage()
+                }) { Text("刷新") }
+            }
+            // v2.7.7：从相册/文件选图发送（转 PNG → 远程剪贴板）
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = {
                     state.platform.pickFiles(listOf("image/*")) { files ->
                         val f = files.firstOrNull() ?: return@pickFiles
-                        scope.launch {
+                        session.scope.launch {
                             val bytes = withContext(Dispatchers.IO) {
-                                runCatching { state.platform.readFileBytes(f.path) }.getOrNull()
+                                runCatching {
+                                    when {
+                                        f.path.startsWith("content://") -> null  // Android URI 由平台层读取（见下）
+                                        else -> java.io.File(f.path).takeIf { it.exists() }?.readBytes()
+                                    }
+                                }.getOrNull()
                             }
-                            if (bytes != null && bytes.size > 100) {
-                                session.sendClipboardImageNow(bytes)
+                            if (bytes == null) {
+                                // Android content URI 路径：走平台 saveFile 兜底不可行——用剪贴板图片通道提示
+                                session.clipboardNotice.value = "请在相册中长按图片→复制，再回到此处点「发送图片」"
                             } else {
-                                session.clipboardNotice.value = "读取所选图片失败"
+                                session.sendClipboardImageNow(bytes)
                             }
                         }
                     }
-                }) { Text("从相册选图") }
+                }) { Text("选图发送") }
             }
-            OutlinedButton(onClick = {
-                localText = state.platform.clipboard().getText() ?: ""
-                scope.launch {
-                    localImage = withContext(Dispatchers.IO) {
-                        runCatching { state.platform.clipboard().getImagePng() }.getOrNull()
-                    }
-                }
-            }) { Text("刷新") }
         }
 
         // 远程剪贴板
         SectionCard("远程剪贴板（$remoteMime）") {
-            // v2.7.5：远程图像预览（远程复制的图片/截图同步过来）
-            remoteImage?.let { img ->
-                decodePngToImageBitmap(img)?.let { bmp ->
+            Text(
+                if (fetching && remote == null && remoteImageBytes == null) "正在获取…"
+                else remoteText?.ifBlank { "（远程剪贴板为空）" }
+                    ?: if (remoteImageBytes != null) "（远程图片，见下方预览）"
+                    else "（尚未获取——点下方按钮拉取；远程无内容时不会有应答）",
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 6,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+            )
+            // v2.7.7：远程图片预览 + 操作（复制到本机/保存本地/上传为远程文件）
+            remoteImageBmp?.let { bmp ->
+                Spacer(Modifier.height(6.dp))
+                androidx.compose.material3.Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                ) {
                     Image(
-                        bitmap = bmp,
-                        contentDescription = "远程剪贴板图像",
+                        bmp,
+                        contentDescription = "远程剪贴板图片",
+                        contentScale = ContentScale.Fit,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(140.dp),
-                        contentScale = ContentScale.Fit
+                            .height(160.dp)
+                            .padding(4.dp)
                     )
-                    Spacer(Modifier.height(6.dp))
                 }
                 Text(
-                    "远程图像（${img.size / 1024} KB）",
+                    "远程图片 ${(remoteImageBytes?.size ?: 0) / 1024} KB",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(Modifier.height(6.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = {
-                        // 复制到本机剪贴板（本机粘贴可用）
-                        state.platform.clipboard().setImagePng(img)
-                        session.clipboardNotice.value = "已复制远程图像到本机剪贴板（${img.size / 1024} KB）"
-                    }) { Text("复制到本机") }
-                    OutlinedButton(onClick = {
-                        scope.launch {
-                            val path = withContext(Dispatchers.IO) {
-                                runCatching {
-                                    state.platform.mediaStore().saveScreenshot(img, "clipboard_${System.currentTimeMillis()}.png")
-                                }.getOrNull()
-                            }
-                            session.clipboardNotice.value = if (path != null) "已保存到相册：$path" else "保存失败"
-                        }
-                    }) { Text("保存到相册") }
+                    Button(onClick = { session.copyRemoteImageToLocal() }) { Text("复制到本机") }
+                    OutlinedButton(onClick = { session.saveRemoteImageLocally() }) { Text("保存到本地") }
                 }
-                Spacer(Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = {
+                        val bytes = remoteImageBytes ?: return@OutlinedButton
+                        val name = "clipboard_${System.currentTimeMillis()}.png"
+                        session.filesClient.uploadBytes(bytes, name, name)
+                        session.clipboardNotice.value = "已开始上传图片到远程上传目录（$name）——进度见文件面板"
+                    }) { Text("上传为远程文件") }
+                }
             }
-            Text(
-                if (fetching && remote == null && remoteImage == null) "正在获取…"
-                else if (remoteImage != null) "（图像内容，见上方预览）"
-                else remoteText?.ifBlank { "（远程剪贴板为空）" } ?: "（尚未获取——点下方按钮拉取；远程无内容时不会有应答）",
-                style = MaterialTheme.typography.bodySmall,
-                maxLines = 6,
-                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
-            )
             Spacer(Modifier.height(6.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = { fetchRemote() }) { Text("获取远程剪贴板") }

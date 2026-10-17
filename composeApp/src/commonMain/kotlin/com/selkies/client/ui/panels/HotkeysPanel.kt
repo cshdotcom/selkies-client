@@ -272,11 +272,15 @@ fun HotkeyManagerScreen(state: AppState) {
                         )
                         Spacer(Modifier.height(6.dp))
                         // 世界最完整键盘选择器：修饰键粘滞 + 主键点选 → 捕获区更新（不自动关闭）
+                        // 【v2.7.6】尊重用户保存的键盘偏好（完整模式/缩放）——与会话悬浮键盘一致；
+                        //   旧版选择器永远从分类模式冷启动，偏好完整模式的用户每次都要重新切换
                         Box(modifier = Modifier.fillMaxWidth().height(300.dp)) {
                             CompleteKeyboard(
                                 session = null,
                                 visible = true,
                                 autoScaleHint = 0.42f,
+                                savedFullMode = state.store.settings.value.keyboardFullMode,
+                                savedFullScale = state.store.settings.value.keyboardFullScale,
                                 onDismiss = { picking = false },
                                 onChord = { chord ->
                                     // v2.7.0：主键按下 → 更新捕获组合（替换）；键盘保持打开
