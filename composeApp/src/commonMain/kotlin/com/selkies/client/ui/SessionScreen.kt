@@ -1688,20 +1688,19 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             }
         }
 
-        // ============ v2.6.0 虚拟手柄悬浮面板（v2.7.7：只读模式也可用——官方允许 viewer 持槽位发手柄） ============
+        // ============ 虚拟手柄（v2.7.9 悬浮式：全屏透明覆盖，控件半透明漂浮在视频上，
+        //             空白区域触摸穿透到远程画面；只读模式也可用——官方允许 viewer 持槽位） ============
         if (status == SelkiesSession.Status.CONNECTED) {
-            Box(Modifier.align(Alignment.BottomCenter).padding(bottom = 70.dp)) {
-                VirtualGamepadOverlay(
-                    engine = virtualEngine,
-                    session = session,
-                    visible = showVirtualPad,
-                    initialMode = state.store.settings.value.virtualGamepadMode,
-                    keyboardMapping = virtualPadKbMap,
-                    onModeChange = { m -> state.store.updateSettings { it.virtualGamepadMode = m } },
-                    onKeyboardMappingChange = { virtualPadKbMap = it },
-                    onDismiss = { showVirtualPad = false }
-                )
-            }
+            VirtualGamepadOverlay(
+                engine = virtualEngine,
+                session = session,
+                visible = showVirtualPad,
+                initialMode = state.store.settings.value.virtualGamepadMode,
+                keyboardMapping = virtualPadKbMap,
+                onModeChange = { m -> state.store.updateSettings { it.virtualGamepadMode = m } },
+                onKeyboardMappingChange = { virtualPadKbMap = it },
+                onDismiss = { showVirtualPad = false }
+            )
         }
 
         // ============ 保存引导对话框（截图/录屏/下载完成 → 打开/文件夹/复制路径） ============

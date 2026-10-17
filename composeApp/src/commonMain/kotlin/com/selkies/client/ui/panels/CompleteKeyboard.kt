@@ -558,7 +558,9 @@ fun CompleteKeyboard(
         val availH = hDp * 0.92f - 66f
         val heightFit = if (availH <= 60f) 0.3f else (availH / 218f)
         // v2.7.5：宽度方向——23 单位 × 34dp + 8dp = 782dp 满宽
-        val widthFit = ((wDp - 8f) / 782f).coerceAtLeast(0.3f)
+        // v2.7.9：余量 8→20（与 fitFullWidthScale 实测校准值一致；-8 时 0.5dp 级溢出
+        //   会让最右列小键盘键被切掉边缘——GUI 实测竖屏 numpad 右缘缺 3dp）
+        val widthFit = ((wDp - 20f) / 782f).coerceAtLeast(0.3f)
         return minOf(heightFit, widthFit).coerceIn(0.3f, 2f)
     }
 

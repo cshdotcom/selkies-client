@@ -128,8 +128,8 @@ android {
         applicationId = "com.selkies.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 20708
-        versionName = "2.7.8"
+        versionCode = 20709
+        versionName = "2.7.9"
         ndkVersion = ""
     }
     // v2.7.5：FFmpeg 原生库压缩存储（APK ~26MB 而非 ~48MB；安装时解压到本地）

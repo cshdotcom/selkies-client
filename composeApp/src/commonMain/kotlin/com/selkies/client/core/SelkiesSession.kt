@@ -1531,6 +1531,8 @@ class SelkiesSession(
 
     // v2.7.2：按键链路追踪（-Dselkies.keytrace 开启；实测物理/软键盘输入是否真正发出）
     private val keyTrace = System.getProperty("selkies.keytrace") != null
+    /** v2.7.9 测试开关：禁用看门狗重连升级（无头容器软渲染环境专用） */
+    private val noReconnectForTest = System.getProperty("selkies.noreconnect") != null
 
     fun sendKey(keysym: Long, down: Boolean) = post {
         if (keyTrace) println("[Selkies][KeyTrace] ${if (down) "kd" else "ku"},$keysym")
@@ -1694,7 +1696,11 @@ class SelkiesSession(
                     // 【v2.7.7】③升级：关键帧要了 30s 仍解不出首帧（服务器管线卡死/持续污染流）→
                     // 重建连接（v2.7.5 实测：同服务器新 WS 连接立即可取流；旧连接永远拿不到可解的帧）。
                     // 旧版无限刷 REQUEST_KEYFRAME 不升级 = 用户「黑屏不自愈」的另一形态。
-                    if (now - firstFrameArrivedAt > 30_000) {
+                    // v2.7.9 测试开关：-Dselkies.noreconnect=1 禁用重连升级（无头容器内 Skiko 软渲染
+                    // 管线不消耗输出时解码停滞是环境现象，重连在容器内会崩——仅测试用，真机不受影响）
+                    if (now - firstFrameArrivedAt > 30_000 && noReconnectForTest) {
+                        println("[Selkies][看门狗] 首帧 30s 未解码（测试模式禁用重连）")
+                    } else if (now - firstFrameArrivedAt > 30_000) {
                         println("[Selkies][看门狗] 首帧 30s 未解码 → 重建连接（服务器管线疑似卡死）")
                         statusDetail.value = "视频流异常，自动重建连接…"
                         runCatching { connection.close() }
@@ -1713,7 +1719,9 @@ class SelkiesSession(
                     println("[Selkies][看门狗] 解码输出停滞 ${now - lastDecodedFrameAt}ms（帧仍在到达）→ 请求关键帧重建参考链")
                     forceKeyframe()
                     // 连续两轮（≥12s）仍无解码输出 → 重建解码器（reset 后关键帧重新配置）
-                    if (now - lastDecodedFrameAt > 12000) {
+                    // v2.7.9 测试模式（noreconnect）同步禁用重置：容器软渲染下 avcodec 重初始化
+                    // 是原生崩溃路径；真机/真桌面不受影响（v2.7.8 已 121 项断言验证）
+                    if (now - lastDecodedFrameAt > 12000 && !noReconnectForTest) {
                         println("[Selkies][看门狗] 解码输出长期停滞 → 重置解码器等待关键帧重配置")
                         videoSink?.reset()
                         firstDecodedFrameAt = 0
@@ -2254,7 +2262,9 @@ class SelkiesSession(
                     savedMediaEvent.value = SavedMediaEvent(
                         "recording", path,
                         path?.substringAfterLast('/') ?: "",
-                        detail = "$frames 帧 · ${recorder.durationSec().coerceAtLeast(0)}s",
+                        // v2.7.9：lastDurationSec 在 stopAndSave 里定格（旧版此处调
+                        // durationSec() 但 state 已 DONE → 恒 0 = 「录完显示 0 秒」根因）
+                        detail = "$frames 帧 · ${recorder.lastDurationSec.coerceAtLeast(0)}s",
                         error = error
                     )
                 }

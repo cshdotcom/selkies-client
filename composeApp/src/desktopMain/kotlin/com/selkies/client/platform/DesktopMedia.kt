@@ -131,6 +131,9 @@ class DesktopStreamMuxer(override val outputPath: String) : StreamMuxer {
     /** ⚠️ write_header 失败后置位：半初始化的 muxer 重入 write_header 会段错误，绝不再试 */
     private var headerFailed = false
     private var videoCodec = 1 // 1=h264 2=vp8 3=vp9 5=h265；0→MJPEG
+    // v2.7.9：真实流尺寸（旧版硬编码 1280x720——容器轨尺寸与实际不符）
+    private var videoW = 0
+    private var videoH = 0
     private var lastVideoPts = -1L
     private var lastAudioPts = -1L
     private var closed = false
@@ -146,6 +149,8 @@ class DesktopStreamMuxer(override val outputPath: String) : StreamMuxer {
         synchronized(lock) {
             if (fmtCtx != null || closed) return false
             videoCodec = codecId
+            videoW = width
+            videoH = height
             return ensureContext()
         }
     }
@@ -225,13 +230,20 @@ class DesktopStreamMuxer(override val outputPath: String) : StreamMuxer {
         synchronized(lock) {
             if (closed) return false
             if (videoCodec != 0) {
-                // JPEG 模式：MJPEG 直通（每包=完整帧）
+                // ⚠️【v2.7.9 录屏闪退根因】旧版先无条件 videoCodec=0：首次调用返回 false 后
+                //   videoCodec 已被改，第二次调用绕过「已按其他编码器初始化」守卫 →
+                //   对无 extradata 的 H264 ctx 调 writeHeader → avformat_write_header
+                //   SIGSEGV（V279MuxerProbe C 用例复现；服务器 h264↔jpeg 切换时
+                //   StreamRecorder 持续喳 jpeg 帧 = 用户「录到一半突然闪退」桌面根因）
+                if (fmtCtx != null) return false // 已按其他编码器初始化 → 拒绝（不改 videoCodec！）
                 videoCodec = 0
-                if (fmtCtx != null) return false // 已按其他编码器初始化
                 if (!ensureContext()) return false
             }
             if (fmtCtx == null) return false
-            if (!headerWritten && !writeHeader()) return false
+            if (!headerWritten && !writeHeader()) {
+                headerFailed = true   // v2.7.9：与 writeVideoFrame 同样的半初始化防线
+                return false
+            }
             if (ptsUs <= lastVideoPts) return true
             // 条带合成完整帧 → 单包 MJPEG（画质无损）
             val jpeg = compositeJpeg(parts) ?: return true
@@ -317,7 +329,8 @@ class DesktopStreamMuxer(override val outputPath: String) : StreamMuxer {
             }
             st.codecpar().codec_type(avutil.AVMEDIA_TYPE_VIDEO)
             st.codecpar().codec_id(codecId)
-            st.codecpar().width(1280); st.codecpar().height(720)
+            st.codecpar().width(if (videoW > 0) videoW else 1280)
+            st.codecpar().height(if (videoH > 0) videoH else 720)
             st.time_base().num(1); st.time_base().den(1_000_000)
             videoStream = st
             fmtCtx = ctx

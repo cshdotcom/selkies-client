@@ -2,10 +2,12 @@ package com.selkies.client.ui.panels
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -290,12 +292,21 @@ class VirtualGamepadEngine(private val session: SelkiesSession) {
     }
 }
 
+
 /**
- * 虚拟手柄悬浮面板 v2.7.7 重做：
- * - Xbox 风格布局：双浮动模拟摇杆（锚点跟随手指）+ ABXY 菱形 + 一体化十字键
- *   + 模拟量扳机（LT/RT 填充条）+ 肩键 + Back/Guide/Start + L3/R3
- * - 只读（viewer）模式可用：持槽位照常发送；无槽位给出引导
- * - 模式：full 完整 / simple 精简（小屏）/ wheel 赛车
+ * 虚拟手柄悬浮层 v2.7.9 重做（修「把整个屏幕都挡住」）：
+ *
+ * 旧版（≤v2.7.7）：一块 94% 不透明的大面板贴在屏幕底部（完整模式高约 420dp+，
+ * 竖屏手机占掉一半以上画面），远程视频被完全遮住。
+ *
+ * 新版：**游戏手柄式悬浮控件**——全屏透明 Box（无背景=空白区域触摸穿透到远程
+ * 视频），控件按角落锚定、半透明（可调三档透明度），视频全程可见：
+ *  - 顶部中央：紧凑控制条（模式/槽位/透明度/键盘映射/收起/关闭 + 实时事件）
+ *  - 完整模式：左下 LT·LB+左摇杆+Back/L3，中央十字键+Guide，右下 RB·RT+ABXY+Start/R3
+ *    （窄屏 <460dp：十字键条上移到左右簇之间，避免挤压）
+ *  - 精简模式：左摇杆 + ABXY + LB/RB/RT + Start
+ *  - 赛车模式：底部半透明控件条（转向/油门/刹车/挡位）
+ *  - 收起后变为右下角可拖动小气泡，一点即展开
  */
 @Composable
 fun VirtualGamepadOverlay(
@@ -314,10 +325,12 @@ fun VirtualGamepadOverlay(
     var slotPref by remember { mutableStateOf(0) }
     var collapsed by remember { mutableStateOf(false) }
     var kbMap by remember { mutableStateOf(keyboardMapping) }
+    // v2.7.9 透明度三档：0.55 轻透 / 0.78 标准（默认）/ 1.0 实心——用户可按需调节遮挡感
+    var alphaLevel by remember { mutableStateOf(1) }
     val role by session.role.collectAsState()
     val gamepadSlot by session.gamepadSlot.collectAsState()
 
-    // 【v2.7.7】角色/槽位变化 → 引擎重新解析发送权限（viewer 被顶替/重连/切换后自动跟随）
+    // 【v2.7.7】角色/槽位变化 → 引擎重新解析发送权限
     LaunchedEffect(role, gamepadSlot, slotPref) {
         engine.refreshRoleSlot(slotPref)
     }
@@ -338,105 +351,45 @@ fun VirtualGamepadOverlay(
         }
     }
 
-    androidx.compose.material3.Surface(
-        modifier = Modifier
-            // ⚠️【v2.7.7 顺序修复】widthIn 必须在 fillMaxWidth 之前（外层）：
-            //   旧顺序 fillMaxWidth().widthIn(max=820) 实测渲染为全宽 1280（fillMaxWidth 强制占满
-            //   父约束）——桌面大屏上摇杆贴左右屏幕边缘、布局散架。交换后先钳到 ≤820 再填充。
-            .widthIn(max = 820.dp)
-            .fillMaxWidth()
-            .padding(horizontal = 8.dp),
-        shape = RoundedCornerShape(18.dp),
-        color = Color(0xF00F1318),
-        // v2.7.0: shadowElevation 移除——SOFTWARE 渲染内容丢失 bug
-    ) {
-        Column(Modifier.padding(10.dp)) {
-            // ---------- 顶栏：模式 / 槽位 / 键盘映射 / 折叠 ----------
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    when {
-                        role == "viewer" && gamepadSlot != null -> "虚拟手柄 · 只读·玩家${gamepadSlot}位"
-                        role == "viewer" -> "虚拟手柄 · 只读"
-                        else -> "虚拟手柄"
-                    },
-                    color = Color(0xFF7DD3FC), fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.weight(1f)
-                )
-                VgChip("完整", mode == "full") { mode = "full"; onModeChange("full") }
-                VgChip("精简", mode == "simple") { mode = "simple"; onModeChange("simple") }
-                VgChip("赛车", mode == "wheel") { mode = "wheel"; onModeChange("wheel") }
-                Spacer(Modifier.width(4.dp))
-                VgChip("键位$slotPref", role != "viewer") {
-                    slotPref = (slotPref + 1) % 4
-                }
-                if (!collapsed) {
-                    Spacer(Modifier.width(4.dp))
-                    VgChip(if (kbMap) "键盘映射开" else "键盘映射", kbMap) {
-                        kbMap = !kbMap
-                        onKeyboardMappingChange(kbMap)
-                    }
-                    Spacer(Modifier.width(4.dp))
-                    androidx.compose.material3.TextButton(
-                        onClick = { collapsed = true },
-                        contentPadding = PaddingValues(0.dp)
-                    ) { Text("收起", fontSize = 10.sp) }
-                    androidx.compose.material3.TextButton(
-                        onClick = { onDismiss() },
-                        contentPadding = PaddingValues(0.dp)
-                    ) { Text("关闭", fontSize = 10.sp) }
-                } else {
-                    Spacer(Modifier.width(4.dp))
-                    androidx.compose.material3.TextButton(
-                        onClick = { collapsed = false },
-                        contentPadding = PaddingValues(0.dp)
-                    ) { Text("展开", fontSize = 10.sp) }
-                    androidx.compose.material3.TextButton(
-                        onClick = { onDismiss() },
-                        contentPadding = PaddingValues(0.dp)
-                    ) { Text("关闭", fontSize = 10.sp) }
-                }
-            }
+    val a = when (alphaLevel) { 0 -> 0.55f; 1 -> 0.78f; else -> 1f }
+    if (System.getProperty("selkies.paddebug") != null) println("[PadDebug] overlay render: mode=$mode collapsed=$collapsed")
 
-            // v2.7.4：连接状态 + 最近事件实时反馈
-            val lastEvent by engine.lastEvent.collectAsState()
-            val blockReason by engine.viewerBlockReason.collectAsState()
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    if (engine.isConnected) "已连接 js${engine.slot}" else "未连接",
-                    color = if (engine.isConnected) Color(0xFF4ADE80) else Color(0xFFF87171),
-                    fontSize = 9.sp
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    lastEvent ?: "等待输入…（按按钮/拖摇杆，此处显示发送事件）",
-                    color = Color(0x99FFFFFF), fontSize = 9.sp,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-            }
-            // 【v2.7.7】viewer 无槽位：明确引导（官方只读手柄控制端需要 ?slot=2..4）
-            blockReason?.let { reason ->
-                Text(
-                    reason,
-                    color = Color(0xFFFBBF24), fontSize = 9.sp,
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
-                )
-            }
+    // ===== 全屏透明覆盖：无背景 → 空白处触摸直达远程视频 =====
+    Box(Modifier.fillMaxSize()) {
+        if (collapsed) {
+            PadCollapsedBubble(
+                alpha = a,
+                role = role,
+                gamepadSlot = gamepadSlot,
+                onExpand = { collapsed = false }
+            )
+        } else {
+            // ---------- 顶部紧凑控制条 ----------
+            PadControlPill(
+                alpha = a,
+                engine = engine,
+                role = role,
+                gamepadSlot = gamepadSlot,
+                mode = mode,
+                slotPref = slotPref,
+                kbMap = kbMap,
+                alphaLevel = alphaLevel,
+                onModeChange = { mode = it; onModeChange(it) },
+                onSlotChange = { slotPref = it },
+                onKbMapChange = { kbMap = it; onKeyboardMappingChange(it) },
+                onAlphaChange = { alphaLevel = it },
+                onCollapse = { collapsed = true },
+                onDismiss = onDismiss
+            )
 
-            if (!collapsed) {
-                if (kbMap) {
-                    Text(
-                        "键盘映射：WASD=左摇杆 · 方向键=D-Pad · IJKL=右摇杆 · Q/E=肩键 · U/I=扳机 · 1/2/3/4=ABXY · Enter=Start · Backspace=Back",
-                        color = Color(0x88FFFFFF), fontSize = 9.sp, modifier = Modifier.padding(vertical = 4.dp)
-                    )
-                }
+            // ---------- 手柄控件区 ----------
+            BoxWithConstraints(Modifier.fillMaxSize()) {
+                val wide = maxWidth >= 460.dp
+                if (System.getProperty("selkies.paddebug") != null) println("[PadDebug] BoxWithConstraints maxWidth=$maxWidth wide=$wide -> ${if (mode == "simple") "Simple" else if (mode == "wheel") "Wheel" else "Full"}")
                 when (mode) {
-                    "simple" -> SimplePad(engine)
-                    "wheel" -> WheelPad(engine)
-                    else -> FullPad(engine)
+                    "simple" -> SimplePadFloating(engine, a)
+                    "wheel" -> WheelPadFloating(engine, a)
+                    else -> FullPadFloating(engine, a, wide)
                 }
             }
         }
@@ -444,7 +397,127 @@ fun VirtualGamepadOverlay(
 }
 
 // =====================================================================
-// 布局（v2.7.7 重做：Xbox 风格）
+// 顶部控制条（半透明胶囊：状态 + 模式 + 槽位 + 透明度 + 收起/关闭）
+// =====================================================================
+@Composable
+private fun androidx.compose.foundation.layout.BoxScope.PadControlPill(
+    alpha: Float,
+    engine: VirtualGamepadEngine,
+    role: String,
+    gamepadSlot: Int?,
+    mode: String,
+    slotPref: Int,
+    kbMap: Boolean,
+    alphaLevel: Int,
+    onModeChange: (String) -> Unit,
+    onSlotChange: (Int) -> Unit,
+    onKbMapChange: (Boolean) -> Unit,
+    onAlphaChange: (Int) -> Unit,
+    onCollapse: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .align(Alignment.TopCenter)
+            .padding(top = 4.dp)
+            .widthIn(max = 640.dp)
+            .background(Color(0xD00F1318).copy(alpha = alpha.coerceAtLeast(0.55f)), RoundedCornerShape(12.dp))
+            .padding(horizontal = 8.dp, vertical = 3.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                when {
+                    role == "viewer" && gamepadSlot != null -> "🎮只读·玩家${gamepadSlot}位"
+                    role == "viewer" -> "🎮只读"
+                    else -> "🎮手柄"
+                },
+                color = Color(0xFF7DD3FC), fontSize = 10.sp, fontWeight = FontWeight.SemiBold
+            )
+            Spacer(Modifier.width(6.dp))
+            val lastEvent by engine.lastEvent.collectAsState()
+            Text(
+                if (engine.isConnected) (lastEvent ?: "js${engine.slot} 已连接")
+                else "未连接",
+                color = if (engine.isConnected) Color(0xB3FFFFFF) else Color(0xFFF87171),
+                fontSize = 8.sp, maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false)
+            )
+            Spacer(Modifier.width(6.dp))
+            VgChip("完整", mode == "full", alpha) { onModeChange("full") }
+            VgChip("精简", mode == "simple", alpha) { onModeChange("simple") }
+            VgChip("赛车", mode == "wheel", alpha) { onModeChange("wheel") }
+            VgChip("槽$slotPref", role != "viewer", alpha) {
+                onSlotChange((slotPref + 1) % 4)
+            }
+            VgChip("透" + (alphaLevel + 1), alphaLevel != 1, alpha) {
+                onAlphaChange((alphaLevel + 1) % 3)
+            }
+            if (kbMap) VgChip("键盘映射", true, alpha) { onKbMapChange(false) }
+            else VgChip("键映", false, alpha) { onKbMapChange(true) }
+            androidx.compose.material3.TextButton(
+                onClick = onCollapse,
+                contentPadding = PaddingValues(0.dp)
+            ) { Text("收起", fontSize = 9.sp, color = Color(0xCCFFFFFF)) }
+            androidx.compose.material3.TextButton(
+                onClick = onDismiss,
+                contentPadding = PaddingValues(0.dp)
+            ) { Text("✕", fontSize = 11.sp, color = Color(0xCCFFFFFF)) }
+        }
+        // viewer 无槽位引导 / 键盘映射说明
+        val blockReason by engine.viewerBlockReason.collectAsState()
+        val hint = when {
+            blockReason != null -> blockReason!!
+            kbMap -> "WASD=左摇杆 · 方向键=十字键 · IJKL=右摇杆 · Q/E=肩键 · U/I=扳机 · 1/2/3/4=ABXY"
+            else -> null
+        }
+        hint?.let {
+            Text(
+                it, color = Color(0xFFFBBF24).copy(alpha = 0.9f), fontSize = 8.sp,
+                maxLines = 2, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+            )
+        }
+    }
+}
+
+/** 收起状态：右下角可拖动小气泡 */
+@Composable
+private fun androidx.compose.foundation.layout.BoxScope.PadCollapsedBubble(
+    alpha: Float,
+    role: String,
+    gamepadSlot: Int?,
+    onExpand: () -> Unit
+) {
+    var offset by remember { mutableStateOf(Offset.Zero) }
+    Box(
+        modifier = Modifier
+            .align(Alignment.BottomEnd)
+            .padding(end = 14.dp, bottom = 92.dp)
+            .offset { androidx.compose.ui.unit.IntOffset(offset.x.toInt(), offset.y.toInt()) }
+            .background(Color(0xD01D2530).copy(alpha = alpha.coerceAtLeast(0.6f)), CircleShape)
+            .border(1.dp, Color(0x5560A5FA), CircleShape)
+            .pointerInput(Unit) {
+                detectDragGestures { _, drag ->
+                    offset = Offset(
+                        (offset.x + drag.x).coerceIn(-320f * density, 60f * density),
+                        (offset.y + drag.y).coerceIn(-360f * density, 160f * density)
+                    )
+                }
+            }
+            .clickable { onExpand() }
+            .padding(horizontal = 14.dp, vertical = 10.dp)
+    ) {
+        Text(
+            "🎮" + if (role == "viewer") (gamepadSlot?.let { "P$it" } ?: "只读") else "",
+            color = Color(0xFF7DD3FC), fontSize = 12.sp, fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+// =====================================================================
+// 悬浮布局（v2.7.9）
 // =====================================================================
 
 /** 手柄配色 */
@@ -454,140 +527,215 @@ private object PadColors {
     val X = Color(0xFF60A5FA)   // 蓝
     val Y = Color(0xFFFBBF24)   // 黄
     val ACCENT = Color(0xFF60A5FA)
-    val KEYFACE = Color(0xFF2A3441)
-    val KEYFACE_PRESS = Color(0xFF3B4A5C)
     val GUIDE = Color(0xFF94A3B8)
 }
 
-/** 完整布局：Xbox 式双摇杆 + 十字键 + ABXY 菱形 + 扳机肩键 + 系统键 */
-@Composable
-private fun FullPad(engine: VirtualGamepadEngine) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        // 肩键 + 扳机行（模拟量）
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceEvenly
-        ) {
-            TriggerBar("LT", engine, axis = 4, button = 6)
-            ShoulderBtn("LB", engine, 4)
-            ShoulderBtn("RB", engine, 5)
-            TriggerBar("RT", engine, axis = 5, button = 7)
-        }
-        // 主区：左摇杆 | 十字 + 系统 | ABXY + 右摇杆
-        Row(
-            modifier = Modifier.fillMaxWidth().height(210.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            // 左摇杆 + L3 + Back
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                FloatingJoystick(engine, 0, 1, label = "L")
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    PadBtn("Back", engine, 8, small = true)
-                    PadBtn("L3", engine, 10, small = true)
-                }
-            }
-            // 中央：十字键 + Guide
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                CrossDpad(engine)
-                Spacer(Modifier.height(6.dp))
-                PadBtn("☰", engine, 16, small = true, accent = PadColors.GUIDE)
-            }
-            // ABXY 菱形 + Start + 右摇杆
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Box(Modifier.size(52.dp))
-                    PadBtn("Y", engine, 3, round = true, accent = PadColors.Y)
-                    Box(Modifier.size(52.dp))
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    PadBtn("X", engine, 2, round = true, accent = PadColors.X)
-                    Text("R", color = Color(0x55FFFFFF), fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                    PadBtn("B", engine, 1, round = true, accent = PadColors.B)
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Box(Modifier.size(52.dp))
-                    PadBtn("A", engine, 0, round = true, accent = PadColors.A)
-                    Box(Modifier.size(52.dp))
-                }
-            }
-            // 右摇杆 + R3 + Start
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                FloatingJoystick(engine, 2, 3, label = "R")
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    PadBtn("R3", engine, 11, small = true)
-                    PadBtn("Start", engine, 9, small = true)
-                }
-            }
-        }
-    }
-}
+/** 半透明键面 */
+private fun keyFace(alpha: Float) = Color(0xFF2A3441).copy(alpha = alpha)
 
-/** 精简布局：左摇杆 + 十字 + A/B + LB/RB + Start（小屏手机） */
+/**
+ * 完整布局（悬浮式）：控件分三簇漂浮在视频上。
+ * 宽屏：左下(扳机+左摇杆+Back/L3) | 底部中央(十字键+Guide) | 右下(扳机+ABXY+Start/R3)
+ * 窄屏：十字键条上移为独立悬浮簇（避免三列挤压）
+ */
 @Composable
-private fun SimplePad(engine: VirtualGamepadEngine) {
-    Row(
-        modifier = Modifier.fillMaxWidth().height(180.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        FloatingJoystick(engine, 0, 1, label = "L", compact = true)
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            PadBtn("A", engine, 0, round = true, accent = PadColors.A)
-            Spacer(Modifier.height(8.dp))
-            PadBtn("B", engine, 1, round = true, accent = PadColors.B)
+private fun androidx.compose.foundation.layout.BoxScope.FullPadFloating(engine: VirtualGamepadEngine, alpha: Float, wide: Boolean) {
+    if (wide) {
+        Row(
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(start = 12.dp, bottom = 84.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.Bottom
+        ) {
+            TriggerBar("LT", engine, axis = 4, button = 6, alpha = alpha)
+            PadBtn("LB", engine, 4, alpha = alpha)
         }
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            CrossDpad(engine, compact = true)
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(start = 16.dp, bottom = 140.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            FloatingJoystick(engine, 0, 1, label = "L", alpha = alpha)
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                PadBtn("Back", engine, 8, small = true, alpha = alpha)
+                PadBtn("L3", engine, 10, small = true, alpha = alpha)
+            }
+        }
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 84.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            CrossDpad(engine, alpha = alpha)
             Spacer(Modifier.height(6.dp))
+            PadBtn("☰", engine, 16, small = true, accent = PadColors.GUIDE, alpha = alpha)
+        }
+        Row(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(end = 12.dp, bottom = 84.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.Bottom
+        ) {
+            PadBtn("RB", engine, 5, alpha = alpha)
+            TriggerBar("RT", engine, axis = 5, button = 7, alpha = alpha)
+        }
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(end = 16.dp, bottom = 140.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            AbxyDiamond(engine, alpha)
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                PadBtn("R3", engine, 11, small = true, alpha = alpha)
+                PadBtn("Start", engine, 9, small = true, alpha = alpha)
+            }
+        }
+    } else {
+        // 窄屏：十字键独立簇（中上），左右簇贴底角
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 300.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            CrossDpad(engine, compact = true, alpha = alpha)
+            Spacer(Modifier.height(4.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                PadBtn("LB", engine, 4, small = true)
-                PadBtn("RB", engine, 5, small = true)
+                PadBtn("Back", engine, 8, small = true, alpha = alpha)
+                PadBtn("☰", engine, 16, small = true, accent = PadColors.GUIDE, alpha = alpha)
+                PadBtn("Start", engine, 9, small = true, alpha = alpha)
             }
         }
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            TriggerBar("RT", engine, axis = 5, button = 7, compact = true)
-            Spacer(Modifier.height(6.dp))
-            PadBtn("Start", engine, 9, small = true)
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(start = 8.dp, bottom = 84.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.Bottom) {
+                TriggerBar("LT", engine, axis = 4, button = 6, alpha = alpha, compact = true)
+                PadBtn("LB", engine, 4, alpha = alpha)
+            }
+            FloatingJoystick(engine, 0, 1, label = "L", alpha = alpha, compact = true)
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                PadBtn("L3", engine, 10, small = true, alpha = alpha)
+            }
+        }
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(end = 8.dp, bottom = 84.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.Bottom) {
+                PadBtn("RB", engine, 5, alpha = alpha)
+                TriggerBar("RT", engine, axis = 5, button = 7, alpha = alpha, compact = true)
+            }
+            AbxyDiamond(engine, alpha, compact = true)
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                PadBtn("R3", engine, 11, small = true, alpha = alpha)
+            }
         }
     }
 }
 
-/** 赛车布局：转向摇杆 + 油门/刹车踏板 + 挡位 */
+/** ABXY 菱形簇 */
 @Composable
-private fun WheelPad(engine: VirtualGamepadEngine) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        SteeringSlider(engine)
+private fun AbxyDiamond(engine: VirtualGamepadEngine, alpha: Float, compact: Boolean = false) {
+    val cell = if (compact) 44.dp else 50.dp
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Row(horizontalArrangement = Arrangement.spacedBy((cell.value / 4).dp)) {
+            Box(Modifier.size(cell))
+            PadBtn("Y", engine, 3, round = true, accent = PadColors.Y, alpha = alpha, size = cell)
+            Box(Modifier.size(cell))
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy((cell.value / 4).dp), verticalAlignment = Alignment.CenterVertically) {
+            PadBtn("X", engine, 2, round = true, accent = PadColors.X, alpha = alpha, size = cell)
+            Box(Modifier.size(cell))
+            PadBtn("B", engine, 1, round = true, accent = PadColors.B, alpha = alpha, size = cell)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy((cell.value / 4).dp)) {
+            Box(Modifier.size(cell))
+            PadBtn("A", engine, 0, round = true, accent = PadColors.A, alpha = alpha, size = cell)
+            Box(Modifier.size(cell))
+        }
+    }
+}
+
+/** 精简布局（悬浮式）：左摇杆 + ABXY + 肩键扳机 + Start */
+@Composable
+private fun androidx.compose.foundation.layout.BoxScope.SimplePadFloating(engine: VirtualGamepadEngine, alpha: Float) {
+    Column(
+        modifier = Modifier
+            .align(Alignment.BottomStart)
+            .padding(start = 10.dp, bottom = 84.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.Bottom) {
+            PadBtn("LB", engine, 4, alpha = alpha)
+            TriggerBar("RT", engine, axis = 5, button = 7, alpha = alpha, compact = true)
+        }
+        FloatingJoystick(engine, 0, 1, label = "L", alpha = alpha)
+    }
+    Column(
+        modifier = Modifier
+            .align(Alignment.BottomEnd)
+            .padding(end = 10.dp, bottom = 84.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        AbxyDiamond(engine, alpha)
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            PadBtn("Start", engine, 9, small = true, alpha = alpha)
+        }
+    }
+}
+
+/** 赛车布局（悬浮式）：底部控件条（无整块面板背景） */
+@Composable
+private fun androidx.compose.foundation.layout.BoxScope.WheelPadFloating(engine: VirtualGamepadEngine, alpha: Float) {
+    Column(
+        modifier = Modifier
+            .align(Alignment.BottomCenter)
+            .padding(bottom = 76.dp)
+            .widthIn(max = 620.dp)
+            .fillMaxWidth(0.96f)
+            .background(Color(0xB00F1318).copy(alpha = alpha * 0.85f), RoundedCornerShape(14.dp))
+            .padding(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        SteeringSlider(engine, alpha)
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            TriggerBar("刹车LT", engine, axis = 4, button = 6)
-            TriggerBar("油门RT", engine, axis = 5, button = 7)
+            TriggerBar("刹车LT", engine, axis = 4, button = 6, alpha = alpha)
+            TriggerBar("油门RT", engine, axis = 5, button = 7, alpha = alpha)
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
-            PadBtn("升挡(A)", engine, 0, small = true, accent = PadColors.A)
-            PadBtn("降挡(B)", engine, 1, small = true, accent = PadColors.B)
-            PadBtn("手刹(X)", engine, 2, small = true, accent = PadColors.X)
-            PadBtn("喇叭(Y)", engine, 3, small = true, accent = PadColors.Y)
-            PadBtn("回放(Back)", engine, 8, small = true)
+            PadBtn("升挡(A)", engine, 0, small = true, accent = PadColors.A, alpha = alpha)
+            PadBtn("降挡(B)", engine, 1, small = true, accent = PadColors.B, alpha = alpha)
+            PadBtn("手刹(X)", engine, 2, small = true, accent = PadColors.X, alpha = alpha)
+            PadBtn("喇叭(Y)", engine, 3, small = true, accent = PadColors.Y, alpha = alpha)
+            PadBtn("回放(Back)", engine, 8, small = true, alpha = alpha)
         }
     }
 }
 
 // =====================================================================
-// 控件（v2.7.7 全面升级）
+// 控件（v2.7.9：全部支持透明度；触摸区=可视区，不额外占屏）
 // =====================================================================
 
 /**
- * 浮动模拟摇杆（体验核心）：
- * - 按下处即摇杆中心（锚点跟随手指——手指按哪都自然，不用瞄准固定圆心）
- * - 全向模拟量 ±1、死区 0.12、圆形限幅
- * - 视觉：刻度环 + 径向渐变摇杆头 + 激活光环 + 实时数值
+ * 浮动模拟摇杆：按下处即摇杆中心（锚点跟随手指）；全向模拟量 ±1、死区 0.12、圆形限幅
  */
 @Composable
 private fun FloatingJoystick(
@@ -595,12 +743,13 @@ private fun FloatingJoystick(
     axisX: Int,
     axisY: Int,
     label: String,
+    alpha: Float,
     compact: Boolean = false
 ) {
-    val zone = if (compact) 132.dp else 158.dp
+    val zone = if (compact) 128.dp else 150.dp
     var active by remember { mutableStateOf(false) }
-    var anchor by remember { mutableStateOf(Offset.Zero) }   // 本次触摸的摇杆中心（区域局部坐标）
-    var knob by remember { mutableStateOf(Offset.Zero) }     // 当前偏移（已限幅）
+    var anchor by remember { mutableStateOf(Offset.Zero) }
+    var knob by remember { mutableStateOf(Offset.Zero) }
     var stickX by remember { mutableStateOf(0f) }
     var stickY by remember { mutableStateOf(0f) }
 
@@ -609,7 +758,7 @@ private fun FloatingJoystick(
             modifier = Modifier
                 .size(zone)
                 .pointerInput(engine, axisX, axisY) {
-                    val radius = (zone.toPx() / 2f) * 0.72f   // 可用半径（留边）
+                    val radius = (zone.toPx() / 2f) * 0.72f
                     fun apply(dx: Float, dy: Float) {
                         var v = Offset(dx / radius, dy / radius)
                         val len = hypot(v.x, v.y)
@@ -644,105 +793,103 @@ private fun FloatingJoystick(
             androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
                 val c = center
                 val r = size.minDimension / 2f
-                // 底盘（固定视觉参考环）
+                // 底盘（固定视觉参考环）——乘透明度
                 drawCircle(
                     Brush.radialGradient(
-                        listOf(Color(0x33000000), Color(0x55000000)),
+                        listOf(Color(0x33000000).copy(alpha = alpha), Color(0x55000000).copy(alpha = alpha)),
                         center = c, radius = r * 0.9f
                     ),
                     radius = r * 0.9f
                 )
-                drawCircle(Color(0x33FFFFFF), radius = r * 0.9f, style = Stroke(1.5.dp.toPx()))
-                // 8 方向刻度
+                drawCircle(Color(0x33FFFFFF).copy(alpha = alpha), radius = r * 0.9f, style = Stroke(1.5.dp.toPx()))
                 val tickR1 = r * 0.82f
                 val tickR2 = r * 0.92f
                 for (i in 0 until 8) {
                     val ang = Math.PI * i / 4.0
                     drawLine(
-                        if (active) Color(0xAA60A5FA) else Color(0x55FFFFFF),
+                        if (active) Color(0xAA60A5FA).copy(alpha = alpha) else Color(0x55FFFFFF).copy(alpha = alpha),
                         Offset(c.x + (tickR1 * cos(ang)).toFloat(), c.y + (tickR1 * sin(ang)).toFloat()),
                         Offset(c.x + (tickR2 * cos(ang)).toFloat(), c.y + (tickR2 * sin(ang)).toFloat()),
                         strokeWidth = 2.dp.toPx()
                     )
                 }
-                // 中心十字
-                drawLine(Color(0x44FFFFFF), Offset(c.x - 6.dp.toPx(), c.y), Offset(c.x + 6.dp.toPx(), c.y), 1.5f)
-                drawLine(Color(0x44FFFFFF), Offset(c.x, c.y - 6.dp.toPx()), Offset(c.x, c.y + 6.dp.toPx()), 1.5f)
+                drawLine(Color(0x44FFFFFF).copy(alpha = alpha), Offset(c.x - 6.dp.toPx(), c.y), Offset(c.x + 6.dp.toPx(), c.y), 1.5f)
+                drawLine(Color(0x44FFFFFF).copy(alpha = alpha), Offset(c.x, c.y - 6.dp.toPx()), Offset(c.x, c.y + 6.dp.toPx()), 1.5f)
 
-                // 摇杆活动中心（锚点）+ 摇杆头
                 val a = if (active) anchor else c
                 val knobR = r * 0.34f
-                // 锚点提示环（按下处）
                 if (active) {
-                    drawCircle(Color(0x3360A5FA), radius = r * 0.62f, center = a, style = Stroke(1.dp.toPx()))
+                    drawCircle(Color(0x3360A5FA).copy(alpha = alpha), radius = r * 0.62f, center = a, style = Stroke(1.dp.toPx()))
                 }
                 val k = a + knob
-                // 激活光环
                 if (active) {
                     drawCircle(
                         Brush.radialGradient(
-                            listOf(Color(0x5560A5FA), Color(0x0060A5FA)),
+                            listOf(Color(0x5560A5FA).copy(alpha = alpha), Color(0x0060A5FA)),
                             center = k, radius = knobR * 1.7f
                         ),
                         radius = knobR * 1.7f, center = k
                     )
                 }
-                // 摇杆头：径向渐变球 + 白描边
                 drawCircle(
                     Brush.radialGradient(
                         listOf(
-                            if (active) Color(0xFF7EB8FF) else Color(0xFF64748B),
-                            if (active) Color(0xFF2F5FA8) else Color(0xFF334155)
+                            if (active) Color(0xFF7EB8FF) else Color(0xFF64748B).copy(alpha = (alpha + 1f) / 2f),
+                            if (active) Color(0xFF2F5FA8) else Color(0xFF334155).copy(alpha = alpha)
                         ),
                         center = k, radius = knobR
                     ),
                     radius = knobR, center = k
                 )
-                drawCircle(Color(0xCCFFFFFF), radius = knobR, center = k, style = Stroke(2.dp.toPx()))
-                // 摇杆头中心点
-                drawCircle(Color(0x88FFFFFF), radius = 3.dp.toPx(), center = k)
-                // 方向指示线（锚点 → 摇杆头）
+                drawCircle(Color(0xCCFFFFFF).copy(alpha = alpha), radius = knobR, center = k, style = Stroke(2.dp.toPx()))
+                drawCircle(Color(0x88FFFFFF).copy(alpha = alpha), radius = 3.dp.toPx(), center = k)
                 if (active && (abs(knob.x) > 1f || abs(knob.y) > 1f)) {
-                    drawLine(Color(0x9960A5FA), a, k, 2.dp.toPx())
+                    drawLine(Color(0x9960A5FA).copy(alpha = alpha), a, k, 2.dp.toPx())
                 }
             }
         }
         Text(
-            buildString {
-                append(label)
-                append(" (")
-                append(String.format(java.util.Locale.US, "%.2f, %.2f", stickX, stickY))
-                append(")")
-            },
-            color = Color(0x88FFFFFF), fontSize = 9.sp, textAlign = TextAlign.Center
+            "$label(${String.format(java.util.Locale.US, "%.2f,%.2f", stickX, stickY)})",
+            color = Color(0x88FFFFFF).copy(alpha = (alpha + 0.6f).coerceAtMost(1f)), fontSize = 8.sp,
+            textAlign = TextAlign.Center
         )
     }
 }
 
-/** 一体化十字键（Xbox 式整体十字；四臂独立按压） */
+/** 一体化十字键（Xbox 式；四臂独立按压） */
 @Composable
-private fun CrossDpad(engine: VirtualGamepadEngine, compact: Boolean = false) {
-    val arm = if (compact) 38.dp else 46.dp
+private fun CrossDpad(engine: VirtualGamepadEngine, compact: Boolean = false, alpha: Float = 1f) {
+    val arm = if (compact) 36.dp else 44.dp
     val shape = RoundedCornerShape(7.dp)
     Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        DpadKey(engine, 12, "▲", arm, shape)
+        DpadKey(engine, 12, "▲", arm, shape, alpha)
         Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-            DpadKey(engine, 14, "◀", arm, shape)
-            Box(Modifier.size(arm).background(Color(0xFF232C38), shape))
-            DpadKey(engine, 15, "▶", arm, shape)
+            DpadKey(engine, 14, "◀", arm, shape, alpha)
+            Box(Modifier.size(arm).background(Color(0xFF232C38).copy(alpha = alpha), shape))
+            DpadKey(engine, 15, "▶", arm, shape, alpha)
         }
-        DpadKey(engine, 13, "▼", arm, shape)
+        DpadKey(engine, 13, "▼", arm, shape, alpha)
     }
 }
 
 @Composable
-private fun DpadKey(engine: VirtualGamepadEngine, btn: Int, label: String, size: androidx.compose.ui.unit.Dp, shape: androidx.compose.foundation.shape.RoundedCornerShape) {
+private fun DpadKey(
+    engine: VirtualGamepadEngine,
+    btn: Int,
+    label: String,
+    size: androidx.compose.ui.unit.Dp,
+    shape: androidx.compose.foundation.shape.RoundedCornerShape,
+    alpha: Float = 1f
+) {
     var pressed by remember { mutableStateOf(false) }
     Box(
         modifier = Modifier
             .size(size)
-            .background(if (pressed) PadColors.ACCENT else Color(0xFF2A3441), shape)
-            .border(1.dp, if (pressed) Color.White else Color(0x33FFFFFF), shape)
+            .background(
+                if (pressed) PadColors.ACCENT.copy(alpha = alpha.coerceAtLeast(0.85f))
+                else keyFace(alpha), shape
+            )
+            .border(1.dp, if (pressed) Color.White else Color(0x33FFFFFF).copy(alpha = alpha), shape)
             .pointerInput(engine, btn) {
                 detectTapGestures(
                     onPress = {
@@ -756,11 +903,11 @@ private fun DpadKey(engine: VirtualGamepadEngine, btn: Int, label: String, size:
             },
         contentAlignment = Alignment.Center
     ) {
-        Text(label, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+        Text(label, color = Color.White.copy(alpha = alpha.coerceAtLeast(0.9f)), fontSize = 14.sp, fontWeight = FontWeight.Bold)
     }
 }
 
-/** 普通按键（v2.7.7：按下渐变高光 + 圆形 ABXY） */
+/** 普通按键（半透明可调） */
 @Composable
 private fun PadBtn(
     label: String,
@@ -768,19 +915,24 @@ private fun PadBtn(
     btn: Int,
     small: Boolean = false,
     round: Boolean = false,
-    accent: Color = Color(0xFF64748B)
+    accent: Color = Color(0xFF64748B),
+    alpha: Float = 1f,
+    size: androidx.compose.ui.unit.Dp? = null
 ) {
     var pressed by remember { mutableStateOf(false) }
-    val w = if (small) 52.dp else 56.dp
-    val h = if (small) 30.dp else 56.dp
+    val w = size ?: if (small) 50.dp else 56.dp
+    val h = if (size != null) size else if (small) 30.dp else 56.dp
     val shape = if (round) CircleShape else RoundedCornerShape(10.dp)
     Box(
         modifier = Modifier
             .size(width = w, height = h)
-            .background(if (pressed) accent else PadColors.KEYFACE, shape)
+            .background(
+                if (pressed) accent.copy(alpha = alpha.coerceAtLeast(0.85f)) else keyFace(alpha),
+                shape
+            )
             .border(
                 if (pressed) 2.dp else 1.dp,
-                if (pressed) Color.White else Color(0x44FFFFFF),
+                if (pressed) Color.White else Color(0x44FFFFFF).copy(alpha = alpha),
                 shape
             )
             .pointerInput(engine, btn) {
@@ -798,52 +950,33 @@ private fun PadBtn(
     ) {
         Text(
             label,
-            color = Color.White,
+            color = Color.White.copy(alpha = alpha.coerceAtLeast(0.9f)),
             fontSize = if (small) 10.sp else 14.sp,
             fontWeight = if (round) FontWeight.Bold else FontWeight.Medium
         )
     }
 }
 
-/** 肩键（LB/RB）：宽扁按钮 */
-@Composable
-private fun ShoulderBtn(label: String, engine: VirtualGamepadEngine, btn: Int) {
-    var pressed by remember { mutableStateOf(false) }
-    Box(
-        modifier = Modifier
-            .size(width = 74.dp, height = 40.dp)
-            .background(if (pressed) PadColors.ACCENT else PadColors.KEYFACE, RoundedCornerShape(12.dp))
-            .border(1.dp, if (pressed) Color.White else Color(0x44FFFFFF), RoundedCornerShape(12.dp))
-            .pointerInput(engine, btn) {
-                detectTapGestures(
-                    onPress = {
-                        pressed = true
-                        engine.setButton(btn, true)
-                        try { awaitRelease() } catch (_: Exception) { }
-                        engine.setButton(btn, false)
-                        pressed = false
-                    }
-                )
-            },
-        contentAlignment = Alignment.Center
-    ) {
-        Text(label, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-    }
-}
-
 /** 扳机（LT/RT）：模拟量垂直填充条 + 数字阈值按钮 */
 @Composable
-private fun TriggerBar(label: String, engine: VirtualGamepadEngine, axis: Int, button: Int, compact: Boolean = false) {
+private fun TriggerBar(
+    label: String,
+    engine: VirtualGamepadEngine,
+    axis: Int,
+    button: Int,
+    compact: Boolean = false,
+    alpha: Float = 1f
+) {
     var value by remember { mutableStateOf(0f) }
-    val h = if (compact) 86.dp else 118.dp
+    val h = if (compact) 76.dp else 108.dp
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(label, color = Color(0x99FFFFFF), fontSize = 10.sp, fontWeight = FontWeight.Medium)
+        Text(label, color = Color(0x99FFFFFF).copy(alpha = (alpha + 0.5f).coerceAtMost(1f)), fontSize = 9.sp, fontWeight = FontWeight.Medium)
         Box(
             modifier = Modifier
-                .width(46.dp)
+                .width(42.dp)
                 .height(h)
-                .background(Color(0x1FFFFFFF), RoundedCornerShape(12.dp))
-                .border(1.dp, Color(0x33FFFFFF), RoundedCornerShape(12.dp))
+                .background(Color(0x1FFFFFFF).copy(alpha = alpha), RoundedCornerShape(12.dp))
+                .border(1.dp, Color(0x33FFFFFF).copy(alpha = alpha), RoundedCornerShape(12.dp))
                 .pointerInput(engine, axis, button) {
                     detectDragGestures { change, _ ->
                         change.consume()
@@ -856,36 +989,37 @@ private fun TriggerBar(label: String, engine: VirtualGamepadEngine, axis: Int, b
                 },
             contentAlignment = Alignment.BottomCenter
         ) {
-            // 填充（渐变：底部亮）
             Box(
                 Modifier
                     .fillMaxWidth()
                     .height(h * value)
                     .background(
                         Brush.verticalGradient(
-                            listOf(Color(0xFF4ADE80).copy(alpha = 0.5f), Color(0xFF4ADE80).copy(alpha = 0.85f))
+                            listOf(
+                                Color(0xFF4ADE80).copy(alpha = alpha * 0.5f),
+                                Color(0xFF4ADE80).copy(alpha = alpha * 0.85f)
+                            )
                         ),
                         RoundedCornerShape(12.dp)
                     )
             )
-            // 中心刻度
-            Box(Modifier.width(2.dp).height(6.dp).background(Color(0x55FFFFFF)))
+            Box(Modifier.width(2.dp).height(6.dp).background(Color(0x55FFFFFF).copy(alpha = alpha)))
         }
-        Text("${(value * 100).toInt()}%", color = Color(0x88FFFFFF), fontSize = 9.sp)
+        Text("${(value * 100).toInt()}%", color = Color(0x88FFFFFF).copy(alpha = alpha), fontSize = 8.sp)
     }
 }
 
 /** 赛车转向：横向拖动条（左摇杆 X 轴） */
 @Composable
-private fun SteeringSlider(engine: VirtualGamepadEngine) {
+private fun SteeringSlider(engine: VirtualGamepadEngine, alpha: Float = 1f) {
     var value by remember { mutableStateOf(0f) }
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text("转向（拖动）", color = Color(0x99FFFFFF), fontSize = 10.sp)
+        Text("转向（拖动）", color = Color(0x99FFFFFF).copy(alpha = alpha), fontSize = 9.sp)
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(54.dp)
-                .background(Color(0x22FFFFFF), RoundedCornerShape(12.dp))
+                .height(50.dp)
+                .background(Color(0x22FFFFFF).copy(alpha = alpha), RoundedCornerShape(12.dp))
                 .pointerInput(engine) {
                     detectDragGestures { change, _ ->
                         change.consume()
@@ -897,16 +1031,16 @@ private fun SteeringSlider(engine: VirtualGamepadEngine) {
                 },
             contentAlignment = Alignment.Center
         ) {
-            Box(Modifier.width(2.dp).height(44.dp).background(Color(0x55FFFFFF)))
+            Box(Modifier.width(2.dp).height(40.dp).background(Color(0x55FFFFFF).copy(alpha = alpha)))
             Box(
                 Modifier
-                    .offset(x = (value / 2f * 300).dp)
-                    .size(width = 18.dp, height = 44.dp)
-                    .background(PadColors.ACCENT, RoundedCornerShape(6.dp))
+                    .offset(x = (value / 2f * 280).dp)
+                    .size(width = 18.dp, height = 40.dp)
+                    .background(PadColors.ACCENT.copy(alpha = alpha.coerceAtLeast(0.8f)), RoundedCornerShape(6.dp))
             )
             Text(
                 "${(value * 100).toInt()}",
-                color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                color = Color.White.copy(alpha = alpha.coerceAtLeast(0.9f)), fontSize = 11.sp, fontWeight = FontWeight.Bold,
                 modifier = Modifier.align(Alignment.CenterEnd).padding(end = 6.dp)
             )
         }
@@ -914,17 +1048,18 @@ private fun SteeringSlider(engine: VirtualGamepadEngine) {
 }
 
 @Composable
-private fun VgChip(label: String, active: Boolean, onClick: () -> Unit) {
+private fun VgChip(label: String, active: Boolean, alpha: Float, onClick: () -> Unit) {
     Box(
         modifier = Modifier
             .background(
-                if (active) Color(0xFF2563EB) else Color(0x33FFFFFF),
-                RoundedCornerShape(8.dp)
+                if (active) Color(0xFF2563EB).copy(alpha = alpha.coerceAtLeast(0.75f))
+                else Color(0x33FFFFFF).copy(alpha = alpha),
+                RoundedCornerShape(7.dp)
             )
             .clickableNoRipple(onClick)
-            .padding(horizontal = 8.dp, vertical = 4.dp)
+            .padding(horizontal = 6.dp, vertical = 2.dp)
     ) {
-        Text(label, color = Color.White, fontSize = 10.sp)
+        Text(label, color = Color.White.copy(alpha = alpha.coerceAtLeast(0.85f)), fontSize = 9.sp)
     }
 }
 

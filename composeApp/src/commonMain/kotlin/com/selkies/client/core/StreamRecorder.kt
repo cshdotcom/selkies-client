@@ -44,6 +44,13 @@ class StreamRecorder(
     var audioFramesWritten: Long = 0
         private set
 
+    /** v2.7.9【修「录完显示 0 秒」】：停止时定格的真实时长（秒）。
+     *  旧版保存回调里调 durationSec()——那时 state 已是 DONE 恒返回 0 →
+     *  保存提示永远「X 帧 · 0s」。 */
+    @Volatile
+    var lastDurationSec: Long = 0
+        private set
+
     @Volatile
     var bytesCaptured: Long = 0
         private set
@@ -160,8 +167,11 @@ class StreamRecorder(
             if (muxer == null) {
                 val p = outputPath ?: return
                 muxer = muxerFactory(p)
-                videoCodecId = 1 // JPEG 将转码 H264
-                videoTrackReady = muxer?.addVideoTrack(1, 0, 0) == true
+                // v2.7.9：codecId 1→0——桌面 muxer 的 JPEG 路径是 MJPEG 直通（要求 addVideoTrack(0)）；
+                //   旧版传 1 = H264 ctx → jpeg 帧全被拒（桌面 jpeg 录屏 0 帧）+ 编码器切换场景
+                //   触发 writeHeader 半初始化崩溃。Android 端 writeJpegFrame 内部自定向（无影响）。
+                videoCodecId = 0
+                videoTrackReady = muxer?.addVideoTrack(0, 0, 0) == true
             }
             val pts = if (lastJpegPts == 0L) ptsNow() else lastJpegPts
             val snapshot = ArrayList(jpegParts)
@@ -202,6 +212,8 @@ class StreamRecorder(
         synchronized(this) {
             if (state != State.RECORDING) return
             state = State.FINALIZING
+            // v2.7.9：先定格真实时长（state 变 DONE 后 durationSec() 会归零）
+            lastDurationSec = (System.currentTimeMillis() - startedAt) / 1000
             flushJpegFrame()
             try {
                 muxer?.let { m ->
@@ -220,7 +232,7 @@ class StreamRecorder(
         if (videoFramesWritten == 0L && audioFramesWritten == 0L) {
             // 空录制：删除文件避免垃圾
             path?.let { runCatching { java.io.File(it).delete() } }
-            onSaved?.invoke(null, 0, "录制内容为空", "empty")
+            onSaved?.invoke(null, 0, "录制内容为空（未收到可写入的视频帧——已自动请求关键帧重试）", "empty")
             return
         }
         onSaved?.invoke(path, frames, error, kind)

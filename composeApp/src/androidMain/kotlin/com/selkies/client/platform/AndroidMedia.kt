@@ -417,6 +417,10 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
     private var videoTrackIdx = -1
     private var audioTrackIdx = -1
     private var muxerStarted = false
+    // v2.7.9【修「录制无法播放」】：真实流尺寸入 MP4 轨（旧版硬编码 16x16——
+    // MediaMuxer 用 format 的宽高写 tkhd，部分播放器依赖轨尺寸 → 播放异常）
+    private var videoW = 0
+    private var videoH = 0
     // 【v2.7.6】close 结果缓存（close 幂等语义：重复调用返回上次结果而非 muxerStarted 已被置 false）
     private var lastCloseOk = false
     private var containerMp4 = true
@@ -425,8 +429,8 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
     private var videoCodec = 1
     private val isAnnexB: Boolean get() = videoCodec == 1 || videoCodec == 5
 
-    // 缓冲（等首关键帧 csd）
-    private val pendingVideo = ArrayList<Pair<ByteArray, Long>>()
+    // 缓冲（等首关键帧 csd）——v2.7.9：三元组保留关键帧标记（冲刷时不再全部当非关键帧）
+    private val pendingVideo = ArrayList<Triple<ByteArray, Long, Boolean>>()
     private val pendingAudio = ArrayList<Pair<ByteArray, Long>>()
     // v2.7.0：缓冲字节累计（防 OOM）
     private var pendingBytes = 0L
@@ -448,6 +452,8 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
             if (realMuxer != null || closed) return false
             videoCodec = if (codecId == 0) 1 else codecId
             containerMp4 = videoCodec == 1 || videoCodec == 5
+            videoW = width
+            videoH = height
             return true // 真正建轨在首关键帧（csd 就绪）
         }
     }
@@ -468,21 +474,25 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
                 if (converted.pps != null) pps = converted.pps
                 if (converted.vps != null) vps = converted.vps
                 if (!gotKeyframe) {
-                    if (!keyframe) return true // 丢弃前导增量帧
+                    // v2.7.9：未写入文件一律返回 false（与桌面 muxer 语义对齐）——
+                    // StreamRecorder 只统计真实写入帧，录屏关键帧重试循环据此持续
+                    // REQUEST_KEYFRAME 直到首帧真正落盘（旧版这里返回 true：前导帧被
+                    // 计入 videoFramesWritten → 重试循环提前停止 → 无 csd 永不启动 →
+                    // 封装失败 + 残留空 MP4 = 「录屏无法播放」链）
+                    if (!keyframe) return false // 丢弃前导增量帧
                     if (sps == null || (videoCodec == 5 && vps == null) || (videoCodec == 1 && pps == null)) {
                         // 关键帧未带参数集：缓冲等下一个
-                        // v2.7.0：帧数与字节双上限（防 OOM 闪退——旧版仅限 240 帧，高码率关键帧可累积 >100MB）
                         val frameBytes = converted.sample.size
                         if (pendingVideo.size < 48 && pendingBytes + frameBytes < 48L * 1024 * 1024) {
-                            pendingVideo.add(converted.sample to ptsUs)
+                            pendingVideo.add(Triple(converted.sample, ptsUs, keyframe))
                             pendingBytes += frameBytes
                         }
-                        return true
+                        return false
                     }
                     gotKeyframe = true
                     startMuxer()
-                    // 冲刷缓冲
-                    for ((s, p) in pendingVideo) writeSample(s, false, p)
+                    // 冲刷缓冲（首个带参数集的关键帧之前缓存的帧）
+                    for ((s, p, kf) in pendingVideo) writeSample(s, kf, p)
                     pendingVideo.clear()
                     pendingBytes = 0L
                 }
@@ -563,9 +573,15 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
             //   native muxer 写入 = SIGSEGV 原生崩溃（Java runCatching 拦不住）。
             //   新顺序：①先置 muxerStarted=false（writeSample 立即拒新）②彻底等编码器线程退出
             //   ③才 stop/release muxer ④置空引用（漏网写入碰 null 检查而非悬垂 native 指针）。
+            // v2.7.9：先捕获 start 状态再置 false（保留 v2.7.6 拒新写入语义）；
+            //   hadStarted=false（含 start() 抛异常）一律走空条目清理，不残留坏文件
+            val hadStarted = muxerStarted
             muxerStarted = false
             var ok = false
-            if (realMuxer != null) {
+            // v2.7.9【修「残留空/坏 MP4」】：muxer 已建但从未 start（无 csd 关键帧）与未建同例——
+            //   旧版这里仍调 stop()（抛异常→ok=false）后 release，但媒体条目不删 →
+            //   Movies/Selkies 留下 0 字节损坏 MP4；统一走空条目清理。
+            if (realMuxer != null && hadStarted) {
                 runCatching { jpegEncoder?.release() }
                 runCatching {
                     realMuxer!!.stop()
@@ -588,6 +604,9 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
                     }
                 } else if (realPath != outputPath) {
                     runCatching { File(realPath).delete() }
+                } else if (videoTrackIdx < 0 && realPath == outputPath) {
+                    // legacy 文件路径模式且从未建轨：删可能已创建的占位文件
+                    runCatching { File(outputPath.removePrefix("selkies-pending://")).delete() }
                 }
             }
             // 【v2.7.6】置空引用：任何残留写入（编码器线程漏网帧）碰 null 检查而非悬垂 native 对象
@@ -683,7 +702,9 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
         if (muxerStarted || realMuxer == null || videoTrackIdx >= 0) return
         val fmt = MediaFormat.createVideoFormat(
             if (videoCodec == 5) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC,
-            16, 16
+            // v2.7.9：真实流尺寸（旧版硬编码 16x16——tkhd 尺寸错误，部分播放器异常）
+            (if (videoW > 0) videoW else 16),
+            (if (videoH > 0) videoH else 16)
         )
         if (videoCodec == 5) {
             val merged = mergeHevcCsd(vps, sps, pps)

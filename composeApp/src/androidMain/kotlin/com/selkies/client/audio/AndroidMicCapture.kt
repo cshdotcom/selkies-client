@@ -232,6 +232,10 @@ class AndroidMicCapture : MicCapture {
             val readBuf = ShortArray(frameSize)
             val info = MediaCodec.BufferInfo()
             var ptsUs = 0L
+            // v2.7.9：统计（观测麦克风真实在发——硬件面板显示上行活动）
+            var framesSent = 0L
+            var lastStatsAt = 0L
+            var lastFramesSent = 0L
             while (running) {
                 // 多设备混音：逐设备读同长帧后平均
                 java.util.Arrays.fill(mixBuf, 0)
@@ -247,7 +251,15 @@ class AndroidMicCapture : MicCapture {
                 // ShortArray → LE bytes
                 java.nio.ByteBuffer.wrap(pcm).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(mixBuf)
 
+                // v2.7.9【修输入帧丢失】：dequeueInputBuffer 返回 -1 时重试而非丢帧
+                //   （旧版直接丢弃 → 编码器忙时无声间歇；最多重试 40ms×20）
                 var idx = enc.dequeueInputBuffer(50_000)
+                var retries = 0
+                while (idx < 0 && retries < 20 && running) {
+                    Thread.sleep(2)
+                    idx = enc.dequeueInputBuffer(50_000)
+                    retries++
+                }
                 if (idx >= 0) {
                     val buf = enc.getInputBuffer(idx)
                     if (buf != null) {
@@ -260,17 +272,34 @@ class AndroidMicCapture : MicCapture {
                 var outIdx = enc.dequeueOutputBuffer(info, 0)
                 while (outIdx >= 0 || outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     if (outIdx >= 0 && info.size > 0) {
-                        val outBuf = enc.getOutputBuffer(outIdx)
-                        if (outBuf != null) {
-                            outBuf.position(info.offset)
-                            outBuf.limit(info.offset + info.size)
-                            val opus = ByteArray(info.size)
-                            outBuf.get(opus)
-                            onOpus?.invoke(opus)
+                        // v2.7.9【协议修复】：过滤 CODEC_CONFIG（OpusHead csd）——
+                        //   部分设备把它作为首个输出 buffer 吐出，旧版未过滤 → 19 字节
+                        //   "OpusHead" 被当 Opus 包发到服务器（官方 web 客户端从不发）。
+                        //   服务器 pcmflux 解码器需要吞掉这个坏包（实测能恢复但脏）。
+                        if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                            // csd 忽略（pcmflux 直接解码 Opus 包，无需 OpusHead）
+                        } else {
+                            val outBuf = enc.getOutputBuffer(outIdx)
+                            if (outBuf != null) {
+                                outBuf.position(info.offset)
+                                outBuf.limit(info.offset + info.size)
+                                val opus = ByteArray(info.size)
+                                outBuf.get(opus)
+                                onOpus?.invoke(opus)
+                                framesSent++
+                            }
                         }
                         enc.releaseOutputBuffer(outIdx, false)
                     }
                     outIdx = enc.dequeueOutputBuffer(info, 0)
+                }
+                // v2.7.9：每 10s 打印一次活性（用户侧日志可诊断「到底在不在发」）
+                val now = System.currentTimeMillis()
+                if (now - lastStatsAt > 10_000 && framesSent > 0) {
+                    val rate = if (lastStatsAt > 0) (framesSent - lastFramesSent) * 1000L / (now - lastStatsAt) else framesSent * 50 / 1000
+                    println("[Selkies][麦克风] 累计 $framesSent 个 Opus 包（最近 ${rate}/s）")
+                    lastStatsAt = now
+                    lastFramesSent = framesSent
                 }
             }
         } catch (e: Exception) {
