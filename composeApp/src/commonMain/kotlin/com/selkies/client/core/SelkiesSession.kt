@@ -170,6 +170,10 @@ class SelkiesSession(
     @Volatile private var decodeOutputStallKeyframeAt = 0L
     /** 【v2.7.7】解码器主动上报错误/溢出（sink → session）：立即强制关键帧，不等看门狗周期 */
     @Volatile private var sinkReportedDecodeIssueAt = 0L
+    // v2.7.10【诊断】会话层帧类型计数（-Dselkies.videodbg 开启；定位服务器实际在发什么流）
+    private val SESSION_DBG = System.getProperty("selkies.videodbg") != null
+    @Volatile private var dbgJpegStripes = 0L
+    @Volatile private var dbgVideoFrames = 0L
     internal fun onSinkDecodeIssue(reason: String) {
         val now = System.currentTimeMillis()
         if (now - sinkReportedDecodeIssueAt < 1500) return  // 限流
@@ -676,7 +680,11 @@ class SelkiesSession(
                 }
             }
             text.startsWith("PIPELINE_RESETTING") -> {
+                // v2.7.10：服务器编码管线重建（录屏关键帧请求/编码器切换等触发）→
+                //    旧参考链全部作废。重置解码器 + 立刻请求关键帧（旧版只 reset 不要关键帧
+                //    = P 帧风暴引发解码端重置风暴 → 原生堆损坏闪退/解码永久停滞）。
                 videoSink?.reset()
+                forceKeyframe()
             }
             text.startsWith("DISPLAY_CONFIG_UPDATE,") -> { /* 多屏配置，v1 仅单屏 */ }
             text.startsWith("cursor,") -> parseCursorShape(text.substring(7))
@@ -1116,6 +1124,10 @@ class SelkiesSession(
                 Protocol.FRAME_JPEG -> {
                     Protocol.parseJpegStripeHeader(data, length)?.let { (frameId, stripeY, off) ->
                         noteVideoChunk(frameId)
+                        if (SESSION_DBG) {
+                            dbgJpegStripes++
+                            if (dbgJpegStripes == 1L || dbgJpegStripes % 120 == 0L) println("[FrameDbg] JPEG 条带 #$dbgJpegStripes frameId=$frameId stripeY=$stripeY")
+                        }
                         videoSink?.onJpegStripe(frameId, stripeY, data, off, length)
                         if (recorder.state == StreamRecorder.State.RECORDING) {
                             recorder.onJpegStripe(frameId, stripeY, data, off, length)
@@ -1125,6 +1137,10 @@ class SelkiesSession(
                 Protocol.FRAME_VIDEO -> {
                     Protocol.parseVideoFrameHeader(data, length)?.let { (header, off) ->
                         noteVideoChunk(header.frameId)
+                        if (SESSION_DBG) {
+                            dbgVideoFrames++
+                            if (dbgVideoFrames == 1L || dbgVideoFrames % 120 == 0L) println("[FrameDbg] VIDEO 帧 #$dbgVideoFrames ${header.width}x${header.height} c${header.codecId}${if (header.keyframe) "K" else ""}")
+                        }
                         // ⚠️【坐标修复】帧头携带真实流尺寸——stream_resolution JSON 缺失/迟到时
                         //    仍能同步视图几何，否则触摸坐标会按错误分辨率映射（点击错位的根源）
                         if (header.width > 0 && header.height > 0) {
@@ -1710,18 +1726,21 @@ class SelkiesSession(
                 // ④【v2.7.7 黑屏根因修复】帧在到达、首帧也解过、但解码输出已停滞 ≥6s：
                 //    参考链断裂（丢帧/溢出/分辨率切换清了解码器）→ 要关键帧重建参考链。
                 //    旧版此处无任何检测 = 用户「动不动黑屏且不自愈」的直接根因（网页版有 GOP 兜底不受影响）。
-                if (firstDecodedFrameAt > 0 && lastReceivedFrameAt > 0 && lastDecodedFrameAt > 0 &&
+                //    v2.7.10【假警报根治】：旧版读 lastDecodedFrameAt——它只在 firstFrameRendered
+                //    StateFlow 状态翻转（仅一次）时更新 → 永远停在首帧时刻 → 视频正常播放也会每 4s
+                //    误报「解码输出停滞」并强制关键帧；生产模式下 >12s 还会重置解码器（触发 avcodec
+                //    重初始化 = 原生崩溃路径）。改读 sink.lastRenderAtMs（每帧发布时更新，真实信号）。
+                val lastRenderMs4 = videoSink?.lastRenderAtMs ?: 0L
+                if (firstDecodedFrameAt > 0 && lastReceivedFrameAt > 0 && lastRenderMs4 > 0 &&
                     now - lastReceivedFrameAt < 4000 &&            // 帧仍在到达
-                    now - lastDecodedFrameAt > 6000 &&             // 但解码输出停滞
+                    now - lastRenderMs4 > 6000 &&                 // 但渲染输出停滞
                     now - decodeOutputStallKeyframeAt > 4000       // 限流
                 ) {
                     decodeOutputStallKeyframeAt = now
-                    println("[Selkies][看门狗] 解码输出停滞 ${now - lastDecodedFrameAt}ms（帧仍在到达）→ 请求关键帧重建参考链")
+                    println("[Selkies][看门狗] 解码输出停滞 ${now - lastRenderMs4}ms（帧仍在到达）→ 请求关键帧重建参考链")
                     forceKeyframe()
                     // 连续两轮（≥12s）仍无解码输出 → 重建解码器（reset 后关键帧重新配置）
-                    // v2.7.9 测试模式（noreconnect）同步禁用重置：容器软渲染下 avcodec 重初始化
-                    // 是原生崩溃路径；真机/真桌面不受影响（v2.7.8 已 121 项断言验证）
-                    if (now - lastDecodedFrameAt > 12000 && !noReconnectForTest) {
+                    if (now - lastRenderMs4 > 12000 && !noReconnectForTest) {
                         println("[Selkies][看门狗] 解码输出长期停滞 → 重置解码器等待关键帧重配置")
                         videoSink?.reset()
                         firstDecodedFrameAt = 0

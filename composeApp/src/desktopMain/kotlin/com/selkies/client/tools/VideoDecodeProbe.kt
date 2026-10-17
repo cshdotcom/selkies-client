@@ -35,10 +35,15 @@ object VideoDecodeProbe {
         val pass = args.getOrNull(3) ?: p("pass", "15068253855z")
 
         val sink = DesktopVideoSink()
+        // v2.7.10：-Dselkies.proberes=WxH 指定流分辨率（复现 GUI 竖屏 410x862 条件）
+        val probeRes = (System.getProperty("selkies.proberes") ?: "").split("x")
+        val rw = probeRes.getOrNull(0)?.toIntOrNull() ?: 0
+        val rh = probeRes.getOrNull(1)?.toIntOrNull() ?: 0
         val server = ServerEntry(
             id = "videoprobe", name = "videoprobe", url = url,
             username = user, password = pass,
-            framerate = 60, encoder = "h264enc", audioEnabled = true
+            framerate = 60, encoder = "h264enc", audioEnabled = true,
+            resolutionW = rw, resolutionH = rh
         )
         val session = SelkiesSession(server, ProbePlatform(sink), { AppSettings() })
         session.videoSink = sink
