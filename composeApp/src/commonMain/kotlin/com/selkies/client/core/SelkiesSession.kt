@@ -163,6 +163,11 @@ class SelkiesSession(
     }
     val micCapture by lazy { platform.makeMicCapture() }
     val webcamCapture by lazy { platform.makeWebcamCapture() }
+    // 【v2.7.6】用户期望的麦克风/摄像头上行状态（区别于 micActive 实际状态）：
+    //   降级 viewer / 服务器发 *_DISABLED 时 micActive 复位但 micWanted 保留——重夺控制权后自动恢复上行。
+    //   旧版只 stop 采集不清 active 标志 = 「麦克风突然无法发送」且点按钮无反应（startMicUplink 早退）根因。
+    @Volatile private var micWanted = false
+    @Volatile private var webcamWanted = false
     val filesClient by lazy { FilesClient(this) }
 
     // ---- v2.7.0：音频停看门狗（AUDIO_STARTED 但服务器无帧 → 自动重启音频管线 + 状态透明化） ----
@@ -533,6 +538,16 @@ class SelkiesSession(
                         connection.sendText(Protocol.resolution(w, h, server.displayId))
                         connection.sendText("START_VIDEO")
                         if (server.audioEnabled) connection.sendText("START_AUDIO")
+                        // 【v2.7.6】重连后恢复之前开启的麦克风/摄像头上行：
+                        //   服务器单主人策略下被顶替会 KILL 本连接；重连成功 = 重新成为
+                        //   controller——若用户之前开着麦克风/摄像头（micWanted/webcamWanted），
+                        //   旧版重连后按钮显示「开」但采集早已停止 = 又一个「突然无法发送」路径。
+                        if (micWanted && !micActive.value && !server.viewOnly) {
+                            runCatching { startMicUplink() }
+                        }
+                        if (webcamWanted && !webcamActive.value && !server.viewOnly) {
+                            runCatching { startWebcamUplink() }
+                        }
                         subscribeStats()
                         armStartVideoWatchdog()
                     }
@@ -570,8 +585,31 @@ class SelkiesSession(
                 audioStallNotice.value = null
                 runCatching { audioPlayer.stop() }
             }
-            text == "MICROPHONE_DISABLED" -> { runCatching { micCapture.stop() } }
-            text == "WEBCAM_DISABLED" -> { runCatching { webcamCapture.stop() } }
+            text == "MICROPHONE_DISABLED" -> {
+                // 【v2.7.6】官方 websockets_mode.py：查看者角色 / 音频错误 / 锁定禁用都会发此消息并丢弃上行帧。
+                //   旧版只 stop 采集但不清 micActive → 按钮看起来开着却永久无数据、重新点击也无反应
+                //   （startMicUplink 的 active 早退分支直接 return true）= 用户「麦克风突然无法发送、
+                //   远程无法识别」根因。现在：复位 active + 透明提示（保留 micWanted 供角色恢复后自启）。
+                val wasActive = micActive.value
+                runCatching { micCapture.stop() }
+                if (wasActive) {
+                    micActive.value = false
+                    notices.value = "服务器已停用麦克风上行" + if (role.value == "viewer") {
+                        "（当前为查看者角色——多端占用会被降级；夺回控制权后自动恢复，或重新点麦克风按钮）"
+                    } else "（可重新点麦克风按钮恢复）"
+                }
+            }
+            text == "WEBCAM_DISABLED" -> {
+                // 【v2.7.6】同麦克风：复位 webcamActive（旧版永久卡死在上行中）
+                val wasActive = webcamActive.value
+                runCatching { webcamCapture.stop() }
+                if (wasActive) {
+                    webcamActive.value = false
+                    notices.value = "服务器已停用摄像头上行" + if (role.value == "viewer") {
+                        "（当前为查看者角色；夺回控制权后自动恢复，或重新点摄像头按钮）"
+                    } else "（可重新点摄像头按钮恢复）"
+                }
+            }
             text == "WEBCAM_KEYFRAME" -> { webcamCapture.requestKeyframe() }
             text.startsWith("CAPTURE_DEMAND ") -> {
                 val parts = text.split(" ")
@@ -654,10 +692,24 @@ class SelkiesSession(
             if (json is kotlinx.serialization.json.JsonObject) {
                 val r = (json["role"] as? kotlinx.serialization.json.JsonPrimitive)?.content
                 if (r != null) {
+                    val was = role.value
                     role.value = r
                     if (r == "viewer") {
                         // 查看者模式：无键鼠输入权限
                         statusDetail.value = "以查看者身份连接"
+                    }
+                    // 【v2.7.6】重夺控制权（viewer → controller）：自动恢复之前开启的麦克风/摄像头上行。
+                    //   降级期间服务器丢弃上行帧并发 *_DISABLED（micActive 已复位但 micWanted 保留）；
+                    //   旧版恢复控制权后按钮状态错乱、永远发不出去 = 「突然无法发送无法恢复」。
+                    if (was == "viewer" && r != "viewer") {
+                        if (micWanted && !micActive.value) {
+                            runCatching { startMicUplink() }
+                            if (micActive.value) notices.value = "已恢复麦克风上行（重新获得控制权）"
+                        }
+                        if (webcamWanted && !webcamActive.value) {
+                            runCatching { startWebcamUplink() }
+                            if (webcamActive.value) notices.value = "已恢复摄像头上行（重新获得控制权）"
+                        }
                     }
                 }
             }
@@ -1678,8 +1730,9 @@ class SelkiesSession(
             micActive.value = false
             return false
         }
-        if (micActive.value || micCapture.active) { micActive.value = true; return true }
+        if (micActive.value || micCapture.active) { micActive.value = true; micWanted = true; return true }
         micActive.value = true
+        micWanted = true
         if (!serverMicEnabled.value) {
             notices.value = "服务器麦克风默认关闭，已按需开启上行"
         }
@@ -1704,6 +1757,8 @@ class SelkiesSession(
     }
 
     fun stopMicUplink() {
+        // 【v2.7.6】用户主动停止 → 清除期望状态（角色恢复后不再自启）；服务器侧 DISABLED 不走这里
+        micWanted = false
         micActive.value = false
         runCatching { micCapture.stop() }
     }
@@ -1715,8 +1770,9 @@ class SelkiesSession(
             webcamActive.value = false
             return false
         }
-        if (webcamActive.value || webcamCapture.active) { webcamActive.value = true; return true }
+        if (webcamActive.value || webcamCapture.active) { webcamActive.value = true; webcamWanted = true; return true }
         webcamActive.value = true
+        webcamWanted = true
         webcamCapture.start(
             encoder = server.webcamEncoder,
             deviceId = selectedCameraId.value,
@@ -1743,6 +1799,8 @@ class SelkiesSession(
     }
 
     fun stopWebcamUplink() {
+        // 【v2.7.6】同麦克风：用户主动停止才清期望状态
+        webcamWanted = false
         webcamActive.value = false
         runCatching { webcamCapture.stop() }
     }

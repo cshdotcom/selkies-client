@@ -199,6 +199,21 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     var toolbarVisible by remember { mutableStateOf(true) }
     // v2.7.0：全屏工具栏自动隐藏（不遮挡远程控制区；边缘唤出）
     var toolbarShowAt by remember { mutableStateOf(System.currentTimeMillis()) }
+    // 【v2.7.6】工具栏唤出把手不再常驻：隐藏工具栏后只显示 4 秒即自动淡出（零遮挡）。
+    //   用户截图实证：「显示工具栏」胶囊常驻顶部挡住远程 Edge 标签栏/关闭按钮。
+    //   恢复工具栏三条路径：①顶/底边缘向内滑 >28px（v2.7.6 起不限全屏）②鼠标移近顶/底边缘
+    //   （桌面）③顶部边缘轻触 → 把手闪现 4s 可点击。每次隐藏/闪现 epoch+1 重启计时。
+    var handleVisible by remember { mutableStateOf(false) }
+    var handleEpoch by remember { mutableStateOf(0) }
+    androidx.compose.runtime.LaunchedEffect(handleEpoch, toolbarVisible) {
+        if (toolbarVisible) {
+            handleVisible = false
+        } else {
+            handleVisible = true
+            kotlinx.coroutines.delay(4000)
+            handleVisible = false
+        }
+    }
     var floatingKb by remember { mutableStateOf(false) }
     // v2.7.2：悬浮键盘文本合成条焦点（false = 键盘打开但无文本框聚焦 → 桌面物理键直通远程）
     var kbTextFocused by remember { mutableStateOf(false) }
@@ -756,8 +771,9 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                     }
                                     PointerEventType.Move -> {
                                         val pos = changes.first().position
-                                        // v2.7.0：全屏时鼠标移到顶部/底部边缘 → 唤出工具栏
-                                        if (fullscreen && !toolbarVisible &&
+                                        // 【v2.7.6】鼠标移到顶部/底部边缘 → 唤出工具栏（不再限全屏：
+                                        //   非全屏隐藏工具栏后同样可唤回，把手已非常驻必须留唤出途径）
+                                        if (!toolbarVisible &&
                                             (pos.y <= edgeRevealPx || pos.y >= viewSize.height - edgeRevealPx)
                                         ) {
                                             toolbarShowAt = System.currentTimeMillis()
@@ -820,6 +836,11 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                             pressPos.y <= 12f -> -1
                                             pressPos.y >= viewSize.height - 12f -> 1
                                             else -> 0
+                                        }
+                                        // 【v2.7.6】顶部/底部边缘轻触（未滑动）→ 闪现把手 4s（可发现性；
+                                        //   把手已不常驻，用户需要入口提示；触摸照常发送远程不受影响）
+                                        if (pressFromEdge != 0 && !toolbarVisible) {
+                                            handleEpoch++
                                         }
                                         touchMoved = false
                                         longFired = false
@@ -892,7 +913,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                         // >28px 才唤出工具栏；任何缩放状态均可用（v2.7.0 旧逻辑错嵌在放大镜
                                         // 分支内，未放大时不生效，且「移动到边缘即唤出」会误触——点击远程画面
                                         // 顶部标签栏/任务栏时把工具栏唤出来挡住，正是用户报的「阻挡部分触屏」）。
-                                        if (fullscreen && !toolbarVisible && pressFromEdge != 0) {
+                                        // 【v2.7.6】不再限全屏：非全屏隐藏工具栏后同样可边缘唤回（把手不常驻了）。
+                                        if (!toolbarVisible && pressFromEdge != 0) {
                                             val inward = if (pressFromEdge < 0) pos.y - pressOrigin.y else pressOrigin.y - pos.y
                                             if (inward > 28f) {
                                                 toolbarShowAt = System.currentTimeMillis()
@@ -1130,22 +1152,23 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             }
         }
 
-        // 隐藏工具栏后的唤出按钮
-        // v2.7.1：全屏时缩成小把手（84×20dp、低透明度）——大胶囊本身也挡远程画面顶部触屏；
-        // 全屏主要靠「边缘内滑」唤出，把手只是提示入口；非全屏保持原尺寸
-        if (!toolbarVisible && status == SelkiesSession.Status.CONNECTED) {
+        // 隐藏工具栏后的唤出把手
+        // 【v2.7.6】不再常驻遮挡：仅出现 4 秒自动淡出（修「显示工具栏还是有遮挡」）；
+        // 顶/底边缘内滑（全模式）、鼠标移近边缘（桌面）、顶/底边缘轻触闪现——三条唤出途径。
+        androidx.compose.animation.AnimatedVisibility(
+            visible = handleVisible && !toolbarVisible && status == SelkiesSession.Status.CONNECTED,
+            enter = androidx.compose.animation.fadeIn(),
+            exit = androidx.compose.animation.fadeOut(animationSpec = androidx.compose.animation.core.tween(600)),
+            modifier = Modifier.align(Alignment.TopCenter)
+        ) {
             Box(
                 modifier = Modifier
-                    .align(Alignment.TopCenter)
                     .statusBarsPadding()
-                    .padding(top = 4.dp)
-                    .size(
-                        width = if (fullscreen) 84.dp else 120.dp,
-                        height = if (fullscreen) 20.dp else 26.dp
-                    )
+                    .padding(top = 2.dp)
+                    .size(width = 78.dp, height = 18.dp)
                     .background(
-                        Color.Black.copy(alpha = if (fullscreen) 0.22f else 0.35f),
-                        RoundedCornerShape(if (fullscreen) 10.dp else 13.dp)
+                        Color.Black.copy(alpha = if (fullscreen) 0.22f else 0.32f),
+                        RoundedCornerShape(9.dp)
                     )
                     .clickable {
                         toolbarShowAt = System.currentTimeMillis()
@@ -1154,9 +1177,9 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    if (fullscreen) "▼ 工具栏" else "显示工具栏",
-                    color = Color.White.copy(alpha = if (fullscreen) 0.75f else 1f),
-                    fontSize = 10.sp,
+                    "▼ 工具栏",
+                    color = Color.White.copy(alpha = if (fullscreen) 0.75f else 0.9f),
+                    fontSize = 9.sp,
                     modifier = Modifier.padding(2.dp)
                 )
             }

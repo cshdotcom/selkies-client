@@ -123,7 +123,10 @@ class AndroidMediaStoreBridge(
             val uri = ctx.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
                 ?: return null
             ctx.contentResolver.openOutputStream(uri)?.use { it.write(png) }
-            uri.toString()
+            // 【v2.7.6】返回真实绝对路径而非 content:// URI（用户反馈「文件位置显示有问题」：
+            //   保存引导弹窗/媒体库直接展示 content://media/external/images/media/71191 对用户
+            //   不可认知也无法打开。与下载路径修复对齐：查 DATA 列，失败回退构造可读路径）
+            mediaStoreRealPath(uri, "/storage/emulated/0/Pictures/Selkies/$fileName")
         } else {
             val dir = legacyDir(Environment.DIRECTORY_PICTURES)
             val f = uniqueFile(dir, fileName)
@@ -148,7 +151,8 @@ class AndroidMediaStoreBridge(
             val uri = ctx.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
                 ?: return null
             ctx.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-            uri.toString()
+            // 【v2.7.6】真实绝对路径（同 saveScreenshot 修复）
+            mediaStoreRealPath(uri, "/storage/emulated/0/Download/Selkies/$fileName")
         } else {
             val dir = legacyDir(Environment.DIRECTORY_DOWNLOADS)
             val f = uniqueFile(dir, fileName)
@@ -333,6 +337,19 @@ class AndroidMediaStoreBridge(
         }
     }
 
+    /**
+     * 【v2.7.6】MediaStore URI → 真实绝对路径（用户可认知的 /storage/emulated/0/... 形态）。
+     * 查询 DATA 列；查不到（部分 ROM 返回空）回退 [fallback]（按 RELATIVE_PATH 规则构造的可读路径）。
+     * 修复：截图/录屏保存后弹窗与媒体库显示 content://media/external/images/media/71191。
+     */
+    private fun mediaStoreRealPath(uri: Uri, fallback: String): String {
+        return runCatching {
+            ctx.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DATA), null, null, null)?.use { c ->
+                if (c.moveToFirst()) c.getString(0)?.takeIf { it.isNotBlank() } else null
+            }
+        }.getOrNull() ?: fallback
+    }
+
     private fun mimeOf(name: String): String = when {
         name.endsWith(".png", true) -> "image/png"
         name.endsWith(".jpg", true) || name.endsWith(".jpeg", true) -> "image/jpeg"
@@ -380,6 +397,8 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
     private var videoTrackIdx = -1
     private var audioTrackIdx = -1
     private var muxerStarted = false
+    // 【v2.7.6】close 结果缓存（close 幂等语义：重复调用返回上次结果而非 muxerStarted 已被置 false）
+    private var lastCloseOk = false
     private var containerMp4 = true
 
     // 视频 codec（1=h264 2=vp8 3=vp9 5=h265）
@@ -470,12 +489,14 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
                 }
                 return true
             }
+            // 【v2.7.6】本地引用快照（close() 并发置空防护）
+            val m = realMuxer ?: return false
             if (audioTrackIdx < 0) return false // 启动时无音频数据 → 不再补轨
             if (ptsUs <= lastAudioPts) return true
             val buf = ByteBuffer.allocate(data.size)
             buf.put(data); buf.flip()
             val info = MediaCodec.BufferInfo().apply { set(0, data.size, ptsUs, 0) }
-            val ok = runCatching { realMuxer!!.writeSampleData(audioTrackIdx, buf, info) }.isSuccess
+            val ok = runCatching { m.writeSampleData(audioTrackIdx, buf, info) }.isSuccess
             if (ok) { lastAudioPts = ptsUs; audioSamplesWritten++ }
             return ok
         }
@@ -514,10 +535,17 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
 
     override fun close(): Boolean {
         synchronized(lock) {
-            if (closed) return muxerStarted
+            if (closed) return lastCloseOk
             closed = true
+            // 【v2.7.6】录屏结束闪退根因修复（use-after-free 竞态）：
+            //   旧版顺序 = jpegEncoder.release()（join 仅 800ms，超时即放弃）→ MediaMuxer.stop()/
+            //   release() → 但编码器 drain 线程可能仍活着并调 writeSampleData() → 对已释放的
+            //   native muxer 写入 = SIGSEGV 原生崩溃（Java runCatching 拦不住）。
+            //   新顺序：①先置 muxerStarted=false（writeSample 立即拒新）②彻底等编码器线程退出
+            //   ③才 stop/release muxer ④置空引用（漏网写入碰 null 检查而非悬垂 native 指针）。
+            muxerStarted = false
             var ok = false
-            if (muxerStarted && realMuxer != null) {
+            if (realMuxer != null) {
                 runCatching { jpegEncoder?.release() }
                 runCatching {
                     realMuxer!!.stop()
@@ -542,6 +570,11 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
                     runCatching { File(realPath).delete() }
                 }
             }
+            // 【v2.7.6】置空引用：任何残留写入（编码器线程漏网帧）碰 null 检查而非悬垂 native 对象
+            realMuxer = null
+            videoTrackIdx = -1
+            audioTrackIdx = -1
+            lastCloseOk = ok
             return ok
         }
     }
@@ -596,11 +629,12 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
                 val uri = ctx.contentResolver.insert(collection, cv) ?: return false
                 docUri = uri
                 // v2.7.5：MediaStore 录屏也解析真实绝对路径（对齐下载修复）
+                // 【v2.7.6】回退构造可读路径而非 uri.toString()（content:// 对用户不可认知）
                 realPath = runCatching {
                     ctx.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DATA), null, null, null)?.use { c ->
                         if (c.moveToFirst()) c.getString(0) else null
                     }
-                }.getOrNull() ?: uri.toString()
+                }.getOrNull() ?: "/storage/emulated/0/Movies/Selkies/$fileName"
                 pfd = ctx.contentResolver.openFileDescriptor(uri, "rw")
                 realMuxer = MediaMuxer(
                     pfd!!.fileDescriptor,
@@ -668,6 +702,8 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
     }
 
     private fun writeSample(sample: ByteArray, keyframe: Boolean, ptsUs: Long): Boolean {
+        // 【v2.7.6】本地引用快照（close() 可能并发置空 realMuxer）+ muxerStarted 拒新
+        val m = realMuxer ?: return false
         if (!muxerStarted || videoTrackIdx < 0) return false
         if (ptsUs <= lastVideoPts) return true
         val buf = ByteBuffer.allocate(sample.size)
@@ -675,7 +711,7 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
         val info = MediaCodec.BufferInfo().apply {
             set(0, sample.size, ptsUs, if (keyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
         }
-        val ok = runCatching { realMuxer!!.writeSampleData(videoTrackIdx, buf, info) }.isSuccess
+        val ok = runCatching { m.writeSampleData(videoTrackIdx, buf, info) }.isSuccess
         if (ok) lastVideoPts = ptsUs
         return ok
     }
@@ -895,13 +931,23 @@ private class JpegH264Encoder(
     }
 
     fun release() {
+        // 【v2.7.6】彻底等 drain 线程退出（旧版 join 仅 800ms——超时后 muxer 被释放而线程
+        //   还在跑 = 录屏结束闪退根因；native writeSampleData 悬垂指针无法被 Java 捕获）
         running.set(false)
         runCatching { codec?.signalEndOfInputStream() }
-        runCatching { thread?.join(800) }
+        val t = thread
+        if (t != null && t.isAlive) {
+            runCatching { t.join(2500) }
+            if (t.isAlive) {
+                // 二次等待：编码器清尾缓冲可能慢；期间 writeSample 已被 muxerStarted=false 拦新
+                runCatching { t.join(1500) }
+            }
+        }
         runCatching { inputSurface?.release() }
         runCatching { codec?.stop(); codec?.release() }
         codec = null
         inputSurface = null
+        thread = null
     }
 }
 
