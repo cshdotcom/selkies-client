@@ -237,7 +237,6 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     var inputMode by remember { mutableStateOf(if (state.store.settings.value.touchMouseMode) InputMode.TRACKPAD else InputMode.TOUCH) }
     var showModeSelector by remember { mutableStateOf(false) }
     var exitConfirm by remember { mutableStateOf(false) }
-    var pendingDrag by remember { mutableStateOf(false) } // 触摸板双击后按住拖动
 
     // v2.5.0：截图/录屏/音量/保存引导
     var recording by remember { mutableStateOf(false) }
@@ -719,7 +718,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                         var twoFingerStart = 0L
                         var twoFingerDist = 0f
                         var twoFingerMoved = false
-                        var lastTapUpAt = 0L            // 双击检测
+                        var lastTapUpAt = 0L            // v2.7.11：TRACKPAD 上次轻点完成时刻（双击窗口判定）
 
                         // ---- v2.7.0：桌面鼠标拖拽 = 放大镜平移（纯本地）；全屏边缘唤出工具栏 ----
                         // 放大状态：左键按下不动→松开 = 远程点击（延迟决策）；拖动 = 本地平移；中键拖动 = 平移
@@ -751,7 +750,11 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
 
                         while (true) {
                             // 长按计时：单指按下未移动未触发时，等到 LONG_PRESS_MS
-                            val needTimer = touches.size == 1 && !touchMoved && !longFired && !pendingDrag && !viewOnly &&
+                            // 【v2.7.11 拖动保护】已发送左键按下（leftDownSent）时绝不触发长按右键——
+                            //   按住文字/文件稍一停顿（>480ms）就被掐断左键+弹右键菜单 =
+                            //   「拖动经常拖不了/选择文字弄不了」主根因。右键有双指轻点兜底（TOUCH）
+                            //   或长按仅限未发键时（TRACKPAD）。
+                            val needTimer = touches.size == 1 && !touchMoved && !longFired && !viewOnly && !leftDownSent &&
                                     (inputMode == InputMode.TOUCH || inputMode == InputMode.TRACKPAD)
                             val waitMs = if (needTimer) {
                                 (LONG_PRESS_MS - (System.currentTimeMillis() - pressStart)).coerceIn(16L, LONG_PRESS_MS)
@@ -814,11 +817,17 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                             }
                                             event.secondaryPressed() -> rightClickAt(pos)
                                             event.primaryPressed() -> {
-                                                // v2.7.0：放大状态左键拖拽 = 本地平移（点击在松手时判定）；未放大 = 左键点击
+                                                // v2.7.0：放大状态左键拖拽 = 本地平移（点击在松手时判定）
+                                                // 【v2.7.11】未放大：标准鼠标语义——按下只发左键按下（松手时抬起）。
+                                                //   旧版此处发 down+up 完整点击对 → 远程收到 down,up,down+move…
+                                                //   拖动前多出一次点击（选择起点被重置）= 桌面拖文字/拖文件不灵敏根因之一。
                                                 if (localZoom > 1.01f) {
                                                     mousePanActive = true
                                                     mousePanLast = pos
-                                                } else leftClickAt(pos)
+                                                } else if (!viewOnly) {
+                                                    val (x, y) = mapToStream(pos)
+                                                    session.sendMouseMove(x, y, Protocol.BUTTON_LEFT)
+                                                }
                                             }
                                         }
                                         changes.forEach { it.consume() }
@@ -906,17 +915,23 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                             toolbarVisible = false
                                         }
                                         if (!viewOnly) {
-                                            if (localZoom > 1.01f) {
-                                                // v2.7.0：放大状态单指拖动 = 本地平移；点击延迟到松手判定
-                                            } else if (inputMode == InputMode.TOUCH) {
-                                                // 直接模式：按下即左键按下（零延迟）
+                                            if (inputMode == InputMode.TOUCH) {
+                                                // 直接模式：按下即左键按下（零延迟）。
+                                                // 【v2.7.11】放大状态同样直发——拖动/选择文字是远程操作；
+                                                //   旧版放大状态（zoom>1.01，双指缩放后未恢复 1.0）单指被抢为
+                                                //   本地平移不发远程 =「拖不了」根因之一。平移由双指承担。
                                                 val (x, y) = mapToStream(pressPos)
                                                 session.sendMouseMove(x, y, Protocol.BUTTON_LEFT)
                                                 leftDownSent = true
-                                            } else if (pendingDrag) {
-                                                // 触摸板双击后按住 = 拖动
-                                                session.sendMouseMoveRelative(0, 0, Protocol.BUTTON_LEFT)
-                                                leftDownSent = true
+                                            } else {
+                                                // 【v2.7.11】触摸板双击拖动实装：双击窗口内再按 = 按住左键。
+                                                //   第二击不动松手 = 自然构成双击（down,up,down,up）；
+                                                //   第二击按住拖动 = 按住左键拖拽。旧版 pendingDrag 恒 false
+                                                //   （从未有人置 true）= 触摸板模式拖动完全不可用的根因。
+                                                if (System.currentTimeMillis() - lastTapUpAt < TAP_MAX_MS) {
+                                                    session.sendMouseMoveRelative(0, 0, Protocol.BUTTON_LEFT)
+                                                    leftDownSent = true
+                                                }
                                             }
                                         }
                                     } else if (touches.size == 2) {
@@ -964,9 +979,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                             touchMoved = true
                                         }
                                         // v2.7.1【边缘滑动唤出·防误触】：起点在屏幕顶/底边缘带(12px)内且向内滑动
-                                        // >28px 才唤出工具栏；任何缩放状态均可用（v2.7.0 旧逻辑错嵌在放大镜
-                                        // 分支内，未放大时不生效，且「移动到边缘即唤出」会误触——点击远程画面
-                                        // 顶部标签栏/任务栏时把工具栏唤出来挡住，正是用户报的「阻挡部分触屏」）。
+                                        // >28px 才唤出工具栏；任何缩放状态均可用。
                                         // 【v2.7.6】不再限全屏：非全屏隐藏工具栏后同样可边缘唤回（把手不常驻了）。
                                         if (!toolbarVisible && pressFromEdge != 0) {
                                             val inward = if (pressFromEdge < 0) pos.y - pressOrigin.y else pressOrigin.y - pos.y
@@ -976,12 +989,13 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                                 pressFromEdge = 0
                                             }
                                         }
-                                        if (localZoom > 1.01f) {
-                                            // v2.7.0：放大状态单指拖动 = 本地平移画面（不控远程；可拖到未显示区域后轻点）
-                                            if (touchMoved) {
-                                                panLocalBy(touchChanges.first().positionChange())
-                                            }
-                                        } else if (!viewOnly && touchMoved) {
+                                        // 【v2.7.11 零死区】旧版 touchMoved（>18px）达标前丢弃全部 move——
+                                        //   左键已按住（TOUCH 按下即发/TRACKPAD 双击拖动）时前段拖动位移被吞
+                                        //   = 文字选择起点丢失、小距离拖动完全无效的根因。现在逐事件直发；
+                                        //   touchMoved 只保留 UI 语义（长按取消/点击判定）。
+                                        // 【v2.7.11】删除旧版「放大状态单指 = 本地平移」分支——放大后单指
+                                        //   拖动重新发给远程；平移由双指稳定拖动承担（下方 touches>=2 分支）。
+                                        if (!viewOnly) {
                                             if (inputMode == InputMode.TOUCH) {
                                                 val (x, y) = mapToStream(pos)
                                                 session.sendMouseMove(x, y, if (leftDownSent) Protocol.BUTTON_LEFT else 0)
@@ -989,9 +1003,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                                 val d = deltaToStream(touchChanges.first().positionChange())
                                                 session.sendMouseMoveRelative(
                                                     d.x.roundToInt(), d.y.roundToInt(),
-                                                    if (leftDownSent || pendingDrag) Protocol.BUTTON_LEFT else 0
+                                                    if (leftDownSent) Protocol.BUTTON_LEFT else 0
                                                 )
-                                                if (pendingDrag && !leftDownSent) leftDownSent = true
                                             }
                                         }
                                         pressPos = pos
@@ -1014,28 +1027,28 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                             val tapDur = System.currentTimeMillis() - pressStart
                                             when (inputMode) {
                                                 InputMode.TOUCH -> {
-                                                    if (localZoom > 1.01f) {
-                                                        // v2.7.0：放大状态轻点 = 远程点击（延迟判定；坐标已含缩放映射）
-                                                        if (!touchMoved && !longFired && tapDur < TAP_MAX_MS && !viewOnly) {
-                                                            leftClickAt(pressPos)
-                                                        }
-                                                    } else {
-                                                        // 松手：释放左键（按下时已发）
-                                                        endTouchSession(true)
-                                                    }
+                                                    // 【v2.7.11】统一收尾：松手 = 释放左键（按下时已发）。
+                                                    //   不动=完整点击；移动=拖动/选择完成。删除旧版放大状态
+                                                    //   「延迟点击」分支——按下已发左键，重复补点击会双击误触。
+                                                    endTouchSession(true)
                                                 }
                                                 InputMode.TRACKPAD -> {
-                                                    if (!viewOnly && !touchMoved && !longFired) {
+                                                    if (leftDownSent) {
+                                                        // 【v2.7.11】双击窗口内第二击按住中：松手 = 左键抬起。
+                                                        //   不动 = 双击完成（down,up,down,up）；移动 = 拖动完成。
+                                                        endTouchSession(true)
+                                                    } else if (!viewOnly && !touchMoved && !longFired) {
                                                         if (tapDur < TAP_MAX_MS) {
-                                                            // 轻触 = 左键（两次快速轻触自然构成双击，
-                                                            // 远程桌面自行识别，无需额外注入）
+                                                            // 轻触 = 左键（两次快速轻触自然构成双击）
                                                             trackpadClick(Protocol.BUTTON_LEFT)
+                                                            // v2.7.11：记录轻点完成时刻——下次按下在窗口内
+                                                            // 即为「双击后按住拖动」的起点
+                                                            lastTapUpAt = System.currentTimeMillis()
                                                         }
                                                         // 超长按且未发左键 → 长按右键已在超时分支处理
                                                     } else {
                                                         endTouchSession(true)
                                                     }
-                                                    pendingDrag = false
                                                 }
                                             }
                                         }
@@ -1905,20 +1918,18 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         ModeOption(
                             title = "触屏模式（直接）",
-                            desc = "手指点哪里就在哪里点击，按下即响应；拖动即拖拽，双指滚动/缩放，长按或双指轻点=右键",
+                            desc = "手指点哪里就在哪里点击，按下即响应；按住拖动=拖拽（选文字/拖文件不中断），双指轻点=右键，双指滚动/缩放",
                             selected = inputMode == InputMode.TOUCH
                         ) {
                             inputMode = InputMode.TOUCH
-                            pendingDrag = false
                             showModeSelector = false
                         }
                         ModeOption(
                             title = "鼠标模式（触摸板）",
-                            desc = "手指滑动移动远程光标（相对），轻点=左键，长按/双指点=右键，双击后按住拖动，双指滚动",
+                            desc = "手指滑动移动远程光标（相对），轻点=左键，快速双击=双击，双击后按住拖动=拖拽，长按=右键，双指滚动",
                             selected = inputMode == InputMode.TRACKPAD
                         ) {
                             inputMode = InputMode.TRACKPAD
-                            pendingDrag = false
                             showModeSelector = false
                         }
                     }

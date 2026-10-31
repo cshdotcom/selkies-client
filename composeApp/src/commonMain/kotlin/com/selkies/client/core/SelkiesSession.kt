@@ -1547,6 +1547,8 @@ class SelkiesSession(
 
     // v2.7.2：按键链路追踪（-Dselkies.keytrace 开启；实测物理/软键盘输入是否真正发出）
     private val keyTrace = System.getProperty("selkies.keytrace") != null
+    // v2.7.11：鼠标链路追踪（-Dselkies.mousetrace 开启；实测拖动/选择文字的 m 事件序列与按键掩码）
+    private val mouseTrace = System.getProperty("selkies.mousetrace") != null
     /** v2.7.9 测试开关：禁用看门狗重连升级（无头容器软渲染环境专用） */
     private val noReconnectForTest = System.getProperty("selkies.noreconnect") != null
 
@@ -1591,6 +1593,7 @@ class SelkiesSession(
     }
 
     fun sendMouseMove(x: Int, y: Int, mask: Int) = post {
+        if (mouseTrace) println("[Selkies][MouseTrace] m,$x,$y,$mask")
         connection.sendText(Protocol.mouseMove(x, y, mask, nextPointerSeq()))
         // 本地回显光标位置（服务器无位置回显时由本地维护）
         cursorX.value = x.toFloat()
@@ -1598,6 +1601,7 @@ class SelkiesSession(
     }
 
     fun sendMouseMoveRelative(dx: Int, dy: Int, mask: Int) = post {
+        if (mouseTrace) println("[Selkies][MouseTrace] m2,$dx,$dy,$mask")
         connection.sendText(Protocol.mouseMoveRelative(dx, dy, mask, nextPointerSeq()))
         // 虚拟光标累加并限制在流范围内
         if (dx != 0 || dy != 0) {

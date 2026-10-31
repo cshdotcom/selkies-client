@@ -59,6 +59,26 @@ object GuiProbe {
                         robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK)
                         println("[drag] $arg")
                     }
+                    // v2.7.11：按住停顿后拖动（draghold:x1,y1,x2,y2,holdMs,moveMs）
+                    // = 用户「按住文字/文件瞄一眼再拖」的真实操作时序
+                    "draghold" -> {
+                        val v = arg.split(",")
+                        val (x1, y1, x2, y2) = listOf(v[0].toInt(), v[1].toInt(), v[2].toInt(), v[3].toInt())
+                        val holdMs = v[4].toLong()
+                        val moveMs = v[5].toLong()
+                        robot.mouseMove(x1, y1)
+                        Thread.sleep(150)
+                        robot.mousePress(InputEvent.BUTTON1_DOWN_MASK)
+                        Thread.sleep(holdMs)
+                        val t0 = System.currentTimeMillis()
+                        while (System.currentTimeMillis() - t0 < moveMs) {
+                            val f = (System.currentTimeMillis() - t0).toDouble() / moveMs
+                            robot.mouseMove((x1 + (x2 - x1) * f).toInt(), (y1 + (y2 - y1) * f).toInt())
+                            Thread.sleep(14)
+                        }
+                        robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK)
+                        println("[draghold] $arg")
+                    }
                     "type" -> {
                         for (c in arg) {
                             val code = KeyEvent.getExtendedKeyCodeForChar(c.code)
