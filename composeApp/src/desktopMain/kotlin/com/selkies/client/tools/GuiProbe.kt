@@ -79,6 +79,19 @@ object GuiProbe {
                         robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK)
                         println("[draghold] $arg")
                     }
+                    // v2.7.12：press/release 分离命令（按下不松开——与 shot 组合
+                    // 确定性捕捉「按下中」的虚拟鼠标状态：涟漪环/微缩放/光环）
+                    "press" -> {
+                        val xy = arg.split(",")
+                        robot.mouseMove(xy[0].toInt(), xy[1].toInt())
+                        Thread.sleep(120)
+                        robot.mousePress(InputEvent.BUTTON1_DOWN_MASK)
+                        println("[press] $arg")
+                    }
+                    "release" -> {
+                        robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK)
+                        println("[release]")
+                    }
                     "type" -> {
                         for (c in arg) {
                             val code = KeyEvent.getExtendedKeyCodeForChar(c.code)

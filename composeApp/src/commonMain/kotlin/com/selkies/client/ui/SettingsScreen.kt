@@ -125,6 +125,10 @@ fun SettingsScreen(state: AppState) {
                 SettingSwitch("默认触屏鼠标模式（显示指针）", settings.touchMouseMode) {
                     toggle { it.touchMouseMode = !it.touchMouseMode }
                 }
+                // v2.7.12：美观虚拟鼠标（远程画面动画光标：按下涟漪/触点光环/美型回退箭头）
+                SettingSwitch("美观虚拟鼠标（画面光标反馈）", settings.virtualCursorEnabled) {
+                    toggle { it.virtualCursorEnabled = !it.virtualCursorEnabled }
+                }
                 SettingSwitch("物理键盘直通远程", settings.physicalKeyboardPassthrough) {
                     toggle { it.physicalKeyboardPassthrough = !it.physicalKeyboardPassthrough }
                 }

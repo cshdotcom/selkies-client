@@ -1,6 +1,12 @@
 package com.selkies.client.ui
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
@@ -98,9 +104,13 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -164,6 +174,9 @@ private const val TAP_SLOP_PX = 18f          // 单指位移容差（超过视�
 private const val LONG_PRESS_MS = 480L       // 长按右键阈值
 private const val TAP_MAX_MS = 280L         // 轻触最大时长
 private const val TWO_FINGER_TAP_MS = 260L  // 双指轻点右键窗口
+
+/** -Dselkies.zoomdbg：放大镜缩放链路追踪（滚轮 ctrl 判定/焦点） */
+private val ZOOMDBG = System.getProperty("selkies.zoomdbg") != null
 
 /** 视频渲染表面（平台实现：Android=SurfaceView+MediaCodec，Desktop=Skia 位图） */
 @Composable
@@ -378,6 +391,20 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     // 手势累积器
     val acc = remember { ScrollAccumulator() }
     val scope = rememberCoroutineScope()
+
+    // 【v2.7.12】美观虚拟鼠标状态：手势处理器写入（press/release/pulse）→ 覆盖层动画读取。
+    //   纯快照状态写入，不消费事件、不改变任何手势判定控制流 → 与拖动/放大镜零冲突。
+    val vcursor = remember { VirtualCursorState() }
+    // 【v2.7.12】虚拟鼠标开关（设置持久化；-Dselkies.vcursor=false 可测试强制关）
+    val virtualCursorOn = System.getProperty("selkies.vcursor")?.toBoolean()
+        ?: state.store.settings.value.virtualCursorEnabled
+
+    // 【v2.7.12 防御】滚轮缩放的 ctrl 判定兜底：PointerEvent.keyboardModifiers 依赖
+    //   AWT 修饰键状态传递（实测 Robot/真实键盘可用）；当 Compose 无聚焦节点或
+    //   修饰键状态未随事件携带时可能漏报。根 Box onPreviewKeyEvent 在聚焦链存在时
+    //   能看到全部物理键按下/抬起——维护 Ctrl 物理状态作 OR 兜底（零成本防御，
+    //   不改变任何既有判定语义）。Android 真实键盘走 keyboardModifiers 正常。
+    var ctrlPhysicallyDown by remember { mutableStateOf(false) }
 
     // 【v2.7.7】含会话中切换（switchRole 运行时覆盖）的只读状态；role==viewer 是服务器/自请求确认
     val viewOnly = session.effectiveViewOnly || role == "viewer"
@@ -629,9 +656,11 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     }
 
     // ---------- 点击原语 ----------
+    // 【v2.7.12】所有点击路径都打一次涟漪（vcursor.pulse）——视觉反馈与远程事件同步。
     fun leftClickAt(pos: Offset) {
         if (viewOnly) return
         val (x, y) = mapToStream(pos)
+        vcursor.pulse()
         session.sendMouseMove(x, y, Protocol.BUTTON_LEFT)
         session.sendMouseMove(x, y, 0)
     }
@@ -639,6 +668,7 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     fun rightClickAt(pos: Offset) {
         if (viewOnly) return
         val (x, y) = mapToStream(pos)
+        vcursor.pulse()
         session.sendMouseMove(x, y, Protocol.BUTTON_RIGHT)
         session.sendMouseMove(x, y, 0)
     }
@@ -646,12 +676,14 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     fun middleClickAt(pos: Offset) {
         if (viewOnly) return
         val (x, y) = mapToStream(pos)
+        vcursor.pulse()
         session.sendMouseMove(x, y, Protocol.BUTTON_MIDDLE)
         session.sendMouseMove(x, y, 0)
     }
 
     fun trackpadClick(mask: Int) {
         if (viewOnly) return
+        vcursor.pulse()
         session.sendMouseMoveRelative(0, 0, mask)
         session.sendMouseMoveRelative(0, 0, 0)
     }
@@ -676,6 +708,13 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                 showVolumePopup || showInputPicker || showModeSelector || exitConfirm || savedEvent != null
 
     fun handleKeyEvent(event: androidx.compose.ui.input.key.KeyEvent): Boolean {
+        // 【v2.7.12】修饰键物理状态跟踪（先于一切门控；桌面 keyboardModifiers 恒空的兜底）
+        if (event.type == KeyEventType.KeyDown || event.type == KeyEventType.KeyUp) {
+            val k = event.key
+            if (k == Key.CtrlLeft || k == Key.CtrlRight) {
+                ctrlPhysicallyDown = event.type == KeyEventType.KeyDown
+            }
+        }
         if (viewOnly) return false
         if (!state.store.settings.value.physicalKeyboardPassthrough) return false
         // v2.7.0 修复：面板/键盘/弹窗打开时物理键必须留给本地 UI（文本框输入）。
@@ -746,6 +785,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                 }
                             }
                             leftDownSent = false
+                            // 【v2.7.12】远程左键释放 → 虚拟鼠标视觉同步释放（幂等；双指手势接管时也走这里）
+                            vcursor.release()
                         }
 
                         while (true) {
@@ -783,7 +824,9 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                     PointerEventType.Scroll -> {
                                         val sd = changes.fold(Offset.Zero) { a, c -> a + c.scrollDelta }
                                         if (sd != Offset.Zero) {
-                                            val ctrl = event.keyboardModifiers.isCtrlPressed
+                                            // 【v2.7.12 防御】ctrl 判定 = 事件修饰键 OR 物理键跟踪兜底
+                                            val ctrl = event.keyboardModifiers.isCtrlPressed || ctrlPhysicallyDown
+                                            if (ZOOMDBG) println("[Selkies][ZoomDbg] scroll sd=$sd ctrl=$ctrl (kb=${event.keyboardModifiers.isCtrlPressed} phys=$ctrlPhysicallyDown)")
                                             if (ctrl) {
                                                 // v2.6.0：Ctrl+滚轮 = 本地缩放/放大镜（鼠标位置为焦点，只调本地）
                                                 val f = changes.first().position
@@ -825,6 +868,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                                     mousePanActive = true
                                                     mousePanLast = pos
                                                 } else if (!viewOnly) {
+                                                    // 【v2.7.12】虚拟鼠标按下反馈（涟漪+缩放）
+                                                    vcursor.press()
                                                     val (x, y) = mapToStream(pos)
                                                     session.sendMouseMove(x, y, Protocol.BUTTON_LEFT)
                                                 }
@@ -864,6 +909,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                     }
                                     PointerEventType.Release -> {
                                         val pos = changes.first().position
+                                        // 【v2.7.12】虚拟鼠标视觉释放（未按下时为幂等空操作）
+                                        vcursor.release()
                                         if (mousePanActive) {
                                             mousePanActive = false
                                             // 放大状态未移动的松开 = 远程点击（延迟决策，保持可控）
@@ -915,6 +962,9 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                             toolbarVisible = false
                                         }
                                         if (!viewOnly) {
+                                            // 【v2.7.12】触摸按下 → 虚拟鼠标按下反馈（涟漪+触点光环+微缩放）。
+                                            //   仅写状态，不改变任何手势控制流。
+                                            vcursor.press()
                                             if (inputMode == InputMode.TOUCH) {
                                                 // 直接模式：按下即左键按下（零延迟）。
                                                 // 【v2.7.11】放大状态同样直发——拖动/选择文字是远程操作；
@@ -1014,6 +1064,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                 PointerEventType.Release -> {
                                     touchChanges.forEach { c -> touches.remove(c.id) }
                                     if (touches.isEmpty()) {
+                                        // 【v2.7.12】全部手指离开 → 虚拟鼠标视觉释放
+                                        vcursor.release()
                                         val dur = System.currentTimeMillis() - twoFingerStart
                                         val wasTwoFinger = twoFingerStart > pressStart
                                         if (wasTwoFinger) {
@@ -1080,13 +1132,19 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                 VideoSurface(session, Modifier.aspectRatio(ratio).fillMaxSize())
             }
 
-            // ============ 本地光标覆盖层 ============
-            // 服务器推送的 cursor 形状（PNG+热点）+ 本地回显位置，与视频等比同坐标
-            if (status == SelkiesSession.Status.CONNECTED && cursorX >= 0f && cursorY >= 0f && !viewOnly) {
-                CursorOverlay(
+            // ============ v2.7.12 美观虚拟鼠标覆盖层 ============
+            // 服务器 cursor 形状（PNG+热点）+ 本地回显位置（缩放感知 mapFromStream）；
+            // 按下涟漪/触点光环/按下微缩放/美型回退箭头。
+            // 【零冲突保证】纯渲染层：无 pointerInput、不消费任何指针事件 →
+            //   放大镜平移（双指/鼠标拖拽）、单指拖动/文字选择、双指缩放全部不受影响。
+            if (status == SelkiesSession.Status.CONNECTED && cursorX >= 0f && cursorY >= 0f && !viewOnly && virtualCursorOn) {
+                VirtualCursorOverlay(
                     cursorX = cursorX,
                     cursorY = cursorY,
                     shape = cursorShape,
+                    pressed = vcursor.pressed,
+                    rippleAt = vcursor.rippleAt,
+                    touchDevice = platform.isTouchDevice(),
                     mapFromStream = ::mapFromStream
                 )
             }
@@ -1932,6 +1990,31 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                             inputMode = InputMode.TRACKPAD
                             showModeSelector = false
                         }
+                        // 【v2.7.12】美观虚拟鼠标开关（会话内即时生效，持久化到全局设置）
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    state.store.updateSettings { it.virtualCursorEnabled = !it.virtualCursorEnabled }
+                                }
+                                .padding(horizontal = 4.dp, vertical = 2.dp)
+                        ) {
+                            androidx.compose.material3.Checkbox(
+                                checked = state.store.settings.value.virtualCursorEnabled,
+                                onCheckedChange = {
+                                    state.store.updateSettings { s -> s.virtualCursorEnabled = it }
+                                }
+                            )
+                            Column(Modifier.padding(start = 4.dp)) {
+                                Text("美观虚拟鼠标", style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    "远程画面显示动画光标：触摸按下涟漪与触点光环反馈、平滑跟随、美型回退箭头（不干预任何手势）",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
                     }
                 },
                 confirmButton = {},
@@ -2162,14 +2245,60 @@ private fun formatRecSec(sec: Int): String {
 }
 
 // =====================================================================
-// 本地光标覆盖层
+// v2.7.12 美观虚拟鼠标（覆盖层渲染 + 手势状态桥）
 // =====================================================================
 
+/** 涟漪扩散时长（按下/点击后从热点扩开的圆环动画） */
+private const val VCURSOR_RIPPLE_MS = 460
+/** 按下时光标的微缩放（弹性回弹；视觉上「按进去」的手感） */
+private const val VCURSOR_PRESS_SCALE = 0.84f
+
+/**
+ * 虚拟鼠标状态桥：手势处理器写、覆盖层读。
+ * press/release/pulse 只做快照状态写入——绝不消费指针事件、绝不改动手势判定控制流，
+ * 因此对拖动/文字选择/双指缩放/放大镜平移零影响（v2.7.11 五项拖动根因修复保持原样）。
+ * - [press]：触摸/鼠标按下 → pressed=true + 涟漪（触点光环 + 微缩放）
+ * - [release]：松开/手势被双指接管 → pressed=false（幂等）
+ * - [pulse]：完整点击对（左/右/中键单击、双指轻点右键、放大镜延迟点击）→ 单发涟漪
+ */
+private class VirtualCursorState {
+    var pressed by mutableStateOf(false)
+    var rippleAt by mutableStateOf(0L)
+    fun press() {
+        pressed = true
+        rippleAt = System.currentTimeMillis()
+        if (TRACE) println("[Selkies][VCursor] press (ripple@$rippleAt)")
+    }
+    fun release() {
+        if (TRACE && pressed) println("[Selkies][VCursor] release")
+        pressed = false
+    }
+    fun pulse() {
+        rippleAt = System.currentTimeMillis()
+        if (TRACE) println("[Selkies][VCursor] pulse (ripple@$rippleAt)")
+    }
+    companion object {
+        /** -Dselkies.vctrace：虚拟鼠标状态链路追踪（E2E 断言用） */
+        private val TRACE = System.getProperty("selkies.vctrace") != null
+    }
+}
+
+/**
+ * 美观虚拟鼠标覆盖层（纯渲染，无 pointerInput）：
+ * - 服务器 PNG 形状按热点绘制 + 软阴影（黑色滤色偏移）；
+ * - 无形状时回退美型箭头（黑体白描边 + 柔和投影）；
+ * - 按下：触点光环（触摸设备；手指遮挡时仍可见精确热点）+ 光标弹性微缩放；
+ * - 按下/单击：涟漪圆环从热点扩散淡出；
+ * - 位置 = mapFromStream(cursorX, cursorY)（本地缩放感知：放大镜下随内容同变换）。
+ */
 @Composable
-private fun CursorOverlay(
+private fun VirtualCursorOverlay(
     cursorX: Float,
     cursorY: Float,
     shape: com.selkies.client.model.CursorShape?,
+    pressed: Boolean,
+    rippleAt: Long,
+    touchDevice: Boolean,
     mapFromStream: (Float, Float) -> Offset
 ) {
     // 服务器 PNG 形状解码（按 handle 缓存；平台各自解码：Android=BitmapFactory / Desktop=Skia）
@@ -2181,35 +2310,101 @@ private fun CursorOverlay(
             }.getOrNull()
         }
     }
+    // 按下微缩放（弹性回弹：松手时轻微过冲，手感「Q 弹」）
+    val scale = animateFloatAsState(
+        targetValue = if (pressed) VCURSOR_PRESS_SCALE else 1f,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = 900f
+        ),
+        label = "vcursorScale"
+    ).value
+    // 触点光环淡入淡出（按下期间常亮呼吸由 alpha 脉动实现）
+    val halo = animateFloatAsState(
+        targetValue = if (pressed && touchDevice) 1f else 0f,
+        animationSpec = tween(180),
+        label = "vcursorHalo"
+    ).value
+    // 涟漪进度：rippleAt 变化 → 0→1 单程扩散动画
+    val ripple = remember { Animatable(1f) }
+    LaunchedEffect(rippleAt) {
+        if (rippleAt > 0L) {
+            ripple.snapTo(0f)
+            ripple.animateTo(
+                1f,
+                animationSpec = tween(durationMillis = VCURSOR_RIPPLE_MS, easing = FastOutSlowInEasing)
+            )
+        }
+    }
+    // 光环呼吸（按下期间 1.1s 周期往复脉动；帧驱动连续动画，静止按住也持续呼吸）
+    val breath = remember { Animatable(0f) }
+    LaunchedEffect(pressed, touchDevice) {
+        if (pressed && touchDevice) {
+            while (true) {
+                breath.animateTo(1f, tween(550, easing = FastOutSlowInEasing))
+                breath.animateTo(0f, tween(550, easing = FastOutSlowInEasing))
+            }
+        } else {
+            breath.snapTo(0f)
+        }
+    }
+
     Canvas(Modifier.fillMaxSize()) {
         val pos = mapFromStream(cursorX, cursorY)
+        val accent = Color(0xFF60A5FA)
+        // 1) 触点光环（触摸设备按下中）：双层柔光 + 热点白点 —— 手指遮挡时的精确位置反馈
+        if (halo > 0.01f) {
+            val a = halo * (0.85f + 0.15f * breath.value)
+            drawCircle(accent.copy(alpha = 0.10f * a), radius = 34f + 4f * breath.value, center = pos)
+            drawCircle(accent.copy(alpha = 0.20f * a), radius = 21f, center = pos)
+            drawCircle(Color.White.copy(alpha = 0.45f * a), radius = 3.5f, center = pos)
+        }
+        // 2) 涟漪：按下/单击从热点扩散的描边圆环（宽度和透明度随进度收敛）
+        val rp = ripple.value
+        if (rp < 1f) {
+            drawCircle(
+                color = accent.copy(alpha = 0.6f * (1f - rp)),
+                radius = 10f + 46f * rp,
+                center = pos,
+                style = Stroke(width = (1f + 2.6f * (1f - rp)).coerceAtLeast(0.8f))
+            )
+        }
+        // 3) 光标本体（缩放围绕热点；软阴影 = 黑色滤色低透明度偏移一层）
         val sh = shape
         if (bitmap != null && sh != null) {
-            val scale = 1f  // 服务器已按显示 DPI 提供合适尺寸
+            val w = (sh.width * scale).roundToInt().coerceAtLeast(1)
+            val h = (sh.height * scale).roundToInt().coerceAtLeast(1)
+            val ox = (pos.x - sh.hotX * scale).roundToInt()
+            val oy = (pos.y - sh.hotY * scale).roundToInt()
             drawImage(
                 image = bitmap,
-                dstOffset = androidx.compose.ui.unit.IntOffset(
-                    (pos.x - sh.hotX * scale).roundToInt(),
-                    (pos.y - sh.hotY * scale).roundToInt()
-                ),
-                dstSize = androidx.compose.ui.unit.IntSize(
-                    (sh.width * scale).roundToInt().coerceAtLeast(1),
-                    (sh.height * scale).roundToInt().coerceAtLeast(1)
-                )
+                dstOffset = androidx.compose.ui.unit.IntOffset(ox + 2, oy + 2),
+                dstSize = androidx.compose.ui.unit.IntSize(w, h),
+                alpha = 0.32f,
+                colorFilter = ColorFilter.tint(Color.Black)
+            )
+            drawImage(
+                image = bitmap,
+                dstOffset = androidx.compose.ui.unit.IntOffset(ox, oy),
+                dstSize = androidx.compose.ui.unit.IntSize(w, h)
             )
         } else {
-            // 回退：绘制经典箭头
+            // 回退：美型箭头（黑体白描边 + 柔和投影；围绕热点缩放）
+            val s = scale
             val arrow = Path().apply {
                 moveTo(pos.x, pos.y)
-                lineTo(pos.x + 12f, pos.y + 18f)
-                lineTo(pos.x + 6.5f, pos.y + 17.5f)
-                lineTo(pos.x + 4f, pos.y + 24f)
-                lineTo(pos.x + 1.5f, pos.y + 23f)
-                lineTo(pos.x + 4f, pos.y + 16f)
+                lineTo(pos.x + 12.5f * s, pos.y + 19f * s)
+                lineTo(pos.x + 7.2f * s, pos.y + 17.6f * s)
+                lineTo(pos.x + 4.3f * s, pos.y + 24.5f * s)
+                lineTo(pos.x + 1.6f * s, pos.y + 23.6f * s)
+                lineTo(pos.x + 4.9f * s, pos.y + 16.4f * s)
                 close()
             }
-            drawPath(arrow, Color.Black.copy(alpha = 0.8f))
-            drawPath(arrow, Color.White, style = Stroke(width = 1.5f))
+            translate(left = 1.2f, top = 1.8f) {
+                drawPath(arrow, Color.Black.copy(alpha = 0.35f))
+            }
+            drawPath(arrow, Color.Black.copy(alpha = 0.92f))
+            drawPath(arrow, Color.White, style = Stroke(width = 1.4f))
         }
     }
 }
