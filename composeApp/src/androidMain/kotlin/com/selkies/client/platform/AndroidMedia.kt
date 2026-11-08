@@ -12,7 +12,10 @@ import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.RectF
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.net.Uri
@@ -23,7 +26,6 @@ import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.provider.MediaStore
 import android.provider.DocumentsContract
-import android.view.Surface
 import com.selkies.client.MainActivity
 import com.selkies.client.model.SavedMediaEntry
 import java.io.File
@@ -403,7 +405,7 @@ object SafMarker {
  * - H.264/H.265 → MP4（Annex-B→AVCC + SPS/PPS/VPS→csd，首关键帧就绪才建轨启动）
  * - VP8/VP9 → WebM（帧直通，无需 csd）
  * - Opus 音频轨（启动前有音频数据才建——避免空轨导致 stop 失败）
- * - JPEG 条带 → MediaCodec H.264 实时转码入轨（Surface 输入）
+ * - JPEG 条带 → MediaCodec H.264 实时转码入轨（ByteBuffer 输入，v2.7.14）
  */
 class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
 
@@ -557,7 +559,9 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
                 jpegEncoder = enc
             }
             if (!enc.ready) {
-                if (enc.prepare(parts) == null) return true // 无法初始化（拿不到尺寸）→ 丢弃但保持录制
+                // v2.7.14：返回 false（真实语义）——返回 true 会虚增 videoFramesWritten，
+                // 骗过录屏关键帧重试循环提前停止 + 空录制判定失效
+                if (enc.prepare(parts) == null) return false
             }
             return enc.submitFrame(parts, ptsUs)
         }
@@ -571,18 +575,22 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
             //   旧版顺序 = jpegEncoder.release()（join 仅 800ms，超时即放弃）→ MediaMuxer.stop()/
             //   release() → 但编码器 drain 线程可能仍活着并调 writeSampleData() → 对已释放的
             //   native muxer 写入 = SIGSEGV 原生崩溃（Java runCatching 拦不住）。
-            //   新顺序：①先置 muxerStarted=false（writeSample 立即拒新）②彻底等编码器线程退出
-            //   ③才 stop/release muxer ④置空引用（漏网写入碰 null 检查而非悬垂 native 指针）。
-            // v2.7.9：先捕获 start 状态再置 false（保留 v2.7.6 拒新写入语义）；
-            //   hadStarted=false（含 start() 抛异常）一律走空条目清理，不残留坏文件
+            // 【v2.7.14】顺序再进化（JPEG 转码器 ByteBuffer 化后 join 可彻底终结写入）：
+            //   ①先 EOS + join 编码器线程（此时 muxerStarted 仍 true——尾部在途帧合法落盘，
+            //     旧序先置 false = 录屏末尾 ~150ms 画面被丢）②线程死亡后才置 false +
+            //     stop/release muxer ③置空引用（漏网写入碰 null 检查而非悬垂 native 指针）。
+            //   join 超时（4s）则退田旧防御序：先拒新再强收尾，双层 writeSample 快照保护。
             val hadStarted = muxerStarted
-            muxerStarted = false
+            val enc = jpegEncoder
+            if (enc != null) {
+                runCatching { enc.release() }
+            }
             var ok = false
             // v2.7.9【修「残留空/坏 MP4」】：muxer 已建但从未 start（无 csd 关键帧）与未建同例——
             //   旧版这里仍调 stop()（抛异常→ok=false）后 release，但媒体条目不删 →
             //   Movies/Selkies 留下 0 字节损坏 MP4；统一走空条目清理。
             if (realMuxer != null && hadStarted) {
-                runCatching { jpegEncoder?.release() }
+                muxerStarted = false
                 runCatching {
                     realMuxer!!.stop()
                     ok = true
@@ -590,7 +598,7 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
                 runCatching { realMuxer!!.release() }
                 pfd?.close()
             } else {
-                runCatching { jpegEncoder?.release() }
+                muxerStarted = false
                 runCatching { realMuxer?.release() }
                 pfd?.close()
                 // 未启动（无有效内容）：删除空条目
@@ -853,7 +861,20 @@ private fun annexToAvcc(data: ByteArray, hevc: Boolean): AvccResult? {
 }
 
 /**
- * JPEG 条带 → MediaCodec H.264 实时转码（Surface 输入；帧节奏 = WS 到达节奏）。
+ * JPEG 条带 → MediaCodec H.264 实时转码（ByteBuffer 输入；帧节奏/时间戳 = WS 到达墙钟）。
+ *
+ * v2.7.14【修「录屏黑屏 + 时长显示 0」根因】旧版 Surface.lockCanvas 路径三宗罪：
+ *  ① submitFrame 收到的 ptsUs 被完全忽略——帧时间戳取决于 surface 内部行为：
+ *    若缓冲时间戳为 0/非单调，muxer 的 ptsUs <= lastVideoPts 守卫会把首帧之后的
+ *    全部样本静默丢弃 → MP4 仅剩 1 个样本 = 黑屏 + 0:00（用户实测症状）；
+ *    若时间戳是 nanoTime 基数（巨大偏移），部分播放器直接显示 0 时长；
+ *  ② lockCanvas 对 GPU 消费的编码器 inputSurface 在部分设备直接产出黑帧
+ *    （v2.7.4 已踩过 lockHardwareCanvas 崩溃坑，lockCanvas 只是绕开崩溃没根治病灶）；
+ *  ③ 帧计数虚增（submitFrame 返回 true ≠ 样本真正落盘）骗过空录制判定。
+ * ByteBuffer 路径（dequeueInputBuffer/queueInputBuffer）逐帧显式携带到达墙钟 PTS，
+ * 与 H.264 直采路径同一时间基（µs 单调递增）；ARGB→YUV420 由本类完成，色彩格式
+ * 按编码器能力自选 NV12/I420——纯 ByteBuffer 输入是 MediaCodec 兼容面最广的经典
+ * 路径，不依赖任何 surface/GPU 行为。
  */
 private class JpegH264Encoder(
     private val onReady: (csd0: ByteArray, csd1: ByteArray?) -> Boolean,
@@ -864,10 +885,19 @@ private class JpegH264Encoder(
         private set
 
     private var codec: MediaCodec? = null
-    private var inputSurface: Surface? = null
     private var thread: Thread? = null
     private val running = AtomicBoolean(false)
-    private var canvasBmp: Bitmap? = null
+    private var encW = 0
+    private var encH = 0
+    /** true=NV12（Y + UV 交错半平面）/ false=I420（Y/U/V 三平面）——按编码器能力选定 */
+    private var semiPlanar = true
+    private var lastQueuedPts = -1L
+
+    // 复用缓冲（热路径零分配）
+    private var frameBmp: Bitmap? = null   // 原始尺寸条纹合成
+    private var canvasBmp: Bitmap? = null  // 编码器尺寸目标（分辨率中途变化时拉伸）
+    private var argbBuf: IntArray = IntArray(0)
+    private var yuvBuf: ByteArray = ByteArray(0)
 
     /** 用首帧条带探测尺寸并初始化；返回非 null = 初始化成功 */
     fun prepare(parts: List<Pair<Int, ByteArray>>): Int? {
@@ -890,11 +920,24 @@ private class JpegH264Encoder(
             fmt.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
             fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
             val c = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            // 色彩格式按编码器能力自选（NV12 优先，I420 回退）——纯 ByteBuffer 输入
+            runCatching {
+                val caps = c.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                val semi = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
+                val planar = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar
+                val colors = caps.colorFormats
+                semiPlanar = when {
+                    semi in colors -> true
+                    planar in colors -> false
+                    else -> true // 兜底 NV12（绝大多数 AVC 编码器支持）
+                }
+                fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT, if (semiPlanar) semi else planar)
+            }
             c.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            val surface = c.createInputSurface()
             c.start()
+            encW = w
+            encH = h
             codec = c
-            inputSurface = surface
             running.set(true)
             thread = Thread(this::drainLoop, "selkies-jpeg-enc").apply {
                 isDaemon = true; start()
@@ -903,8 +946,10 @@ private class JpegH264Encoder(
         }.getOrDefault(false)
     }
 
+    /** 提交一帧：解码条纹 → 合成 → ARGB→YUV → 显式 PTS 入编码器（不长时间阻塞调用线程） */
     fun submitFrame(parts: List<Pair<Int, ByteArray>>, ptsUs: Long): Boolean {
-        val surface = inputSurface ?: return false
+        val c = codec ?: return false
+        if (!running.get()) return false
         var w = 0
         var h = 0
         val stripes = ArrayList<Pair<Int, Bitmap>>()
@@ -915,24 +960,61 @@ private class JpegH264Encoder(
             h = maxOf(h, y + bmp.height)
         }
         if (stripes.isEmpty()) return false
-        var bmp = canvasBmp
-        if (bmp == null || bmp.width != w || bmp.height != h) {
-            bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-            canvasBmp = bmp
+        try {
+            // 1) 原始尺寸合成
+            var fb = frameBmp
+            if (fb == null || fb.width != w || fb.height != h) {
+                fb?.recycle()
+                fb = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                frameBmp = fb
+            }
+            val fc = Canvas(fb)
+            fc.drawColor(Color.BLACK)
+            for ((y, s) in stripes) fc.drawBitmap(s, 0f, y.toFloat(), null)
+            // 2) 编码器尺寸目标（会话中途分辨率变化时拉伸——不崩、不越界）
+            var cb = canvasBmp
+            if (cb == null || cb.width != encW || cb.height != encH) {
+                cb?.recycle()
+                cb = Bitmap.createBitmap(encW, encH, Bitmap.Config.ARGB_8888)
+                canvasBmp = cb
+            }
+            val cc = Canvas(cb)
+            cc.drawColor(Color.BLACK)
+            if (w == encW && h == encH) {
+                cc.drawBitmap(fb, 0f, 0f, null)
+            } else {
+                cc.drawBitmap(fb, null, RectF(0f, 0f, encW.toFloat(), encH.toFloat()), null)
+            }
+            // 3) ARGB → YUV420
+            val px = encW * encH
+            if (argbBuf.size != px) argbBuf = IntArray(px)
+            cb.getPixels(argbBuf, 0, encW, 0, 0, encW, encH)
+            val yuvSize = px * 3 / 2
+            if (yuvBuf.size != yuvSize) yuvBuf = ByteArray(yuvSize)
+            argbToYuv420(argbBuf, encW, encH, yuvBuf, semiPlanar)
+            // 4) 入编码器（输入忙最多等 ~60ms，拿不到就丢帧——绝不阻塞 WS 读线程）
+            var idx = -1
+            for (attempt in 0 until 6) {
+                idx = c.dequeueInputBuffer(10_000)
+                if (idx >= 0) break
+            }
+            if (idx < 0) return false
+            val buf = c.getInputBuffer(idx)
+            if (buf == null || buf.remaining() < yuvSize) {
+                // 容量异常（理论不可达）：不可挽救——停用编码器走优雅降级，避免悬垂输入缓冲泄漏
+                running.set(false)
+                return false
+            }
+            buf.clear()
+            buf.put(yuvBuf, 0, yuvSize)
+            // MediaCodec 要求输入 PTS 单调（部分编码器收到回退 PTS 直接停摆）
+            val pts = if (ptsUs > lastQueuedPts) ptsUs else lastQueuedPts + 1
+            c.queueInputBuffer(idx, 0, yuvSize, pts, 0)
+            lastQueuedPts = pts
+            return true
+        } finally {
+            stripes.forEach { it.second.recycle() }
         }
-        val canvas = Canvas(bmp)
-        for ((y, s) in stripes) canvas.drawBitmap(s, 0f, y.toFloat(), null)
-        stripes.forEach { it.second.recycle() }
-        // v2.7.4【录屏闪退根因修复】：lockHardwareCanvas 在非渲染线程对 MediaCodec inputSurface
-        // 调用在大量设备（Android 11+，尤其部分 OEM）上 native crash（EXCEPTION_ACCESS_VIOLATION）。
-        // 用户实测「点击录屏后过 2 秒闪退」= 首关键帧到达 → JPEG 转码启动 → hardware canvas 崩溃。
-        // 改用 lockCanvas（CPU 软件画布）：MediaCodec inputSurface 的传统稳定路径，兼容性好。
-        runCatching {
-            val c = surface.lockCanvas(null)
-            c.drawBitmap(bmp, 0f, 0f, null)
-            surface.unlockCanvasAndPost(c)
-        }.onFailure { return false }
-        return true
     }
 
     private fun drainLoop() {
@@ -964,6 +1046,7 @@ private class JpegH264Encoder(
                         )
                     }
                     c.releaseOutputBuffer(outIdx, false)
+                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
                 }
             } catch (_: Throwable) {
                 break
@@ -974,8 +1057,18 @@ private class JpegH264Encoder(
     fun release() {
         // 【v2.7.6】彻底等 drain 线程退出（旧版 join 仅 800ms——超时后 muxer 被释放而线程
         //   还在跑 = 录屏结束闪退根因；native writeSampleData 悬垂指针无法被 Java 捕获）
+        // v2.7.14：ByteBuffer 路径用 EOS 输入缓冲代替 signalEndOfInputStream（后者仅
+        //   Surface 输入语义）——drain 线程冲完剩余输出（尾部帧落盘）后自然退出。
         running.set(false)
-        runCatching { codec?.signalEndOfInputStream() }
+        runCatching {
+            val c = codec
+            if (c != null) {
+                val idx = c.dequeueInputBuffer(200_000)
+                if (idx >= 0) {
+                    c.queueInputBuffer(idx, 0, 0, lastQueuedPts.coerceAtLeast(0), MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                }
+            }
+        }
         val t = thread
         if (t != null && t.isAlive) {
             runCatching { t.join(2500) }
@@ -984,11 +1077,68 @@ private class JpegH264Encoder(
                 runCatching { t.join(1500) }
             }
         }
-        runCatching { inputSurface?.release() }
         runCatching { codec?.stop(); codec?.release() }
         codec = null
-        inputSurface = null
         thread = null
+        runCatching { frameBmp?.recycle(); canvasBmp?.recycle() }
+        frameBmp = null
+        canvasBmp = null
+        argbBuf = IntArray(0)
+        yuvBuf = ByteArray(0)
+    }
+
+    /** ARGB8888 → YUV420（BT.601 limited range）。semi=true 输出 NV12（Y + UV 交错），否则 I420（Y/U/V 三平面） */
+    private fun argbToYuv420(argb: IntArray, w: Int, h: Int, out: ByteArray, semi: Boolean) {
+        val ySize = w * h
+        // ---- Y 平面 ----
+        for (i in 0 until ySize) {
+            val p = argb[i]
+            val r = (p shr 16) and 0xff
+            val g = (p shr 8) and 0xff
+            val b = p and 0xff
+            out[i] = (((66 * r + 129 * g + 25 * b + 128) shr 8) + 16).toByte()
+        }
+        val uvW = w / 2
+        val uvH = h / 2
+        val cSize = uvW * uvH
+        if (semi) {
+            // NV12：Y 后紧跟 UV 交错（U 在前）
+            var uv = ySize
+            for (row in 0 until uvH) {
+                val top = row * 2 * w
+                val bot = top + w
+                for (col in 0 until uvW) {
+                    val p00 = argb[top + col * 2]
+                    val p01 = argb[top + col * 2 + 1]
+                    val p10 = argb[bot + col * 2]
+                    val p11 = argb[bot + col * 2 + 1]
+                    val r = (((p00 shr 16) and 0xff) + ((p01 shr 16) and 0xff) + ((p10 shr 16) and 0xff) + ((p11 shr 16) and 0xff)) shr 2
+                    val g = (((p00 shr 8) and 0xff) + ((p01 shr 8) and 0xff) + ((p10 shr 8) and 0xff) + ((p11 shr 8) and 0xff)) shr 2
+                    val b = ((p00 and 0xff) + (p01 and 0xff) + (p10 and 0xff) + (p11 and 0xff)) shr 2
+                    out[uv++] = (((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128).toByte()
+                    out[uv++] = (((112 * r - 94 * g - 18 * b + 128) shr 8) + 128).toByte()
+                }
+            }
+        } else {
+            // I420：Y + U 平面 + V 平面
+            var u = ySize
+            var v = ySize + cSize
+            for (row in 0 until uvH) {
+                val top = row * 2 * w
+                val bot = top + w
+                for (col in 0 until uvW) {
+                    val p00 = argb[top + col * 2]
+                    val p01 = argb[top + col * 2 + 1]
+                    val p10 = argb[bot + col * 2]
+                    val p11 = argb[bot + col * 2 + 1]
+                    val r = (((p00 shr 16) and 0xff) + ((p01 shr 16) and 0xff) + ((p10 shr 16) and 0xff) + ((p11 shr 16) and 0xff)) shr 2
+                    val g = (((p00 shr 8) and 0xff) + ((p01 shr 8) and 0xff) + ((p10 shr 8) and 0xff) + ((p11 shr 8) and 0xff)) shr 2
+                    val b = ((p00 and 0xff) + (p01 and 0xff) + (p10 and 0xff) + (p11 and 0xff)) shr 2
+                    out[u++] = (((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128).toByte()
+                    out[v++] = (((112 * r - 94 * g - 18 * b + 128) shr 8) + 128).toByte()
+                }
+            }
+        }
     }
 }
 

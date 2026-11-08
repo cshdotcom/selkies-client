@@ -1,0 +1,192 @@
+name: 全平台构建发布
+
+# v* 标签推送 → 全平台构建 + GitHub Release（8 资产）
+# 手动触发 → 仅构建产物（不上架 Release，用于验证 CI 链路）
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: 构建 Android APK + 桌面通用 JAR
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: 缓存 Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'composeApp/build.gradle.kts', 'build.gradle.kts') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: 读取版本号
+        id: ver
+        run: |
+          VER=$(grep -oP 'versionName\s*=\s*"\K[^"]+' composeApp/build.gradle.kts | head -1)
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          echo "版本: $VER"
+
+      - name: 构建 Android Release APK（签名）
+        run: |
+          chmod +x gradlew
+          ./gradlew :composeApp:assembleRelease --console=plain --no-daemon
+
+      - name: 构建桌面通用 Fat JAR（含全平台原生库）
+        run: ./gradlew :composeApp:desktopFatJar --console=plain --no-daemon
+
+      - name: 归集构建产物
+        run: |
+          VER=${{ steps.ver.outputs.ver }}
+          mkdir -p dist
+          cp composeApp/build/outputs/apk/release/composeApp-release.apk "dist/Selkies-Client-Android-$VER.apk"
+          cp composeApp/build/libs/Selkies-Desktop-all.jar "dist/Selkies-Desktop-all-$VER.jar"
+          ls -la dist/
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ steps.ver.outputs.ver }}
+          path: dist/*
+          retention-days: 7
+
+  release:
+    name: 打包全平台便携包并发布 Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: 检出源码（含标签注释——Release 说明来源）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: 展平产物目录
+        run: |
+          mkdir -p out
+          find dist -type f -exec mv {} out/ \;
+          rm -rf dist && mv out dist
+          ls -la dist/
+
+      - name: 读取版本号
+        id: ver
+        run: |
+          VER=$(grep -oP 'versionName\s*=\s*"\K[^"]+' composeApp/build.gradle.kts | head -1)
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          echo "标签: $GITHUB_REF_NAME | 版本: $VER"
+
+      - name: 下载五平台 JRE（Temurin 21）
+        run: |
+          mkdir -p jres
+          BASE_URL="https://api.adoptium.net/v3/binary/latest/21/ga"
+          curl -sSL --retry 3 -o jres/jre-linux-x64.tar.gz   "$BASE_URL/linux/x64/jre/hotspot/normal/eclipse" &
+          curl -sSL --retry 3 -o jres/jre-linux-arm64.tar.gz "$BASE_URL/linux/aarch64/jre/hotspot/normal/eclipse" &
+          curl -sSL --retry 3 -o jres/jre-windows-x64.zip    "$BASE_URL/windows/x64/jre/hotspot/normal/eclipse" &
+          curl -sSL --retry 3 -o jres/jre-mac-x64.tar.gz     "$BASE_URL/mac/x64/jre/hotspot/normal/eclipse" &
+          curl -sSL --retry 3 -o jres/jre-mac-arm64.tar.gz   "$BASE_URL/mac/aarch64/jre/hotspot/normal/eclipse" &
+          wait
+          ls -la jres/
+          # 校验：任何 JRE < 20MB 视为下载失败
+          for f in jres/*; do
+            size=$(stat -c%s "$f")
+            if [ "$size" -lt 20000000 ]; then echo "JRE 下载异常: $f ($size bytes)"; exit 1; fi
+          done
+
+      - name: 打包全平台便携包
+        run: |
+          VER=${{ steps.ver.outputs.ver }}
+          JAR="dist/Selkies-Desktop-all-$VER.jar"
+          [ -f "$JAR" ] || { echo "fat JAR 缺失"; exit 1; }
+
+          pack_portable() {
+            local jre=$1 name=$2 ext=$3 rundir=$4
+            local dir="Selkies-Client-$name"
+            rm -rf "$dir"; mkdir -p "$dir/jre"
+            if [ "$ext" = "zip" ]; then unzip -q "jres/jre-$jre.zip" -d "$dir/jre-tmp"
+            else mkdir -p "$dir/jre-tmp" && tar -xzf "jres/jre-$jre.tar.gz" -C "$dir/jre-tmp"; fi
+            inner=$(ls "$dir/jre-tmp")
+            mv "$dir/jre-tmp/$inner"/* "$dir/jre/" 2>/dev/null || true
+            rm -rf "$dir/jre-tmp"
+            cp "$JAR" "$dir/Selkies-Desktop-all.jar"
+            if [ "$rundir" = "windows" ]; then
+              printf '@echo off\r\nsetlocal\r\ncd /d "%%~dp0"\r\njre\\bin\\java.exe -Dfile.encoding=UTF-8 -jar Selkies-Desktop-all.jar\r\nif errorlevel 1 pause\r\n' > "$dir/launch.bat"
+            else
+              printf '#!/bin/bash\ncd "$(dirname "$0")"\n# GL 自检失败自动软件渲染回退\nif ! jre/bin/java -Dselkies.glselftest -jar Selkies-Desktop-all.jar 2>/dev/null; then\n  exec jre/bin/java -Dskiko.renderApi=SOFTWARE -jar Selkies-Desktop-all.jar\nfi\n' > "$dir/launch.sh"
+              chmod +x "$dir/launch.sh"
+            fi
+            { echo "Selkies 远程桌面客户端 v${VER}（$name 便携版）"; echo; echo "启动方式："; \
+              if [ "$rundir" = "windows" ]; then \
+                echo "  双击 launch.bat（自带 Java 运行时，无需安装任何依赖）"; \
+              else \
+                echo "  终端执行 ./launch.sh（自带 Java 运行时，无需安装任何依赖）"; \
+              fi; } > "$dir/使用说明.txt"
+          }
+
+          pack_portable "windows-x64" "Windows-x64" "zip" "windows"
+          pack_portable "linux-x64"   "Linux-x86_64" "tar.gz" "unix"
+          pack_portable "linux-arm64" "Linux-arm64"  "tar.gz" "unix"
+          pack_portable "mac-x64"     "macOS-x64"    "tar.gz" "unix"
+          pack_portable "mac-arm64"   "macOS-arm64"  "tar.gz" "unix"
+
+          for d in Selkies-Client-*/; do
+            d=${d%/}
+            if [[ "$d" == *Windows* ]]; then zip -qr "$d-$VER.zip" "$d"
+            else tar -czf "$d-$VER.tar.gz" "$d"; fi
+            rm -rf "$d"
+          done
+
+          # 源码包
+          git archive --format=tar.gz --prefix="selkies-client-$VER/" -o "selkies-client-$VER-source.tar.gz" HEAD
+
+          mv Selkies-Client-*-$VER.zip Selkies-Client-*-$VER.tar.gz selkies-client-$VER-source.tar.gz dist/ 2>/dev/null
+          ls -la dist/
+
+      - name: 生成 Release 说明（取自标签注释）
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          git tag -l --format='%(contents:body)' "$TAG" > release-notes.md
+          # 标签无注释时兜底
+          if [ ! -s release-notes.md ]; then
+            echo "Selkies 远程桌面客户端 $TAG 全平台发布（Android APK + 桌面通用 JAR + 五平台便携包 + 源码）。" > release-notes.md
+          fi
+          echo "--- Release 说明预览 ---"
+          cat release-notes.md
+
+      - name: 创建 GitHub Release 并上传资产
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VER=${{ steps.ver.outputs.ver }}
+          # 幂等：Release 已存在则复用（追加/覆盖同名资产）
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes-file release-notes.md
+          fi
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" dist/* --clobber
+          echo "=== 发布完成 ==="
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[] | "\(.name)\t\(.size)"'

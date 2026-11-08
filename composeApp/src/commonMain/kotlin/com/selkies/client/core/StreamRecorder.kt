@@ -74,7 +74,6 @@ class StreamRecorder(
     private var jpegCanvasW = 0
     private var jpegCanvasH = 0
     private var jpegParts = ArrayList<Pair<Int, ByteArray>>() // (stripeY, jpeg)
-    private var lastJpegPts = 0L
 
     // v2.7.0：缓冲硬上限（防 OOM 闪退——旧版 240 帧高码率关键帧可累积 >100MB）
     private var pendingBytes = 0L
@@ -173,7 +172,10 @@ class StreamRecorder(
                 videoCodecId = 0
                 videoTrackReady = muxer?.addVideoTrack(0, 0, 0) == true
             }
-            val pts = if (lastJpegPts == 0L) ptsNow() else lastJpegPts
+            // v2.7.14：PTS 统一为帧到达墙钟（µs 单调递增）——旧版 lastJpegPts 是从未被
+            // 写入的死变量（碰巧恒走 ptsNow() 分支）；现在直接语义化，与 H.264 直采路径
+            // 同一时间基，也是安卓 JPEG 转码路径显式 PTS 的唯一来源。
+            val pts = ptsNow()
             val snapshot = ArrayList(jpegParts)
             if (muxer?.writeJpegFrame(snapshot, pts) == true) {
                 videoFramesWritten++
