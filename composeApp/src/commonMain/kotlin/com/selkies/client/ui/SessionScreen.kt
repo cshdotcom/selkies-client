@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -33,10 +34,12 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Adjust
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Close
@@ -105,6 +108,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
@@ -113,6 +117,7 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerId
@@ -120,10 +125,14 @@ import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.isCtrlPressed
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -150,6 +159,7 @@ import com.selkies.client.ui.panels.QuickShortcutBar
 import com.selkies.client.ui.panels.SavedMediaPanel
 import com.selkies.client.ui.panels.SessionSettingsPanel
 import com.selkies.client.ui.panels.StatsPanel
+import com.selkies.client.ui.panels.VirtualMousePanel
 import com.selkies.client.ui.panels.VirtualGamepadOverlay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -174,6 +184,16 @@ private const val TAP_SLOP_PX = 18f          // 单指位移容差（超过视�
 private const val LONG_PRESS_MS = 480L       // 长按右键阈值
 private const val TAP_MAX_MS = 280L         // 轻触最大时长
 private const val TWO_FINGER_TAP_MS = 260L  // 双指轻点右键窗口
+
+// ---- v2.7.13 放大镜手势状态机阈值：双指外扩/内收 + 停顿保持（不再即时缩放）----
+// 用户实测「双手一放就进放大」根因：旧版双指距离变化 >0.5px 即触发 zoomAt。
+// 新语义：外扩达标 + 停顿 3 秒才进入/加档；内收达标 + 停顿才减档/退出（退出同样 3 秒）。
+private const val ZOOM_EXPAND_PX = 44f       // 外扩判定：距基准距离增加量
+private const val ZOOM_CONTRACT_PX = 36f     // 内收判定：距基准距离减少量
+private const val ZOOM_HOLD_MS = 3000L       // 保持静止时长（进入/加档/减档/退出统一 3 秒）
+private const val ZOOM_HOLD_JITTER_PX = 2.5f // 事件间距离抖动容差（≤视为静止，不打断倒计时）
+private const val ZOOM_HOLD_DRIFT_PX = 7f    // 保持期累计漂移容差（超过=仍在移动，倒计时重置）
+private const val ZOOM_HOLD_PAN_PX = 6f      // 保持期平移容差（超过=取消倒计时）
 
 /** -Dselkies.zoomdbg：放大镜缩放链路追踪（滚轮 ctrl 判定/焦点） */
 private val ZOOMDBG = System.getProperty("selkies.zoomdbg") != null
@@ -264,6 +284,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     // v2.6.0：虚拟手柄（屏上手柄；无物理手柄也能玩远程游戏）
     var showVirtualPad by remember { mutableStateOf(false) }
     var virtualPadKbMap by remember { mutableStateOf(false) }
+    // v2.7.13 虚拟鼠标面板（工具栏「虚拟鼠标」按钮弹出：触控板+实体键+滚动滑条）
+    var showVirtualMouse by remember { mutableStateOf(false) }
     val virtualEngine = remember(session) { com.selkies.client.ui.panels.VirtualGamepadEngine(session) }
     // 【v2.7.7】手柄触感反馈（按键振动；Android 真机生效，桌面空操作）
     androidx.compose.runtime.DisposableEffect(virtualEngine) {
@@ -395,6 +417,9 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     // 【v2.7.12】美观虚拟鼠标状态：手势处理器写入（press/release/pulse）→ 覆盖层动画读取。
     //   纯快照状态写入，不消费事件、不改变任何手势判定控制流 → 与拖动/放大镜零冲突。
     val vcursor = remember { VirtualCursorState() }
+    // 【v2.7.13】放大镜手势倒计时指示状态（手势处理器写入 → 指示环覆盖层读取，纯渲染层）
+    val zoomHold = remember { ZoomHoldState() }
+    val haptic = LocalHapticFeedback.current
     // 【v2.7.12】虚拟鼠标开关（设置持久化；-Dselkies.vcursor=false 可测试强制关）
     val virtualCursorOn = System.getProperty("selkies.vcursor")?.toBoolean()
         ?: state.store.settings.value.virtualCursorEnabled
@@ -431,12 +456,13 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     //   Android 真返回键恒启用（根层弹出退出确认，行为与旧版一致）
     val hasDismissibleLayer = panel != SessionPanel.NONE || showVolumePopup || showZoomControls ||
             showVirtualPad || floatingKb || quickBar || showModeSelector || showInputPicker || fullscreen ||
-            showRoleSwitcher
+            showRoleSwitcher || showVirtualMouse
     PlatformBackHandler(enabled = hasDismissibleLayer || platform.isTouchDevice()) {
         when {
             panel != SessionPanel.NONE -> panel = SessionPanel.NONE
             showVolumePopup -> showVolumePopup = false
             showZoomControls -> showZoomControls = false
+            showVirtualMouse -> showVirtualMouse = false
             showVirtualPad -> showVirtualPad = false
             floatingKb -> floatingKb = false
             quickBar -> quickBar = false
@@ -534,7 +560,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
         //        仍可用物理键盘打字到远程；仅文本框聚焦时才留给本地输入）
         platform.setPhysicalKeyHandler { code, down ->
             if (!viewOnly && panel == SessionPanel.NONE && (!floatingKb || !kbTextFocused) && !quickBar &&
-                !showZoomControls && !showVirtualPad && !showVolumePopup && !showInputPicker && !showModeSelector &&
+                !showZoomControls && !showVirtualPad && !showVirtualMouse && !showVolumePopup &&
+                !showInputPicker && !showModeSelector &&
                 state.store.settings.value.physicalKeyboardPassthrough
             ) {
                 val ks = platform.nativeKeyCodeToKeysym(code, 0)
@@ -705,7 +732,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     /** 是否有本地交互层打开（此时物理键不得发往远程——文本框/面板要接收键盘） */
     fun inputOverlayOpen(): Boolean =
         panel != SessionPanel.NONE || floatingKb || quickBar || showZoomControls || showVirtualPad ||
-                showVolumePopup || showInputPicker || showModeSelector || exitConfirm || savedEvent != null
+                showVirtualMouse || showVolumePopup || showInputPicker || showModeSelector ||
+                exitConfirm || savedEvent != null
 
     fun handleKeyEvent(event: androidx.compose.ui.input.key.KeyEvent): Boolean {
         // 【v2.7.12】修饰键物理状态跟踪（先于一切门控；桌面 keyboardModifiers 恒空的兜底）
@@ -759,6 +787,13 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                         var twoFingerMoved = false
                         var lastTapUpAt = 0L            // v2.7.11：TRACKPAD 上次轻点完成时刻（双击窗口判定）
 
+                        // ---- v2.7.13 放大镜手势状态机：外扩/内收 + 停顿保持 → 缩放/退出（不再即时缩放）----
+                        var tfBaseDist = 0f       // 双指基准距离（会话开始/触发后重置）
+                        var tfHoldRefDist = 0f    // 倒计时参考距离（检测保持期漂移）
+                        var tfHoldTarget = 0      // 0=无 1=进入放大 2=再加一档 3=减一档/退出
+                        var tfHoldSince = 0L      // 倒计时起始时刻
+                        var tfHoldActive = false  // 倒计时进行中
+
                         // ---- v2.7.0：桌面鼠标拖拽 = 放大镜平移（纯本地）；全屏边缘唤出工具栏 ----
                         // 放大状态：左键按下不动→松开 = 远程点击（延迟决策）；拖动 = 本地平移；中键拖动 = 平移
                         var mousePanActive = false
@@ -789,6 +824,29 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                             vcursor.release()
                         }
 
+                        /** 【v2.7.13】取消放大镜手势倒计时（指示环一并隐藏） */
+                        fun cancelZoomHold() {
+                            tfHoldActive = false
+                            tfHoldTarget = 0
+                            zoomHold.cancel()
+                        }
+
+                        /** 【v2.7.13】倒计时完成 → 执行缩放动作（触觉反馈；重置基准防连续误触发） */
+                        fun fireZoomHold() {
+                            val ps = touches.values.toList()
+                            val mid = if (ps.size >= 2) Offset((ps[0].x + ps[1].x) / 2f, (ps[0].y + ps[1].y) / 2f) else pressPos
+                            if (ZOOMDBG) println("[Selkies][ZoomDbg] hold-fire target=$tfHoldTarget zoom=$localZoom")
+                            when (tfHoldTarget) {
+                                1 -> zoomAt(mid, 2f)                                     // 进入放大
+                                2 -> zoomAt(mid, (localZoom + 1f).coerceAtMost(5f))      // 再加一档
+                                3 -> zoomAt(mid, (localZoom - 1f).coerceIn(1f, 5f))      // 减一档（到 1x = 退出）
+                            }
+                            tfBaseDist = twoFingerDist
+                            cancelZoomHold()
+                            twoFingerMoved = true
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        }
+
                         while (true) {
                             // 长按计时：单指按下未移动未触发时，等到 LONG_PRESS_MS
                             // 【v2.7.11 拖动保护】已发送左键按下（leftDownSent）时绝不触发长按右键——
@@ -797,14 +855,16 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                             //   或长按仅限未发键时（TRACKPAD）。
                             val needTimer = touches.size == 1 && !touchMoved && !longFired && !viewOnly && !leftDownSent &&
                                     (inputMode == InputMode.TOUCH || inputMode == InputMode.TRACKPAD)
-                            val waitMs = if (needTimer) {
+                            var waitMs = if (needTimer) {
                                 (LONG_PRESS_MS - (System.currentTimeMillis() - pressStart)).coerceIn(16L, LONG_PRESS_MS)
                             } else 60_000L
+                            // 【v2.7.13】放大镜手势倒计时：60ms tick 驱动进度环推进与触发判定
+                            if (tfHoldActive && touches.size >= 2) waitMs = minOf(waitMs, 60L)
                             val event = withTimeoutOrNull(waitMs) {
                                 awaitPointerEvent(PointerEventPass.Initial)
                             }
                             if (event == null) {
-                                // 超时：长按 → 右键
+                                // 超时：单指长按 → 右键；双指保持倒计时 → 推进/触发
                                 if (needTimer) {
                                     longFired = true
                                     if (inputMode == InputMode.TOUCH) {
@@ -813,6 +873,33 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                         rightClickAt(pressPos)
                                     } else {
                                         trackpadClick(Protocol.BUTTON_RIGHT)
+                                    }
+                                } else if (tfHoldActive && touches.size >= 2) {
+                                    val ps = touches.values.toList()
+                                    if (ps.size >= 2) {
+                                        val d = hypot(ps[0].x - ps[1].x, ps[0].y - ps[1].y)
+                                        val now = System.currentTimeMillis()
+                                        if (abs(d - tfHoldRefDist) > ZOOM_HOLD_DRIFT_PX) {
+                                            // 仍在缓慢移动 → 倒计时重置（等待真正静止）
+                                            tfHoldRefDist = d
+                                            tfHoldSince = now
+                                        }
+                                        val held = now - tfHoldSince
+                                        if (held >= ZOOM_HOLD_MS) {
+                                            fireZoomHold()
+                                        } else {
+                                            val label = when (tfHoldTarget) {
+                                                1 -> "进入放大"
+                                                2 -> "再放大一档"
+                                                else -> "缩小 / 退出"
+                                            }
+                                            zoomHold.update(
+                                                Offset((ps[0].x + ps[1].x) / 2f, (ps[0].y + ps[1].y) / 2f),
+                                                held.toFloat() / ZOOM_HOLD_MS, label
+                                            )
+                                        }
+                                    } else {
+                                        cancelZoomHold()
                                     }
                                 }
                                 continue
@@ -991,6 +1078,9 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                         val ps = touches.values.toList()
                                         twoFingerDist = hypot(ps[0].x - ps[1].x, ps[0].y - ps[1].y)
                                         twoFingerMoved = false
+                                        // 【v2.7.13】基准距离 = 会话起始距离；倒计时清零
+                                        tfBaseDist = twoFingerDist
+                                        cancelZoomHold()
                                         acc.scrollY = 0f
                                         acc.zoom = 1f
                                     }
@@ -999,20 +1089,46 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                 PointerEventType.Move -> {
                                     touchChanges.forEach { c -> touches[c.id] = c.position }
                                     if (touches.size >= 2 && !viewOnly) {
-                                        // 双指：捏合 = 本地缩放/放大镜（v2.6.0，以双指中点为焦点，只调本地显示）；
-                                        // 放大后稳定距离拖动 = 本地平移；未放大时拖动 = 远程滚动（原行为）
+                                        // 【v2.7.13 放大镜手势状态机】双指不再即时缩放（旧版距离变化
+                                        //   >0.5px 即 zoomAt = 「双手一放就进放大」根因）。新语义：
+                                        //   外扩 ≥44px + 保持静止 3 秒 → 进入放大/再加一档；
+                                        //   内收 ≥36px + 保持静止 3 秒 → 减一档/退出（缩回 1x）。
+                                        //   快速捏合不触发任何缩放；双指轻点右键/竖滑滚轮/放大后稳定拖平移保留。
                                         val ps = touches.values.toList()
                                         val d = hypot(ps[0].x - ps[1].x, ps[0].y - ps[1].y)
                                         val mid = Offset((ps[0].x + ps[1].x) / 2f, (ps[0].y + ps[1].y) / 2f)
                                         val pan = touchChanges.fold(Offset.Zero) { a, c -> a + c.positionChange() }
-                                        if (twoFingerDist > 10f && d > 10f && abs(d - twoFingerDist) > 0.5f) {
+                                        val distDelta = d - twoFingerDist
+                                        if (twoFingerDist > 10f && d > 10f && abs(distDelta) > ZOOM_HOLD_JITTER_PX) {
+                                            // 距离显著变化 = 捏合进行中：评估外扩/内收意图（不缩放；
+                                            //   倒计时随移动重置，静止后由主循环 tick 推进）
                                             twoFingerMoved = true
-                                            zoomAt(mid, localZoom * (d / twoFingerDist))
+                                            cancelZoomHold()
+                                            when {
+                                                d > tfBaseDist + ZOOM_EXPAND_PX -> {
+                                                    tfHoldTarget = if (localZoom <= 1.01f) 1 else 2
+                                                    tfHoldRefDist = d
+                                                    tfHoldSince = System.currentTimeMillis()
+                                                    tfHoldActive = true
+                                                }
+                                                d < tfBaseDist - ZOOM_CONTRACT_PX && localZoom > 1.01f -> {
+                                                    tfHoldTarget = 3
+                                                    tfHoldRefDist = d
+                                                    tfHoldSince = System.currentTimeMillis()
+                                                    tfHoldActive = true
+                                                }
+                                            }
+                                        } else if (tfHoldActive) {
+                                            // 倒计时进行中：明显平移/距离突变 → 取消（微小抖动容忍）
+                                            if (hypot(pan.x, pan.y) > ZOOM_HOLD_PAN_PX ||
+                                                abs(distDelta) > ZOOM_HOLD_JITTER_PX
+                                            ) cancelZoomHold()
                                         } else if (localZoom > 1.01f && (abs(pan.x) > 0.5f || abs(pan.y) > 0.5f)) {
-                                            // 放大状态：双指稳定距离拖动 = 平移画面（本地）
+                                            // 放大状态：双指稳定距离拖动 = 平移画面（本地）——原行为保留
                                             twoFingerMoved = true
                                             zoomPan = clampZoomPan(zoomPan + pan, localZoom)
                                         } else if (abs(pan.y) > 0.5f) {
+                                            // 未放大：双指竖滑 = 远程滚动——原行为保留
                                             twoFingerMoved = true
                                             acc.scrollY += -pan.y / 2f
                                             val notches = (acc.scrollY / TOUCH_SCROLL_NOTCH_PX).toInt()
@@ -1063,6 +1179,8 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                 }
                                 PointerEventType.Release -> {
                                     touchChanges.forEach { c -> touches.remove(c.id) }
+                                    // 【v2.7.13】手指不足两根 → 取消放大镜手势倒计时
+                                    if (touches.size < 2) cancelZoomHold()
                                     if (touches.isEmpty()) {
                                         // 【v2.7.12】全部手指离开 → 虚拟鼠标视觉释放
                                         vcursor.release()
@@ -1147,6 +1265,11 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                     touchDevice = platform.isTouchDevice(),
                     mapFromStream = ::mapFromStream
                 )
+            }
+
+            // ============ v2.7.13 放大镜手势倒计时指示环（纯渲染，双指中点，视图坐标）============
+            if (zoomHold.active) {
+                ZoomHoldIndicator(zoomHold)
             }
 
             // ============ FPS/带宽/延迟悬浮条（官方 StreamStrip 等效，设置开关） ============
@@ -1451,6 +1574,14 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                                 Icons.Filled.VideogameAsset, if (showVirtualPad) "关闭手柄" else "虚拟手柄",
                                 tint = if (showVirtualPad) Color(0xFF4ADE80) else Color.White
                             ) { showVirtualPad = !showVirtualPad }
+                            "vmouse" -> if (platform.isTouchDevice()) {
+                                // v2.7.13 虚拟鼠标面板：弹出真正可操作的虚拟鼠标
+                                // （触控板+左中右实体键+滚动滑条+Ctrl+C/V/X/A+灵敏度）
+                                ToolButton(
+                                    Icons.Filled.Adjust, if (showVirtualMouse) "关闭虚拟鼠标" else "虚拟鼠标",
+                                    tint = if (showVirtualMouse) Color(0xFF4ADE80) else Color.White
+                                ) { showVirtualMouse = !showVirtualMouse }
+                            }
                             "zoom" -> ToolButton(
                                 Icons.Filled.ZoomIn, if (localZoom > 1.01f) "${(localZoom * 100).toInt()}%" else "放大镜",
                                 tint = if (localZoom > 1.01f) Color(0xFF60A5FA) else Color.White
@@ -1556,6 +1687,35 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
                 visible = quickBar,
                 onDismiss = { quickBar = false },
                 onOpenManager = { quickBar = false; panel = SessionPanel.HOTKEYS }
+            )
+        }
+
+        // ============ v2.7.13 虚拟鼠标面板（真正的可操作虚拟鼠标：触控板+实体键+滚动滑条）============
+        if (!viewOnly && status == SelkiesSession.Status.CONNECTED && platform.isTouchDevice()) {
+            VirtualMousePanel(
+                visible = showVirtualMouse,
+                modifier = Modifier.align(Alignment.BottomCenter),
+                sensitivity = state.store.settings.value.virtualMouseSensitivity,
+                onSensitivityChange = { s -> state.store.updateSettings { it.virtualMouseSensitivity = s } },
+                onMoveRelative = { dx, dy, mask ->
+                    if (!viewOnly) session.sendMouseMoveRelative(dx.roundToInt(), dy.roundToInt(), mask)
+                },
+                onPressButton = { b ->
+                    if (!viewOnly) {
+                        if (b == Protocol.BUTTON_LEFT) vcursor.press()
+                        session.sendMouseMoveRelative(0, 0, b)
+                    }
+                },
+                onReleaseButton = { _ ->
+                    if (!viewOnly) {
+                        vcursor.release()
+                        session.sendMouseMoveRelative(0, 0, 0)
+                    }
+                },
+                onTapButton = { b -> trackpadClick(b) },
+                onScroll = { v, n -> scrollNotches(v, n) },
+                onKeyChord = { keys -> if (!viewOnly) session.sendKeyChord(keys) },
+                onDismiss = { showVirtualMouse = false }
             )
         }
 
@@ -2261,6 +2421,70 @@ private const val VCURSOR_PRESS_SCALE = 0.84f
  * - [release]：松开/手势被双指接管 → pressed=false（幂等）
  * - [pulse]：完整点击对（左/右/中键单击、双指轻点右键、放大镜延迟点击）→ 单发涟漪
  */
+/**
+ * v2.7.13 放大镜手势倒计时指示状态：手势处理器写入（60ms tick）→ 指示环覆盖层读取。
+ * 纯渲染层（无 pointerInput），与远程画面手势零冲突。
+ */
+private class ZoomHoldState {
+    var active by mutableStateOf(false)
+    var mid by mutableStateOf(Offset.Zero)   // 双指中点（视图坐标）
+    var progress by mutableStateOf(0f)        // 0..1
+    var label by mutableStateOf("")
+    fun update(mid: Offset, progress: Float, label: String) {
+        this.mid = mid
+        this.progress = progress
+        this.label = label
+        active = true
+    }
+    fun cancel() {
+        active = false
+    }
+}
+
+/**
+ * v2.7.13 放大镜手势倒计时指示环：双指外扩/内收达标后跟随双指中点显示，
+ * 进度环满 3 秒触发缩放（进入/加档/减档/退出）。半透明圆底 + 进度弧 + 目标文案。
+ */
+@Composable
+private fun ZoomHoldIndicator(state: ZoomHoldState) {
+    Box(Modifier.fillMaxSize()) {
+        val ringPx = with(LocalDensity.current) { 92.dp.toPx() }
+        Surface(
+            modifier = Modifier
+                .offset {
+                    IntOffset(
+                        (state.mid.x - ringPx / 2f).roundToInt(),
+                        (state.mid.y - ringPx / 2f).roundToInt()
+                    )
+                }
+                .size(92.dp),
+            shape = CircleShape,
+            color = Color.Black.copy(alpha = 0.55f)
+        ) {
+            Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                Canvas(Modifier.size(74.dp)) {
+                    val stroke = 5.dp.toPx()
+                    drawArc(
+                        Color.White.copy(alpha = 0.22f), 0f, 360f, false,
+                        style = Stroke(stroke, cap = StrokeCap.Round)
+                    )
+                    drawArc(
+                        Color(0xFF60A5FA), -90f, 360f * state.progress.coerceIn(0f, 1f), false,
+                        style = Stroke(stroke, cap = StrokeCap.Round)
+                    )
+                }
+                Text(
+                    state.label,
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelSmall,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(horizontal = 6.dp)
+                )
+            }
+        }
+    }
+}
+
 private class VirtualCursorState {
     var pressed by mutableStateOf(false)
     var rippleAt by mutableStateOf(0L)
@@ -2492,7 +2716,7 @@ object ToolbarDefaults {
     val ALL = listOf(
         "keyboard", "hotkeys", "clipboard", "files", "print", "mic", "camera",
         "hardware", "quality", "touchmode", "apps", "stats",
-        "screenshot", "record", "volume", "gamepad", "virtualpad", "zoom",
+        "screenshot", "record", "volume", "gamepad", "virtualpad", "vmouse", "zoom",
         "media", "fullscreen"
     )
 
@@ -2502,7 +2726,7 @@ object ToolbarDefaults {
         "print" to "打印", "mic" to "麦克风", "camera" to "摄像头", "hardware" to "硬件",
         "quality" to "画质", "touchmode" to "触屏/触摸板", "apps" to "应用", "stats" to "统计",
         "screenshot" to "截图", "record" to "录屏", "volume" to "音量", "gamepad" to "手柄",
-        "virtualpad" to "虚拟手柄", "zoom" to "放大镜", "media" to "媒体库", "fullscreen" to "全屏"
+        "virtualpad" to "虚拟手柄", "vmouse" to "虚拟鼠标", "zoom" to "放大镜", "media" to "媒体库", "fullscreen" to "全屏"
     )
 }
 

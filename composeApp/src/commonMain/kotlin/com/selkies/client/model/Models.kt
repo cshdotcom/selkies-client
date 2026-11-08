@@ -146,6 +146,8 @@ data class AppSettings(
     /** v2.7.12 美观虚拟鼠标：远程画面上本地渲染动画光标（按下涟漪/触点光环/回退美型箭头；
      * 纯渲染层零手势拦截，与放大镜平移/双指缩放/拖动无冲突。开关即时生效并持久化。 */
     var virtualCursorEnabled: Boolean = true,
+    /** v2.7.13 虚拟鼠标面板触控板灵敏度（0.5–3.0；持久化） */
+    var virtualMouseSensitivity: Float = 1f,
     // 键盘
     var keyboardScale: Float = 0f,           // 分类键盘缩放（0 = 未设置，自动适配）
     var keyboardFullScale: Float = 0f,       // v2.6.0 完整键盘独立缩放（0 = 未设置，自动适配屏宽）
