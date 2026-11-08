@@ -164,16 +164,26 @@ jobs:
           mv Selkies-Client-*-$VER.zip Selkies-Client-*-$VER.tar.gz selkies-client-$VER-source.tar.gz dist/ 2>/dev/null
           ls -la dist/
 
-      - name: 生成 Release 说明（取自标签注释）
+      - name: 生成 Release 说明（取自 GitHub 标签对象——runner 本地 tag 可能被 checkout 转轻量）
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          git tag -l --format='%(contents:body)' "$TAG" > release-notes.md
-          # 标签无注释时兜底
+          # 从 GitHub API 取 annotated tag 的完整 message（本地 git tag 在 checkout 后
+          # 可能被转为轻量 tag——%(contents) 会退化为提交信息，v2.7.14 实测踩坑）
+          TAG_TYPE=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" -q '.object.type')
+          if [ "$TAG_TYPE" = "tag" ]; then
+            TAG_SHA=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" -q '.object.sha')
+            gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_SHA" -q '.message' > release-notes.md
+          else
+            git tag -l --format='%(contents)' "$TAG" > release-notes.md
+          fi
+          # 兜底：标签无注释时
           if [ ! -s release-notes.md ]; then
             echo "Selkies 远程桌面客户端 $TAG 全平台发布（Android APK + 桌面通用 JAR + 五平台便携包 + 源码）。" > release-notes.md
           fi
           echo "--- Release 说明预览 ---"
-          cat release-notes.md
+          head -5 release-notes.md
 
       - name: 创建 GitHub Release 并上传资产
         env:
