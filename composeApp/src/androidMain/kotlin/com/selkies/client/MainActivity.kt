@@ -1,5 +1,7 @@
 package com.selkies.client
 
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -13,6 +15,15 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         com.selkies.client.platform.AndroidPlatform.init(this)
+        // 修复：Android 13+ 通知运行时权限——录屏前台服务通知需要 POST_NOTIFICATIONS，
+        // 首次安装未授权时部分 ROM 直接拒绝前台服务启动→5秒超时杀进程（录屏闪退链源头）。
+        // 启动即请求，配合 RecordingService.startAsForeground 失败 stopSelf 兑底。
+        if (Build.VERSION.SDK_INT >= 33) {
+            val perm = android.Manifest.permission.POST_NOTIFICATIONS
+            if (checkSelfPermission(perm) != PackageManager.PERMISSION_GRANTED) {
+                runCatching { requestPermissions(arrayOf(perm), 0x5e1c) }
+            }
+        }
         setContent {
             App()
         }

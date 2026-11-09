@@ -734,7 +734,19 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
                 audioTrackIdx = realMuxer!!.addTrack(af)
             }
         }
-        realMuxer!!.start()
+        // 修复：muxer.start() 失败（格式/时间基准异常等）时旧版直接抛异常→半初始化状态：
+        // 轨道已加但 started=false，后续 writeSampleData 全部失败且 muxer 无法释放。
+        // 失败即回滚清理（关 muxer+关 pfd+重置轨号）并退出，录制转入安全降级不崩溃。
+        val startedOk = runCatching { realMuxer!!.start() }.isSuccess
+        if (!startedOk) {
+            videoTrackIdx = -1
+            audioTrackIdx = -1
+            runCatching { realMuxer?.release() }
+            realMuxer = null
+            runCatching { pfd?.close() }
+            pfd = null
+            return
+        }
         muxerStarted = true
         // 冲刷音频缓冲
         if (audioTrackIdx >= 0) {
@@ -1183,15 +1195,19 @@ class RecordingService : Service() {
             .setContentIntent(pi)
             .setOngoing(true)
             .build()
-        if (Build.VERSION.SDK_INT >= 34) {
+        // 修复：startForeground 失败时必须主动 stopSelf——targetSdk 34 下前台服务
+        // 5 秒内未进入前台系统抛 ForegroundServiceDidNotStartInTimeException 直接杀进程
+        //（Android 13+ 缺 POST_NOTIFICATIONS 权限时部分 ROM 会拒绝前台启动 =「点录屏即闪退」根因）。
+        val started = if (Build.VERSION.SDK_INT >= 34) {
             runCatching {
                 startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-            }.onFailure {
-                runCatching { startForeground(NOTIF_ID, notification) }
-            }
+            }.recoverCatching {
+                runCatching { startForeground(NOTIF_ID, notification) }.getOrThrow()
+            }.isSuccess
         } else {
-            startForeground(NOTIF_ID, notification)
+            runCatching { startForeground(NOTIF_ID, notification) }.isSuccess
         }
+        if (!started) { runCatching { stopSelf() } }
     }
 
     override fun onDestroy() {
