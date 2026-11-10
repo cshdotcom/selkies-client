@@ -1,0 +1,35 @@
+// gradle-mirror.init.gradle v2 (Groovy)
+// 用途：修 mavenCentral 429——清空默认仓库，重注入阿里云镜像。
+// 要点：init 脚本上下文解析不了全限定类名（如 RepositoriesMode），
+//       一律用闭包动态写法；本项目仓库统一在 settings.gradle.kts 声明
+//       （无 buildSrc/build-logic，build 文件零 repo 声明），
+//       因此只需在 settingsEvaluated 两个注入点做 clear()+重注入。
+
+settingsEvaluated { settings ->
+    // 注入点 1：插件仓库
+    settings.pluginManagement {
+        repositories {
+            clear()
+            maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+            maven { url 'https://maven.aliyun.com/repository/public' }
+            maven { url 'https://maven.aliyun.com/repository/central' }
+            maven { url 'https://maven.aliyun.com/repository/google' }
+            google() // 兜底：阿里云缺 AGP 新版本时直连
+        }
+    }
+    // 注入点 2：依赖仓库（dependencyResolutionManagement）
+    try {
+        settings.dependencyResolutionManagement {
+            repositories {
+                clear()
+                maven { url 'https://maven.aliyun.com/repository/public' }
+                maven { url 'https://maven.aliyun.com/repository/central' }
+                maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+                maven { url 'https://maven.aliyun.com/repository/google' }
+                google() // 兜底
+            }
+        }
+    } catch (Throwable ignored) {
+        // 极老 Gradle 无 dependencyResolutionManagement，忽略
+    }
+}
