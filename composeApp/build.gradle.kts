@@ -128,8 +128,8 @@ android {
         applicationId = "com.selkies.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 20715
-        versionName = "2.7.15"
+        versionCode = 20716
+        versionName = "2.7.16"
         ndkVersion = ""
     }
     // v2.7.5：FFmpeg 原生库压缩存储（APK ~26MB 而非 ~48MB；安装时解压到本地）
@@ -178,7 +178,7 @@ compose.desktop {
         mainClass = "com.selkies.client.MainKt"
         nativeDistributions {
             packageName = "Selkies-Desktop"
-            packageVersion = "2.7.15"
+            packageVersion = "2.7.16"
             description = "Selkies 远程桌面原生客户端"
             vendor = "Selkies Client"
         }
@@ -195,7 +195,7 @@ val desktopFatJar = tasks.register<Jar>("desktopFatJar") {
     manifest {
         attributes["Main-Class"] = "com.selkies.client.MainKt"
         attributes["Implementation-Title"] = "Selkies Desktop Client"
-        attributes["Implementation-Version"] = "2.7.15"
+        attributes["Implementation-Version"] = "2.7.16"
     }
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
     exclude("META-INF/versions/**/module-info.class")
