@@ -1,0 +1,103 @@
+name: 录屏闪退诊断
+
+# 目标：在 KVM 加速的 Android 模拟器上复现 RecordingService 启动崩溃，
+# 抓 crash/main buffer 日志作为 artifact 上传，供根因定位。
+# 触发：push 到 main 或 fix/* 分支（paths 过滤避免无关变更空跑）；手动。
+
+on:
+  push:
+    branches: [main, 'fix/**']
+    paths:
+      - 'composeApp/src/androidMain/**'
+      - 'composeApp/build.gradle.kts'
+      - '.github/workflows/crash-repro.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: crash-repro-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  crash-repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: 缓存 Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'composeApp/build.gradle.kts') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: 构建 Android Release APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :composeApp:assembleRelease --console=plain --no-daemon
+
+      - name: 启动模拟器并复现 RecordingService 启动
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          profile: pixel_6
+          script: |
+            set +e
+            echo "=== 找 APK ==="
+            APK=$(find composeApp/build/outputs/apk/release -name "*.apk" | head -1)
+            echo "APK=$APK"
+            [ -f "$APK" ] || { echo "APK 缺失"; exit 1; }
+
+            echo "=== 安装 APK ==="
+            adb install -r "$APK" 2>&1 | tail -3
+
+            echo "=== 预授权 POST_NOTIFICATIONS（避免 MainActivity 弹窗阻塞）==="
+            adb shell pm grant com.selkies.client android.permission.POST_NOTIFICATIONS 2>&1 || true
+
+            echo "=== 清空 logcat ==="
+            adb logcat -c
+
+            echo "=== 启动 MainActivity ==="
+            adb shell am start -W -n com.selkies.client/.MainActivity 2>&1 | tail -5
+            sleep 8
+
+            echo "=== 进程状态（启动后）==="
+            adb shell ps -A | grep -i selkies || echo "WARN: selkies 进程未找到——可能启动即崩"
+
+            echo "=== 清空 logcat 再触发 RecordingService ==="
+            adb logcat -c
+            adb shell am start-foreground-service -n com.selkies.client/.platform.RecordingService 2>&1 | tail -3
+            sleep 12
+
+            echo "=== 进程状态（触发后）==="
+            adb shell ps -A | grep -i selkies || echo "ALERT: selkies 进程消失——RecordingService 触发即崩"
+
+            echo "=== 抓取日志 ==="
+            adb logcat -b crash -d > crash-buffer.log
+            adb logcat -b main -d > main-buffer.log
+            adb shell dumpsys activity services com.selkies.client > service-state.txt
+            adb shell dumpsys notification --noredact > notif-state.txt
+            echo "=== crash buffer 行数 ==="
+            wc -l crash-buffer.log main-buffer.log service-state.txt notif-state.txt
+
+      - name: 上传诊断 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-diag-${{ github.run_id }}
+          path: |
+            crash-buffer.log
+            main-buffer.log
+            service-state.txt
+            notif-state.txt
+          retention-days: 14
