@@ -19,7 +19,9 @@ concurrency:
 
 jobs:
   crash-repro:
-    runs-on: ubuntu-latest
+    # 钉住 24.04：ubuntu-latest 已滚动到 26.04，KVM 被移除，
+    # emulator 会退化成纯软件模拟（boot 10min+ 且 boot 后即崩 Broken pipe）
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -51,6 +53,7 @@ jobs:
           arch: x86_64
           target: google_apis
           profile: pixel_6
+          emulator-boot-timeout: 900
           script: |
             set +e
             cd "$GITHUB_WORKSPACE" || { echo "cd GITHUB_WORKSPACE 失败"; pwd; exit 1; }
