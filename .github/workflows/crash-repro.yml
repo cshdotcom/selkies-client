@@ -53,10 +53,24 @@ jobs:
           profile: pixel_6
           script: |
             set +e
-            echo "=== 找 APK ==="
-            APK=$(find composeApp/build/outputs/apk/release -name "*.apk" | head -1)
+            cd "$GITHUB_WORKSPACE" || { echo "cd GITHUB_WORKSPACE 失败"; pwd; exit 1; }
+            echo "=== cwd ==="
+            pwd
+            echo "=== ls release 目录 ==="
+            ls -la composeApp/build/outputs/apk/release/ 2>&1
+
+            echo "=== 找 APK（已知文件名兜底）==="
+            APK="composeApp/build/outputs/apk/release/composeApp-release.apk"
+            if [ ! -f "$APK" ]; then
+              echo "主路径缺失，find 兜底"
+              APK=$(find "$GITHUB_WORKSPACE" -name "composeApp-release.apk" -type f 2>/dev/null | head -1)
+            fi
             echo "APK=$APK"
-            [ -f "$APK" ] || { echo "APK 缺失"; exit 1; }
+            if [ ! -f "$APK" ]; then
+              echo "APK 缺失，列出 build/outputs 全树："
+              find composeApp/build/outputs -type f 2>/dev/null | head -20
+              exit 1
+            fi
 
             echo "=== 安装 APK ==="
             adb install -r "$APK" 2>&1 | tail -3
@@ -82,13 +96,13 @@ jobs:
             echo "=== 进程状态（触发后）==="
             adb shell ps -A | grep -i selkies || echo "ALERT: selkies 进程消失——RecordingService 触发即崩"
 
-            echo "=== 抓取日志 ==="
-            adb logcat -b crash -d > crash-buffer.log
-            adb logcat -b main -d > main-buffer.log
-            adb shell dumpsys activity services com.selkies.client > service-state.txt
-            adb shell dumpsys notification --noredact > notif-state.txt
-            echo "=== crash buffer 行数 ==="
-            wc -l crash-buffer.log main-buffer.log service-state.txt notif-state.txt
+            echo "=== 抓取日志（写绝对路径）==="
+            adb logcat -b crash -d > "$GITHUB_WORKSPACE/crash-buffer.log"
+            adb logcat -b main -d > "$GITHUB_WORKSPACE/main-buffer.log"
+            adb shell dumpsys activity services com.selkies.client > "$GITHUB_WORKSPACE/service-state.txt"
+            adb shell dumpsys notification --noredact > "$GITHUB_WORKSPACE/notif-state.txt"
+            echo "=== 文件行数 ==="
+            wc -l "$GITHUB_WORKSPACE/crash-buffer.log" "$GITHUB_WORKSPACE/main-buffer.log" "$GITHUB_WORKSPACE/service-state.txt" "$GITHUB_WORKSPACE/notif-state.txt"
 
       - name: 上传诊断 artifact
         if: always()
