@@ -19,8 +19,9 @@ concurrency:
 
 jobs:
   crash-repro:
-    # 钉住 24.04：ubuntu-latest 已滚动到 26.04，KVM 被移除，
-    # emulator 会退化成纯软件模拟（boot 10min+ 且 boot 后即崩 Broken pipe）
+    # 钉住 24.04：ubuntu-latest 已滚动到 26.04。
+    # 注意：即使 24.04，runner 用户也可能不在 kvm 组（ProbeKVM 报 no permissions），
+    # 所以有下方「授权 KVM」步骤做 chmod 666 /dev/kvm workaround，否则 boot 900s 超时。
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -45,6 +46,17 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew :composeApp:assembleRelease --console=plain --no-daemon
+
+      - name: 授权 KVM（runner 用户不在 kvm 组的 workaround）
+        run: |
+          echo "=== /dev/kvm 修复前 ==="
+          ls -l /dev/kvm || { echo "WARN: /dev/kvm 不存在"; }
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null || true
+          sudo udevadm control --reload-rules 2>/dev/null || true
+          sudo udevadm trigger --name-match=kvm 2>/dev/null || true
+          echo "=== /dev/kvm 修复后 ==="
+          ls -l /dev/kvm || true
 
       - name: 启动模拟器并复现 RecordingService 启动
         uses: reactivecircus/android-emulator-runner@v2
