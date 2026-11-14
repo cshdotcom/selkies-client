@@ -42,8 +42,19 @@ adb shell ps -A | grep -i selkies || echo "WARN: selkies 进程未找到——�
 
 echo "=== 清空 logcat 再触发 RecordingService ==="
 adb logcat -c
+
+# shell uid 直接 start-foreground-service 会被拒（Requires permission not exported），
+# 先 adb root（google_apis 镜像支持 userdebug root），uid 0 可启动未导出组件，
+# 服务 onCreate/onStartCommand 仍在应用进程内跑，等效应用内 startForegroundService。
+echo "=== adb root ==="
+adb root 2>&1 | tail -1
+adb wait-for-device
+sleep 3
+adb shell id -u 2>&1 | tail -1
+
+echo "=== 触发 RecordingService（root）==="
 adb shell am start-foreground-service -n com.selkies.client/.platform.RecordingService 2>&1 | tail -3
-sleep 12
+sleep 15
 
 echo "=== 进程状态（触发后）==="
 adb shell ps -A | grep -i selkies || echo "ALERT: selkies 进程消失——RecordingService 触发即崩"
