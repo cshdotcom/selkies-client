@@ -536,6 +536,70 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
         }
     }
 
+    // v2.7.18：编码器输出格式取证（每实例只记一次，用户回传崩溃报告即知设备编码器行为）
+    @Volatile private var encFormatLogged = false
+
+    private fun logEncFormat(tag: String) {
+        if (!encFormatLogged) {
+            encFormatLogged = true
+            com.selkies.client.core.CrashCapture.crumb("ENC", "编码器输出格式=$tag")
+        }
+    }
+
+    /**
+     * 编码器帧输出 → 标准 AVCC 样本（[4B NAL长][NAL]...；与直采路径一致）。
+     * 判定顺序：先验 AVCC 直通 → 再剥双封装外层 → 最后才 Annex-B——
+     * 避免小帧的长度前缀字节（如 unitLen=0x12C 时首三字节 00 00 01）
+     * 被误判为 Annex-B 起始码。
+     */
+    private fun normalizeEncoderFrame(b: ByteArray): ByteArray {
+        if (b.size < 6) return b
+        if (validAvccChain(b, 0, b.size)) {
+            logEncFormat("AVCC直通")
+            return b
+        }
+        if (b.size >= 8 && readLen(b, 0) == b.size - 4) {
+            val inner = b.copyOfRange(4, b.size)
+            if (validAvccChain(inner, 0, inner.size)) {
+                logEncFormat("双封装剥外层(unitLen=${b.size - 4})")
+                return inner
+            }
+            if (startsWithStartCode(inner)) {
+                logEncFormat("双封装内AnnexB→annexToAvcc")
+                annexToAvcc(inner, videoCodec == 5)?.let { return it.sample }
+            }
+        }
+        if (startsWithStartCode(b)) {
+            logEncFormat("AnnexB起始码→annexToAvcc")
+            return annexToAvcc(b, videoCodec == 5)?.sample ?: b
+        }
+        logEncFormat("未识别格式原样透传(首字节=${b[0].toInt() and 0xff})")
+        return b
+    }
+
+    /** 编码器 csd → [4B 长度前缀][NAL 裸体]（MPEG4Writer 可解析，直采路径同款） */
+    private fun normalizeEncoderCsd(b: ByteArray): ByteArray {
+        if (b.size < 4) return b
+        if (validAvccChain(b, 0, b.size)) return b
+        if (b.size >= 8 && readLen(b, 0) == b.size - 4) {
+            val inner = b.copyOfRange(4, b.size)
+            if (startsWithStartCode(inner)) annexToAvcc(inner, false)?.sps?.let { return it }
+            if (validAvccChain(inner, 0, inner.size)) return inner
+            val hdr = inner[0].toInt() and 0xff
+            if (hdr != 0 && (hdr and 0x80) == 0 && (hdr and 0x1f) in 1..12) return wrapNalLen(inner)
+            return inner
+        }
+        if (startsWithStartCode(b)) {
+            if (videoCodec == 5) return b // HEVC csd 由 mergeHevcCsd 路径处理
+            annexToAvcc(b, false)?.sps?.let { return it }
+            val off = if (b[2] == 1.toByte()) 3 else 4
+            return wrapNalLen(b.copyOfRange(off, b.size))
+        }
+        val hdr = b[0].toInt() and 0xff
+        if (hdr != 0 && (hdr and 0x80) == 0 && (hdr and 0x1f) in 1..12) return wrapNalLen(b)
+        return b
+    }
+
     override fun writeJpegFrame(parts: List<Pair<Int, ByteArray>>, ptsUs: Long): Boolean {
         synchronized(lock) {
             if (closed) return false
@@ -545,17 +609,31 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
                 containerMp4 = true
                 enc = JpegH264Encoder(
                     onReady = { csd0, csd1 ->
+                        // v2.7.18: csd 规范化（非标编码器 → avcC 无参数集 → 黑屏，见类注释）
+                        val s0: ByteArray
+                        val s1: ByteArray?
+                        if (startsWithStartCode(csd0) && csd1 == null) {
+                            // csd-0 连体携带 SPS(+PPS)（Annex-B）→ 拆分
+                            val r = annexToAvcc(csd0, false)
+                            s0 = r?.sps ?: normalizeEncoderCsd(csd0)
+                            s1 = r?.pps
+                        } else {
+                            s0 = normalizeEncoderCsd(csd0)
+                            s1 = csd1?.let { normalizeEncoderCsd(it) }
+                        }
                         // 编码器输出格式就绪：建 muxer + 视频轨
                         if (realMuxer == null && !ensureMuxer()) return@JpegH264Encoder false
                         if (videoTrackIdx < 0) {
-                            sps = csd0; pps = csd1
+                            sps = s0; pps = s1
                             gotKeyframe = true
                             startMuxer()
                         }
                         videoTrackIdx >= 0
                     },
                     onFrame = { sample, keyframe, pts ->
-                        if (muxerStarted && videoTrackIdx >= 0) writeSample(sample, keyframe, pts) else true
+                        if (muxerStarted && videoTrackIdx >= 0) {
+                            writeSample(normalizeEncoderFrame(sample), keyframe, pts)
+                        } else true
                     }
                 )
                 jpegEncoder = enc
@@ -879,6 +957,57 @@ private fun annexToAvcc(data: ByteArray, hevc: Boolean): AvccResult? {
     return AvccResult(sample, sps, pps, vps)
 }
 
+// ---------------- v2.7.18 编码器输出规范化（录屏黑屏真机根因修复） ----------------
+//
+// v2.7.17 用户真机实锤：部分 MediaCodec AVC 编码器（ByteBuffer 输入路径）输出非标准
+// 格式——每个输出 buffer = [4B 单元总长][4B NAL长][NAL]...（AVCC 外再套一层单元长度），
+// csd 同样带外层长度。MPEG4Writer 对此：
+//   ① csd 解析失败 → avcC 无参数集（numSPS=0，profile 字节错乱）→ 解码器无法初始化；
+//   ② 首个样本（含 SPS/PPS 的 IDR）被吞进参数集提取——数据写入 mdat 但样本表无条目；
+//   ③ 样本表整体错位 → 解码器按错位长度读 NAL → 全部解码失败。
+// 表现 =「录屏能生成但播放全黑、进度异常」（ffprobe: Invalid NAL unit size /
+// missing picture in access unit）。
+// 修复：帧样本与 csd 统一规范为直采路径同款 AVCC（[4B NAL长][NAL]...）——该格式
+// 经 H.264 直采录屏长期验证可用。
+
+private fun readLen(b: ByteArray, off: Int): Int =
+    ((b[off].toInt() and 0xff) shl 24) or ((b[off + 1].toInt() and 0xff) shl 16) or
+        ((b[off + 2].toInt() and 0xff) shl 8) or (b[off + 3].toInt() and 0xff)
+
+private fun startsWithStartCode(b: ByteArray): Boolean =
+    (b.size >= 3 && b[0] == 0.toByte() && b[1] == 0.toByte() && b[2] == 1.toByte()) ||
+        (
+            b.size >= 4 && b[0] == 0.toByte() && b[1] == 0.toByte() &&
+                b[2] == 0.toByte() && b[3] == 1.toByte()
+            )
+
+/** 校验 [off,end) 是否为自洽的 AVCC NAL 链（长度精确闭合 + NAL 头合法） */
+private fun validAvccChain(b: ByteArray, start: Int, end: Int): Boolean {
+    var p = start
+    var nals = 0
+    while (p + 4 <= end) {
+        val len = readLen(b, p)
+        if (len <= 1 || p + 4 + len > end) return false
+        val hdr = b[p + 4].toInt() and 0xff
+        if (hdr and 0x80 != 0) return false                       // forbidden zero bit
+        val t = hdr and 0x1f
+        if (t == 0 || t > 12) return false                        // NAL 类型 1..12
+        p += 4 + len
+        nals++
+    }
+    return nals > 0 && p == end
+}
+
+private fun wrapNalLen(body: ByteArray): ByteArray {
+    val out = ByteArray(4 + body.size)
+    out[0] = ((body.size ushr 24) and 0xff).toByte()
+    out[1] = ((body.size ushr 16) and 0xff).toByte()
+    out[2] = ((body.size ushr 8) and 0xff).toByte()
+    out[3] = (body.size and 0xff).toByte()
+    System.arraycopy(body, 0, out, 4, body.size)
+    return out
+}
+
 /**
  * JPEG 条带 → MediaCodec H.264 实时转码（ByteBuffer 输入；帧节奏/时间戳 = WS 到达墙钟）。
  *
@@ -1049,6 +1178,22 @@ private class JpegH264Encoder(
                     if (csd0 != null) ready = onReady(csd0, csd1)
                 } else if (outIdx >= 0) {
                     if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                        // v2.7.18: 部分编码器经 CODEC_CONFIG buffer（而非 output format csd）
+                        // 携带参数集——旧版直接丢弃 = csd 永远缺失 → muxer 无法建轨。
+                        // 捕获交给 onReady（内部规范化为 [4B 长度前缀][NAL]）。
+                        if (!ready && info.size > 4) {
+                            val cb = c.getOutputBuffer(outIdx)
+                            if (cb != null) {
+                                cb.position(info.offset)
+                                cb.limit(info.offset + info.size)
+                                val csdBytes = ByteArray(info.size)
+                                cb.get(csdBytes)
+                                com.selkies.client.core.CrashCapture.crumb(
+                                    "ENC", "CODEC_CONFIG buffer 捕获 csd ${info.size}B"
+                                )
+                                ready = onReady(csdBytes, null)
+                            }
+                        }
                         c.releaseOutputBuffer(outIdx, false)
                         continue
                     }
