@@ -270,6 +270,10 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
     var inputMode by remember { mutableStateOf(if (state.store.settings.value.touchMouseMode) InputMode.TRACKPAD else InputMode.TOUCH) }
     var showModeSelector by remember { mutableStateOf(false) }
     var exitConfirm by remember { mutableStateOf(false) }
+    // v2.7.17：防系统手势误触（真机边缘拖动被返回/主页劫持的修复开关）
+    var edgeGestureGuard by remember {
+        mutableStateOf(state.store.settings.value.edgeGestureGuard)
+    }
 
     // v2.5.0：截图/录屏/音量/保存引导
     var recording by remember { mutableStateOf(false) }
@@ -587,7 +591,16 @@ fun SessionScreen(state: AppState, server: ServerEntry) {
             clip.removeListener(clipListener)
             session.disconnect()
             platform.setFullscreen(false)
+            // v2.7.17：离开会话恢复系统边缘手势
+            platform.setGestureExclusion(false)
         }
+    }
+
+    // v2.7.17 防系统手势误触：会话期间排除屏幕左/右/底边缘的系统手势（Android 10+
+    // 手势导航下贴边拖动文件/框选文字会被返回/主页手势劫持 = 真机专属 bug，桌面测不到）。
+    // 设置可关（edgeGestureGuard）；旋转屏幕后本 Composable 重建，LaunchedEffect 重跑自动重铺。
+    LaunchedEffect(edgeGestureGuard) {
+        platform.setGestureExclusion(edgeGestureGuard)
     }
 
     // 全屏模式：工具栏闲置自动隐藏（顶部/底部边缘内滑或鼠标移近唤出）

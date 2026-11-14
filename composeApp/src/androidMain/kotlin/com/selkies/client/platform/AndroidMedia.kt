@@ -28,6 +28,8 @@ import android.provider.MediaStore
 import android.provider.DocumentsContract
 import com.selkies.client.MainActivity
 import com.selkies.client.model.SavedMediaEntry
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import java.io.File
 import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
@@ -701,7 +703,9 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
                 )
             }
             true
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            // v2.7.17：MediaMuxer 构造失败留痕（真机存储路径/权限异常在此显形）
+            com.selkies.client.core.CrashCapture.crumb("MUX", "ensureMuxer 失败：${t.javaClass.simpleName}: ${t.message?.take(100)}")
             false
         }
     }
@@ -738,6 +742,9 @@ class AndroidStreamMuxer(override val outputPath: String) : StreamMuxer {
         // 轨道已加但 started=false，后续 writeSampleData 全部失败且 muxer 无法释放。
         // 失败即回滚清理（关 muxer+关 pfd+重置轨号）并退出，录制转入安全降级不崩溃。
         val startedOk = runCatching { realMuxer!!.start() }.isSuccess
+        com.selkies.client.core.CrashCapture.crumb(
+            "MUX", "startMuxer codec=${if (videoCodec == 5) "HEVC" else "AVC"} ${videoW}x$videoH audio=${pendingAudio.size}帧 结果=$startedOk"
+        )
         if (!startedOk) {
             videoTrackIdx = -1
             audioTrackIdx = -1
@@ -1160,11 +1167,16 @@ private class JpegH264Encoder(
  */
 class RecordingService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
+    // v2.7.17：心跳协程——录屏期间维持 CrashCapture alive.marker 新鲜度，
+    // 硬死（native 崩溃/系统击杀）检测窗口取决于此
+    private var hbScope: kotlinx.coroutines.CoroutineScope? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        com.selkies.client.core.CrashCapture.crumb("SVC", "onStartCommand action=${intent?.action} startId=$startId")
         if (intent?.action == ACTION_STOP) {
+            com.selkies.client.core.CrashCapture.crumb("SVC", "收到 stop 指令 → stopSelf")
             stopSelf()
             return START_NOT_STICKY
         }
@@ -1174,15 +1186,35 @@ class RecordingService : Service() {
                 setReferenceCounted(false); acquire(4 * 60 * 60 * 1000L)
             }
         }
+        com.selkies.client.core.CrashCapture.crumb("SVC", "wakeLock 已持有，进入前台录制")
+        startHeartbeat()
         return START_STICKY
+    }
+
+    /** 录屏期间每 30s 心跳一次（写 alive.marker 时间戳） */
+    private fun startHeartbeat() {
+        if (hbScope != null) return
+        hbScope = kotlinx.coroutines.CoroutineScope(
+            kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Default
+        ).also { scope ->
+            scope.launch {
+                while (true) {
+                    kotlinx.coroutines.delay(30_000)
+                    com.selkies.client.core.CrashCapture.heartbeat()
+                }
+            }
+        }
     }
 
     private fun startAsForeground() {
         val channelId = "selkies_recording"
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        nm.createNotificationChannel(
-            NotificationChannel(channelId, "录屏进行中", NotificationManager.IMPORTANCE_LOW)
-        )
+        com.selkies.client.core.CrashCapture.crumb("FGS", "startAsForeground 开始（SDK=${Build.VERSION.SDK_INT}）")
+        runCatching {
+            nm.createNotificationChannel(
+                NotificationChannel(channelId, "录屏进行中", NotificationManager.IMPORTANCE_LOW)
+            )
+        }.onFailure { com.selkies.client.core.CrashCapture.crumb("FGS", "通知渠道创建异常：${it.javaClass.simpleName}") }
         val pi = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java),
@@ -1201,22 +1233,32 @@ class RecordingService : Service() {
         val started = if (Build.VERSION.SDK_INT >= 34) {
             runCatching {
                 startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-            }.recoverCatching {
+            }.recoverCatching { e1 ->
+                com.selkies.client.core.CrashCapture.crumb("FGS", "SPECIAL_USE 失败：${e1.javaClass.simpleName}: ${e1.message?.take(80)}，回退无类型")
                 runCatching { startForeground(NOTIF_ID, notification) }.getOrThrow()
             }.isSuccess
         } else {
             runCatching { startForeground(NOTIF_ID, notification) }.isSuccess
         }
-        if (!started) { runCatching { stopSelf() } }
+        com.selkies.client.core.CrashCapture.crumb("FGS", "startForeground 结果=$started")
+        if (!started) {
+            com.selkies.client.core.CrashCapture.crumb("FGS", "前台化全败 → stopSelf 优雅退出")
+            runCatching { stopSelf() }
+        }
     }
 
     override fun onDestroy() {
+        com.selkies.client.core.CrashCapture.crumb("SVC", "onDestroy（服务销毁）")
+        hbScope?.cancel()
+        hbScope = null
         wakeLock?.release()
+        com.selkies.client.core.CrashCapture.dumpBreadcrumbs()
         com.selkies.client.core.RecordingShutdownHook.autosave()
         super.onDestroy()
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
+        com.selkies.client.core.CrashCapture.crumb("SVC", "onTaskRemoved（任务被划走）")
         com.selkies.client.core.RecordingShutdownHook.autosave()
         super.onTaskRemoved(rootIntent)
     }
@@ -1226,13 +1268,19 @@ class RecordingService : Service() {
         const val ACTION_STOP = "stop"
 
         fun start(ctx: Context) {
+            com.selkies.client.core.CrashCapture.crumb("SVC", "start() 调用 → ${if (Build.VERSION.SDK_INT >= 26) "startForegroundService" else "startService"}")
             val i = Intent(ctx, RecordingService::class.java)
             runCatching {
                 if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
+            }.onFailure {
+                // v2.7.17：v2.7.16 前这里静默吞异常，真机上 startForegroundService 本身
+                // 抛出的异常类型无从知晓——留痕（常见：ForegroundServiceStartNotAllowedException）
+                com.selkies.client.core.CrashCapture.crumb("SVC", "start() 异常：${it.javaClass.simpleName}: ${it.message?.take(100)}")
             }
         }
 
         fun stop(ctx: Context) {
+            com.selkies.client.core.CrashCapture.crumb("SVC", "stop() 调用")
             ctx.stopService(Intent(ctx, RecordingService::class.java))
         }
     }

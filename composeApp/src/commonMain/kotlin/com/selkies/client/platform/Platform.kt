@@ -300,6 +300,12 @@ interface PlatformServices {
     fun hasAppFocus(): Boolean = true
     /** Android：启动/停止录屏前台服务（后台持续录）；Desktop：注册关闭钩子 */
     fun setRecordingActive(active: Boolean) {}
+    /** v2.7.17 Android：上次异常崩溃报告（无则 null，读取后标记已展示） */
+    fun pendingCrashReport(): String? = null
+    /** v2.7.17 Android：崩溃报告已展示（重命名归档，下次启动不再弹） */
+    fun markCrashReportShown() {}
+    /** v2.7.17 Android：会话中排除系统边缘手势（防拖动被返回/主页劫持）；Desktop: no-op */
+    fun setGestureExclusion(enabled: Boolean) {}
 }
 
 expect fun getPlatformServices(): PlatformServices

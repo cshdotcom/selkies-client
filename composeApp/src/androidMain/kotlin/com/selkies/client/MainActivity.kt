@@ -49,6 +49,8 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         com.selkies.client.platform.AndroidPlatform.setFocus(true)
+        // v2.7.17：前台心跳（维持 CrashCapture alive.marker 新鲜度，硬死检测窗口依赖它）
+        com.selkies.client.core.CrashCapture.heartbeat()
     }
 
     override fun onPause() {
@@ -61,6 +63,8 @@ class MainActivity : ComponentActivity() {
         if (isFinishing) {
             // 用户主动结束应用：录屏先保存（「退出默认视为保存」）
             RecordingShutdownHook.autosave()
+            // v2.7.17：正常退出标记（区分「用户退出」与「进程被杀」→ 硬死检测不误报）
+            com.selkies.client.core.CrashCapture.markCleanExit()
             com.selkies.client.platform.AndroidPlatform.release()
         }
     }

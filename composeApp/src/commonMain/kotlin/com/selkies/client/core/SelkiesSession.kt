@@ -2260,9 +2260,16 @@ class SelkiesSession(
                 }
             }
             RecordingShutdownHook.register(recorder)
-            platform.setRecordingActive(true)
+            // v2.7.17 兼容模式：部分国产 ROM 对 specialUse 前台服务管制 = 点录屏即闪退
+            // 第 4 链真机根因（CI 纯净 API34 复现不了）。开启后不启动前台服务，
+            // 仅前台录制；退后台可能被冻结（UI 已在设置里说明代价）。
+            if (settings().recordingCompatMode) {
+                notices.value = "录屏兼容模式：已跳过前台服务，仅前台录制（退后台可能中断）"
+            } else {
+                platform.setRecordingActive(true)
+            }
             recorder.onSaved = { path, frames, error, kind ->
-                platform.setRecordingActive(false)
+                if (!settings().recordingCompatMode) platform.setRecordingActive(false)
                 recKeyframeJob?.cancel()
                 RecordingShutdownHook.register(null)
                 if (kind == "segment" && recordingAutoContinue && !userClosed &&
@@ -2273,7 +2280,8 @@ class SelkiesSession(
                     if (next != null && recorder.start(next)) {
                         forceKeyframe()
                         RecordingShutdownHook.register(recorder)
-                        platform.setRecordingActive(true)
+                        // v2.7.17：兼容模式下同样跳过前台服务（与主启动路径一致）
+                        if (!settings().recordingCompatMode) platform.setRecordingActive(true)
                     } else {
                         recordingAutoContinue = false
                         recordingActive.value = false

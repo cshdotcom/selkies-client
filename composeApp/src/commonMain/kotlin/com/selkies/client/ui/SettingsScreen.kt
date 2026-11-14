@@ -129,6 +129,11 @@ fun SettingsScreen(state: AppState) {
                 SettingSwitch("美观虚拟鼠标（画面光标反馈）", settings.virtualCursorEnabled) {
                     toggle { it.virtualCursorEnabled = !it.virtualCursorEnabled }
                 }
+                // v2.7.17：防系统手势误触——会话中排除屏幕边缘的返回/主页手势
+                //（Android 10+ 手势导航真机：贴边拖动文件/框选文字被系统劫持的根因修复）
+                SettingSwitch("防系统手势误触（边缘拖动不再弹回）", settings.edgeGestureGuard) {
+                    toggle { it.edgeGestureGuard = !it.edgeGestureGuard }
+                }
                 SettingSwitch("物理键盘直通远程", settings.physicalKeyboardPassthrough) {
                     toggle { it.physicalKeyboardPassthrough = !it.physicalKeyboardPassthrough }
                 }
@@ -179,6 +184,12 @@ fun SettingsScreen(state: AppState) {
                 }
                 SettingSwitch("保存后弹窗引导（打开/复制路径）", settings.recordingNotifyOnSave) {
                     toggle { it.recordingNotifyOnSave = !it.recordingNotifyOnSave }
+                }
+                // v2.7.17：录屏兼容模式——不启动前台服务，仅前台录制。
+                // 点录屏即闪退（第 4 链真机 ROM 特有，CI 纯净 API34 复现不了）的兜底开关；
+                // 代价：退到后台后系统可能冻结进程导致录制中断。
+                SettingSwitch("录屏兼容模式（闪退时开启：仅前台录制）", settings.recordingCompatMode) {
+                    toggle { it.recordingCompatMode = !it.recordingCompatMode }
                 }
                 var storageRoot by remember { mutableStateOf(settings.storageRoot) }
                 // v2.7.5：选择器回填（settings 更新时同步文本框）

@@ -183,6 +183,14 @@ data class AppSettings(
     // 录屏
     var recordingIncludeAudio: Boolean = true,
     var recordingNotifyOnSave: Boolean = true,
+    // v2.7.17 录屏兼容模式：不启动前台服务，仅前台录制。部分国产 ROM 对 specialUse
+    // 前台服务的管制会直接杀进程（点录屏即闪退第 4 链的真机兜底）——代价是退到后台
+    // 后系统可能冻结进程导致录制中断。崩溃报告弹窗会建议闪退用户开启此项。
+    var recordingCompatMode: Boolean = false,
+    // 输入
+    // v2.7.17 防系统手势误触：会话中排除屏幕左/右/底边缘的系统手势（返回/主页），
+    // 修复真机手势导航下贴边拖动被劫持、全屏误触滑出。桌面无手势导航，恒无效。
+    var edgeGestureGuard: Boolean = true,
     // 保持屏幕常亮（会话中）
     var keepScreenOn: Boolean = true
 )

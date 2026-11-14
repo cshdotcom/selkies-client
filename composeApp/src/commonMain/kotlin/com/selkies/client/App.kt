@@ -1,16 +1,22 @@
 package com.selkies.client
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import com.selkies.client.core.SettingsStore
 import com.selkies.client.model.ServerEntry
 import com.selkies.client.platform.PlatformServices
@@ -59,6 +65,8 @@ class AppState(
 @Composable
 fun App() {
     val state = remember { AppState() }
+    // v2.7.17：上次异常崩溃报告弹窗（录屏闪退第 4 链真机取证——用户一键复制贴回即可定位）
+    var crashReport by remember { mutableStateOf(state.platform.pendingCrashReport()) }
     SelkiesTheme(themeMode = state.themeMode) {
         Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             when (val screen = state.currentScreen) {
@@ -75,6 +83,43 @@ fun App() {
                 is Screen.Settings -> SettingsScreen(state)
                 is Screen.HotkeyManager -> HotkeyManagerScreen(state)
             }
+        }
+        if (crashReport != null) {
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = {
+                    crashReport = null
+                    state.platform.markCrashReportShown()
+                },
+                title = { Text("检测到上次运行异常崩溃") },
+                text = {
+                    Box(
+                        Modifier
+                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                            .heightIn(max = 420.dp)
+                            .verticalScroll(rememberScrollState())
+                            .horizontalScroll(rememberScrollState())
+                    ) {
+                        Text(
+                            crashReport ?: "",
+                            softWrap = false,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                },
+                confirmButton = {
+                    androidx.compose.material3.TextButton(onClick = {
+                        state.platform.clipboard().setText(crashReport ?: "")
+                        crashReport = null
+                        state.platform.markCrashReportShown()
+                    }) { Text("复制报告") }
+                },
+                dismissButton = {
+                    androidx.compose.material3.TextButton(onClick = {
+                        crashReport = null
+                        state.platform.markCrashReportShown()
+                    }) { Text("关闭") }
+                }
+            )
         }
     }
 }

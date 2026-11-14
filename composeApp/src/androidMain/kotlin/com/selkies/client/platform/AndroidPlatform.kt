@@ -98,6 +98,9 @@ object AndroidPlatform : PlatformServices {
     fun init(activity: ComponentActivity) {
         appContext = activity.applicationContext
         activityRef = activity
+        // v2.7.17：应用内崩溃取证（录屏闪退第 4 链真机定位）——全局未捕获异常
+        // 落盘 + 面包屑轨迹 + 下次启动弹窗展示
+        com.selkies.client.core.CrashCapture.install(activity)
         pickLauncher = activity.registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
             val cb = pendingPick
             pendingPick = null
@@ -745,6 +748,50 @@ object AndroidPlatform : PlatformServices {
     override fun setRecordingActive(active: Boolean) {
         val ctx = appContext ?: return
         if (active) RecordingService.start(ctx) else RecordingService.stop(ctx)
+    }
+
+    // ---------------- v2.7.17 崩溃报告桥 ----------------
+
+    override fun pendingCrashReport(): String? =
+        com.selkies.client.core.CrashCapture.pendingCrashReport()
+
+    override fun markCrashReportShown() {
+        com.selkies.client.core.CrashCapture.markCrashReportShown()
+    }
+
+    // ---------------- v2.7.17 系统手势排除（真机触屏拖动/全屏误触根因修复） ----------------
+
+    /**
+     * Android 10+ 手势导航下，从屏幕左/右/底边缘起手的滑动被系统拦截为返回/主页
+     * 手势——远程桌面上表现为：贴边拖动文件/框选文字拖一半被弹回、全屏看片时
+     * 误触滑出应用。桌面测试（Xvfb/鼠标）永远复现不了，只有真机手势导航设备踩得到。
+     *
+     * 修复：decorView.systemGestureExclusionRects 排除左/右/底三条边缘带（API 29+）。
+     * 系统对单边排除总量有上限（约 200dp，超出被钳制），取 40dp 带宽足够覆盖
+     * 手势热区又不至于把整个边缘吞掉；左侧仍留 12dp 给需要它的用户从最边缘滑入。
+     * 排除后这些区域的触摸事件完整送达应用 = 边缘起手的拖动/点击恢复正常。
+     */
+    override fun setGestureExclusion(enabled: Boolean) {
+        val act = activityRef ?: return
+        runCatching {
+            val decor = act.window.decorView
+            if (Build.VERSION.SDK_INT < 29) return
+            if (!enabled) {
+                decor.systemGestureExclusionRects = emptyList()
+                return
+            }
+            val dm = act.resources.displayMetrics
+            val bandPx = (40 * dm.density).toInt().coerceAtLeast(60)
+            val w = dm.widthPixels
+            val h = dm.heightPixels
+            val left = android.graphics.Rect(0, 0, bandPx, h)
+            val right = android.graphics.Rect(w - bandPx, 0, w, h)
+            val bottom = android.graphics.Rect(0, h - (bandPx * 3 / 4), w, h)
+            decor.systemGestureExclusionRects = listOf(left, right, bottom)
+            com.selkies.client.core.CrashCapture.crumb(
+                "UI", "手势排除已应用 band=${bandPx}px screen=${w}x$h"
+            )
+        }
     }
 }
 
